@@ -1,0 +1,11 @@
+[package]
+name = "quiescence-runtime"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+quiescence-core = { path = "../quiescence-core" }
+
+[lints]
+workspace = true
