@@ -31,7 +31,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     })?;
 
     g.settle()?;
-    g.take_transitions();
+    let _ = g.take_transitions();
     g.schedule_input(water, SimTime::from_secs(5), 0.0)?;
     g.schedule_input(damage, SimTime::from_secs(7), 1.5)?;
     g.schedule_input(water, SimTime::from_secs(8), 1.0)?;
