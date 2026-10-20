@@ -52,3 +52,13 @@ RUSTC_WRAPPER=/usr/local/bin/sccache cargo run -p quiescence-boiler-demo
 Near-term targets are interval/refinement evaluators, SCC/repeated-state analysis, a budgeted forecast frontier, stable-region collapse, and explanation tracing (*why did this node wake?*).
 
 The fast path is not faster arithmetic. It is **proving that no arithmetic needs to happen**.
+
+### Sparse-cutoff smoke benchmark
+
+A deliberately simple release-mode smoke test builds a 100,001-node chain, then compares a source change that dies at the first quantized node with one that propagates through the entire chain:
+
+```console
+RUSTC_WRAPPER=/usr/local/bin/sccache cargo run --release -p quiescence-runtime --example sparse_cutoff
+```
+
+This is not yet a stable benchmark suite; it exists to catch catastrophic runtime regressions while the graph representation is still changing rapidly.
