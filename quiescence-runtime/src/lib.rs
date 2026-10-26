@@ -1,18 +1,21 @@
 #![forbid(unsafe_code)]
 
 use quiescence_core::{
-    Bucket, Estimate, NodeId, Quantization, QuantizeError, SimDuration, SimTime,
+    Bucket, Estimate, NodeId, Quantization, QuantizeError, ReactionId, SimDuration, SimTime,
 };
 use std::{
     cell::RefCell,
     cmp::Ordering,
-    collections::{BTreeSet, BinaryHeap, VecDeque},
+    collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque},
     fmt,
     sync::Arc,
 };
 
 type EvalFn =
     Arc<dyn for<'a> Fn(&EvalContext<'a>) -> Result<EvalOutput, EvalError> + Send + Sync + 'static>;
+type ReactionFn = Arc<
+    dyn for<'a> Fn(&EvalContext<'a>) -> Result<ReactionOutput, EvalError> + Send + Sync + 'static,
+>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RuntimeConfig {
@@ -32,6 +35,46 @@ pub struct EvalOutput {
     pub delay: SimDuration,
     pub valid_for: Option<SimDuration>,
 }
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StateWrite {
+    pub node: NodeId,
+    pub value: f64,
+}
+impl StateWrite {
+    #[must_use]
+    pub const fn new(node: NodeId, value: f64) -> Self {
+        Self { node, value }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReactionOutput {
+    pub transition_after: Option<SimDuration>,
+    pub writes: Vec<StateWrite>,
+}
+impl ReactionOutput {
+    #[must_use]
+    pub const fn idle() -> Self {
+        Self {
+            transition_after: None,
+            writes: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn after(delay: SimDuration, writes: Vec<StateWrite>) -> Self {
+        Self {
+            transition_after: Some(delay),
+            writes,
+        }
+    }
+
+    #[must_use]
+    pub fn immediate(writes: Vec<StateWrite>) -> Self {
+        Self::after(SimDuration::ZERO, writes)
+    }
+}
+
 impl EvalOutput {
     #[must_use]
     pub const fn immediate(value: f64) -> Self {
@@ -108,12 +151,28 @@ struct Node {
     generation: u64,
 }
 
+struct Reaction {
+    name: String,
+    evaluator: ReactionFn,
+    dependencies: BTreeSet<NodeId>,
+    generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum WorkId {
+    Node(NodeId),
+    Reaction(ReactionId),
+}
+
 pub struct Graph {
     config: RuntimeConfig,
     now: SimTime,
     nodes: Vec<Node>,
-    dirty: VecDeque<NodeId>,
-    is_dirty: Vec<bool>,
+    reactions: Vec<Reaction>,
+    reaction_dependents: BTreeMap<NodeId, BTreeSet<ReactionId>>,
+    dirty: VecDeque<WorkId>,
+    node_is_dirty: Vec<bool>,
+    reaction_is_dirty: Vec<bool>,
     events: BinaryHeap<ScheduledEvent>,
     next_sequence: u64,
     transitions: Vec<TransitionRecord>,
@@ -126,8 +185,11 @@ impl Graph {
             config,
             now: SimTime::ZERO,
             nodes: Vec::new(),
+            reactions: Vec::new(),
+            reaction_dependents: BTreeMap::new(),
             dirty: VecDeque::new(),
-            is_dirty: Vec::new(),
+            node_is_dirty: Vec::new(),
+            reaction_is_dirty: Vec::new(),
             events: BinaryHeap::new(),
             next_sequence: 0,
             transitions: Vec::new(),
@@ -180,9 +242,9 @@ impl Graph {
             dependents: BTreeSet::new(),
             generation: 0,
         });
-        self.is_dirty.push(false);
+        self.node_is_dirty.push(false);
         if derived {
-            self.mark_dirty(id);
+            self.mark_dirty(WorkId::Node(id));
         }
         Ok(id)
     }
@@ -196,8 +258,41 @@ impl Graph {
             .get_mut(id.index())
             .ok_or(RuntimeError::UnknownNode(id))?;
         node.evaluator = Some(Arc::new(evaluator));
-        self.mark_dirty(id);
+        self.mark_dirty(WorkId::Node(id));
         Ok(())
+    }
+
+    pub fn add_reaction<F>(
+        &mut self,
+        name: impl Into<String>,
+        evaluator: F,
+    ) -> Result<ReactionId, RuntimeError>
+    where
+        F: for<'a> Fn(&EvalContext<'a>) -> Result<ReactionOutput, EvalError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let raw_id =
+            u32::try_from(self.reactions.len()).map_err(|_| RuntimeError::TooManyReactions)?;
+        let id = ReactionId::from_index(raw_id);
+        self.reactions.push(Reaction {
+            name: name.into(),
+            evaluator: Arc::new(evaluator),
+            dependencies: BTreeSet::new(),
+            generation: 0,
+        });
+        self.reaction_is_dirty.push(false);
+        self.mark_dirty(WorkId::Reaction(id));
+        Ok(id)
+    }
+
+    pub fn reaction_name(&self, id: ReactionId) -> Result<&str, RuntimeError> {
+        Ok(&self
+            .reactions
+            .get(id.index())
+            .ok_or(RuntimeError::UnknownReaction(id))?
+            .name)
     }
 
     pub fn value_bucket(&self, id: NodeId) -> Result<Bucket, RuntimeError> {
@@ -232,26 +327,33 @@ impl Graph {
 
     pub fn settle(&mut self) -> Result<(), RuntimeError> {
         let mut steps = 0_usize;
-        while let Some(id) = self.dirty.pop_front() {
-            self.is_dirty[id.index()] = false;
-            if self.nodes[id.index()].evaluator.is_none() {
-                continue;
+        while let Some(work) = self.dirty.pop_front() {
+            match work {
+                WorkId::Node(id) => self.node_is_dirty[id.index()] = false,
+                WorkId::Reaction(id) => self.reaction_is_dirty[id.index()] = false,
             }
             steps = steps.saturating_add(1);
             if steps > self.config.same_time_microstep_budget {
-                let active_nodes = self
+                let active_work = self
                     .dirty
                     .iter()
                     .copied()
-                    .chain(std::iter::once(id))
+                    .chain(std::iter::once(work))
                     .collect();
                 return Err(RuntimeError::CalculationInstability {
                     at: self.now,
                     microsteps: steps,
-                    active_nodes,
+                    active_work,
                 });
             }
-            self.evaluate(id)?;
+            match work {
+                WorkId::Node(id) => {
+                    if self.nodes[id.index()].evaluator.is_some() {
+                        self.evaluate(id)?;
+                    }
+                }
+                WorkId::Reaction(id) => self.evaluate_reaction(id)?,
+            }
         }
         Ok(())
     }
@@ -275,6 +377,11 @@ impl Graph {
     }
 
     #[must_use]
+    pub fn next_event_time(&self) -> Option<SimTime> {
+        self.events.peek().map(|event| event.at)
+    }
+
+    #[must_use]
     pub fn take_transitions(&mut self) -> Vec<TransitionRecord> {
         std::mem::take(&mut self.transitions)
     }
@@ -293,7 +400,7 @@ impl Graph {
         let output =
             evaluator(&context).map_err(|source| RuntimeError::Evaluation { node: id, source })?;
         let deps = context.dependencies();
-        self.update_dependencies(id, deps)?;
+        self.update_dependencies(WorkId::Node(id), deps)?;
 
         let current = self.nodes[id.index()].bucket;
         let next = self.nodes[id.index()]
@@ -329,20 +436,95 @@ impl Graph {
         Ok(())
     }
 
+    fn evaluate_reaction(&mut self, id: ReactionId) -> Result<(), RuntimeError> {
+        let evaluator = self
+            .reactions
+            .get(id.index())
+            .ok_or(RuntimeError::UnknownReaction(id))?
+            .evaluator
+            .clone();
+        let context = EvalContext {
+            now: self.now,
+            nodes: &self.nodes,
+            reads: RefCell::new(BTreeSet::new()),
+        };
+        let output = evaluator(&context).map_err(|source| RuntimeError::ReactionEvaluation {
+            reaction: id,
+            source,
+        })?;
+        let deps = context.dependencies();
+        self.update_dependencies(WorkId::Reaction(id), deps)?;
+        let reaction = self
+            .reactions
+            .get_mut(id.index())
+            .ok_or(RuntimeError::UnknownReaction(id))?;
+        reaction.generation = reaction.generation.saturating_add(1);
+        let generation = reaction.generation;
+
+        if let Some(delay) = output.transition_after {
+            if delay == SimDuration::ZERO {
+                self.apply_state_writes(&output.writes)?;
+            } else {
+                self.push_event(
+                    self.now.saturating_add(delay),
+                    EventKind::ReactionTransition {
+                        reaction: id,
+                        generation,
+                        writes: output.writes,
+                    },
+                );
+            }
+        } else if !output.writes.is_empty() {
+            return Err(RuntimeError::UnscheduledReactionWrites(id));
+        }
+        Ok(())
+    }
+
     fn update_dependencies(
         &mut self,
-        id: NodeId,
+        dependent: WorkId,
         new: BTreeSet<NodeId>,
     ) -> Result<(), RuntimeError> {
         for dep in &new {
             self.node(*dep)?;
         }
-        let old = std::mem::replace(&mut self.nodes[id.index()].dependencies, new.clone());
+        let old = match dependent {
+            WorkId::Node(id) => {
+                std::mem::replace(&mut self.nodes[id.index()].dependencies, new.clone())
+            }
+            WorkId::Reaction(id) => std::mem::replace(
+                &mut self
+                    .reactions
+                    .get_mut(id.index())
+                    .ok_or(RuntimeError::UnknownReaction(id))?
+                    .dependencies,
+                new.clone(),
+            ),
+        };
         for dep in old.difference(&new) {
-            self.nodes[dep.index()].dependents.remove(&id);
+            match dependent {
+                WorkId::Node(id) => {
+                    self.nodes[dep.index()].dependents.remove(&id);
+                }
+                WorkId::Reaction(id) => {
+                    if let Some(reactions) = self.reaction_dependents.get_mut(dep) {
+                        reactions.remove(&id);
+                        if reactions.is_empty() {
+                            self.reaction_dependents.remove(dep);
+                        }
+                    }
+                }
+            }
         }
         for dep in new.difference(&old) {
-            self.nodes[dep.index()].dependents.insert(id);
+            match dependent {
+                WorkId::Node(id) => {
+                    self.nodes[dep.index()].dependents.insert(id);
+                }
+                WorkId::Reaction(id) => {
+                    self.reaction_dependents.entry(*dep).or_default().insert(id);
+                }
+            }
         }
         Ok(())
     }
@@ -364,7 +546,23 @@ impl Graph {
             EventKind::Reevaluate { node, generation } => {
                 self.node(node)?;
                 if self.nodes[node.index()].generation == generation {
-                    self.mark_dirty(node);
+                    self.mark_dirty(WorkId::Node(node));
+                }
+                Ok(())
+            }
+            EventKind::ReactionTransition {
+                reaction,
+                generation,
+                writes,
+            } => {
+                let current_generation = self
+                    .reactions
+                    .get(reaction.index())
+                    .ok_or(RuntimeError::UnknownReaction(reaction))?
+                    .generation;
+                if current_generation == generation {
+                    self.apply_state_writes(&writes)?;
+                    self.mark_dirty(WorkId::Reaction(reaction));
                 }
                 Ok(())
             }
@@ -372,17 +570,32 @@ impl Graph {
     }
 
     fn apply_input(&mut self, id: NodeId, value: f64) -> Result<(), RuntimeError> {
-        self.node(id)?;
-        if self.nodes[id.index()].evaluator.is_some() {
-            return Err(RuntimeError::NotAnInput(id));
+        self.apply_state_writes(&[StateWrite::new(id, value)])
+    }
+
+    fn apply_state_writes(&mut self, writes: &[StateWrite]) -> Result<(), RuntimeError> {
+        let mut seen = BTreeSet::new();
+        let mut resolved = Vec::with_capacity(writes.len());
+        for write in writes {
+            self.node(write.node)?;
+            if !seen.insert(write.node) {
+                return Err(RuntimeError::DuplicateStateWrite(write.node));
+            }
+            if self.nodes[write.node.index()].evaluator.is_some() {
+                return Err(RuntimeError::NotAnInput(write.node));
+            }
+            let current = self.nodes[write.node.index()].bucket;
+            let next = self.nodes[write.node.index()]
+                .quantization
+                .resolve(Some(current), Estimate::point(write.value))?;
+            resolved.push((write.node, current, next));
         }
-        let current = self.nodes[id.index()].bucket;
-        let next = self.nodes[id.index()]
-            .quantization
-            .resolve(Some(current), Estimate::point(value))?;
-        if next != current {
-            self.nodes[id.index()].generation = self.nodes[id.index()].generation.saturating_add(1);
-            self.commit(id, next);
+        for (node, current, next) in resolved {
+            if next != current {
+                self.nodes[node.index()].generation =
+                    self.nodes[node.index()].generation.saturating_add(1);
+                self.commit(node, next);
+            }
         }
         Ok(())
     }
@@ -401,16 +614,29 @@ impl Graph {
             old,
             new: bucket,
         });
-        let dependents: Vec<_> = node.dependents.iter().copied().collect();
-        for dependent in dependents {
-            self.mark_dirty(dependent);
+        let node_dependents: Vec<_> = node.dependents.iter().copied().collect();
+        for dependent in node_dependents {
+            self.mark_dirty(WorkId::Node(dependent));
+        }
+        let reaction_dependents: Vec<_> = self
+            .reaction_dependents
+            .get(&id)
+            .into_iter()
+            .flat_map(|dependents| dependents.iter().copied())
+            .collect();
+        for dependent in reaction_dependents {
+            self.mark_dirty(WorkId::Reaction(dependent));
         }
     }
 
-    fn mark_dirty(&mut self, id: NodeId) {
-        if !self.is_dirty[id.index()] {
-            self.is_dirty[id.index()] = true;
-            self.dirty.push_back(id);
+    fn mark_dirty(&mut self, work: WorkId) {
+        let already_dirty = match work {
+            WorkId::Node(id) => &mut self.node_is_dirty[id.index()],
+            WorkId::Reaction(id) => &mut self.reaction_is_dirty[id.index()],
+        };
+        if !*already_dirty {
+            *already_dirty = true;
+            self.dirty.push_back(work);
         }
     }
 
@@ -441,6 +667,11 @@ enum EventKind {
     Reevaluate {
         node: NodeId,
         generation: u64,
+    },
+    ReactionTransition {
+        reaction: ReactionId,
+        generation: u64,
+        writes: Vec<StateWrite>,
     },
 }
 #[derive(Clone, Debug, PartialEq)]
@@ -495,6 +726,10 @@ pub enum RuntimeError {
     MissingEvaluator(NodeId),
     NotAnInput(NodeId),
     TooManyNodes,
+    TooManyReactions,
+    UnknownReaction(ReactionId),
+    UnscheduledReactionWrites(ReactionId),
+    DuplicateStateWrite(NodeId),
     CorruptEventQueue,
     EventInPast {
         now: SimTime,
@@ -504,10 +739,14 @@ pub enum RuntimeError {
         node: NodeId,
         source: EvalError,
     },
+    ReactionEvaluation {
+        reaction: ReactionId,
+        source: EvalError,
+    },
     CalculationInstability {
         at: SimTime,
         microsteps: usize,
-        active_nodes: Vec<NodeId>,
+        active_work: Vec<WorkId>,
     },
 }
 impl fmt::Display for RuntimeError {
@@ -518,6 +757,20 @@ impl fmt::Display for RuntimeError {
             Self::MissingEvaluator(id) => write!(f, "node {id:?} has no evaluator"),
             Self::NotAnInput(id) => write!(f, "node {id:?} is derived, not an input"),
             Self::TooManyNodes => f.write_str("graph contains too many nodes"),
+            Self::TooManyReactions => f.write_str("graph contains too many reactions"),
+            Self::UnknownReaction(id) => write!(f, "unknown reaction {id:?}"),
+            Self::UnscheduledReactionWrites(id) => {
+                write!(
+                    f,
+                    "reaction {id:?} returned writes without a transition time"
+                )
+            }
+            Self::DuplicateStateWrite(id) => {
+                write!(
+                    f,
+                    "reaction transition writes state node {id:?} more than once"
+                )
+            }
             Self::CorruptEventQueue => f.write_str("event queue became inconsistent"),
             Self::EventInPast { now, requested } => write!(
                 f,
@@ -526,13 +779,16 @@ impl fmt::Display for RuntimeError {
             Self::Evaluation { node, source } => {
                 write!(f, "evaluation of {node:?} failed: {source}")
             }
+            Self::ReactionEvaluation { reaction, source } => {
+                write!(f, "evaluation of reaction {reaction:?} failed: {source}")
+            }
             Self::CalculationInstability {
                 at,
                 microsteps,
-                active_nodes,
+                active_work,
             } => write!(
                 f,
-                "calculation instability at {at:?} after {microsteps} same-time microsteps; active nodes: {active_nodes:?}"
+                "calculation instability at {at:?} after {microsteps} same-time microsteps; active work: {active_work:?}"
             ),
         }
     }
@@ -541,7 +797,9 @@ impl std::error::Error for RuntimeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Quantize(e) => Some(e),
-            Self::Evaluation { source, .. } => Some(source),
+            Self::Evaluation { source, .. } | Self::ReactionEvaluation { source, .. } => {
+                Some(source)
+            }
             _ => None,
         }
     }
@@ -554,7 +812,7 @@ impl From<QuantizeError> for RuntimeError {
 
 #[cfg(test)]
 mod tests {
-    use super::{EvalOutput, Graph, RuntimeConfig, RuntimeError};
+    use super::{EvalOutput, Graph, ReactionOutput, RuntimeConfig, RuntimeError, StateWrite};
     use quiescence_core::{Quantization, SimDuration, SimTime};
     use std::sync::{
         Arc,
@@ -627,6 +885,97 @@ mod tests {
         assert_eq!(calls.load(Ordering::Relaxed), before);
         g.set_input_now(enabled, 1.0)?;
         assert!(calls.load(Ordering::Relaxed) > before);
+        Ok(())
+    }
+
+    #[test]
+    fn reaction_forecast_is_invalidated_when_a_dependency_changes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = Graph::new(RuntimeConfig::default());
+        let enabled = g.add_input("enabled", q0()?, 0.0)?;
+        let output = g.add_input("output", q0()?, 0.0)?;
+        let reaction = g.add_reaction("delayed output", move |c| {
+            if c.read_bool(enabled)? {
+                Ok(ReactionOutput::after(
+                    SimDuration::from_millis(10),
+                    vec![StateWrite::new(output, 1.0)],
+                ))
+            } else {
+                Ok(ReactionOutput::idle())
+            }
+        })?;
+        g.settle()?;
+        assert_eq!(g.reaction_name(reaction)?, "delayed output");
+
+        g.set_input_now(enabled, 1.0)?;
+        assert_eq!(g.next_event_time(), Some(SimTime::from_millis(10)));
+        g.advance_to(SimTime::from_millis(5))?;
+        g.set_input_now(enabled, 0.0)?;
+        g.advance_to(SimTime::from_millis(10))?;
+        assert_eq!(g.value_f64(output)?, 0.0);
+        Ok(())
+    }
+
+    #[test]
+    fn reaction_transition_applies_multiple_state_writes_before_dependents_run()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = Graph::new(RuntimeConfig::default());
+        let trigger = g.add_input("trigger", q0()?, 0.0)?;
+        let left = g.add_input("left", q0()?, 0.0)?;
+        let right = g.add_input("right", q0()?, 0.0)?;
+        let mismatches = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&mismatches);
+        let _observer = g.add_derived("observer", q0()?, 0.0, move |c| {
+            let left_value = c.read_f64(left)?;
+            let right_value = c.read_f64(right)?;
+            if left_value != right_value {
+                seen.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(EvalOutput::immediate(left_value + right_value))
+        })?;
+        let _reaction = g.add_reaction("paired write", move |c| {
+            if c.read_bool(trigger)? {
+                Ok(ReactionOutput::after(
+                    SimDuration::from_millis(1),
+                    vec![StateWrite::new(left, 1.0), StateWrite::new(right, 1.0)],
+                ))
+            } else {
+                Ok(ReactionOutput::idle())
+            }
+        })?;
+        g.settle()?;
+        g.set_input_now(trigger, 1.0)?;
+        g.advance_to(SimTime::from_millis(1))?;
+        assert_eq!(g.value_f64(left)?, 1.0);
+        assert_eq!(g.value_f64(right)?, 1.0);
+        assert_eq!(mismatches.load(Ordering::Relaxed), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn reaction_dependencies_are_dynamic() -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = Graph::new(RuntimeConfig::default());
+        let enabled = g.add_input("enabled", q0()?, 0.0)?;
+        let source = g.add_input("source", q0()?, 1.0)?;
+        let sink = g.add_input("sink", q0()?, 0.0)?;
+        let evaluations = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&evaluations);
+        let _reaction = g.add_reaction("gated copy", move |c| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            if !c.read_bool(enabled)? {
+                return Ok(ReactionOutput::idle());
+            }
+            Ok(ReactionOutput::immediate(vec![StateWrite::new(
+                sink,
+                c.read_f64(source)?,
+            )]))
+        })?;
+        g.settle()?;
+        let before = evaluations.load(Ordering::Relaxed);
+        g.set_input_now(source, 2.0)?;
+        assert_eq!(evaluations.load(Ordering::Relaxed), before);
+        g.set_input_now(enabled, 1.0)?;
+        assert_eq!(g.value_f64(sink)?, 2.0);
         Ok(())
     }
 

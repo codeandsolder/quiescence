@@ -36,11 +36,17 @@ Future policies may use:
 
 The important contract is that an evaluator either determines the correct observable bucket or explicitly reports that more precision/refinement is required.
 
-## Layer 2: evaluation
+## Layer 2: evaluation and reactions
 
-An evaluator reads nodes through an evaluation context and produces a candidate result plus temporal information. Reads form the current dependency set.
+A derived-node evaluator reads nodes through an evaluation context and produces a candidate result plus temporal information. Reads form the current dependency set.
 
-Evaluation is conceptually pure with respect to graph state. Side effects belong in explicit transition/application layers rather than hidden inside an evaluator.
+A reaction uses the same read-tracking context, but its output is a forecasted state transition: an optional causal delay plus an atomic batch of writes to state/input nodes. Reaction dependencies are dynamic just like derived-node dependencies. If any dependency changes before the forecasted transition, the reaction is reevaluated and the old generation-stamped forecast becomes stale.
+
+This keeps evaluation pure while making side effects explicit and inspectable. A reaction does not mutate graph state while deciding what should happen; the runtime applies its write batch only when the causal boundary is reached.
+
+This distinction is important for recovered game logic. A furnace, machine controller, crop timer, cooldown, scheduled block update, or network state machine generally has sparse semantic boundaries even when the source implementation polls it every tick. The graph should store facts such as absolute deadlines and epochs, then derive continuously changing presentation values such as progress bars from `(state, now)` on demand. It should not manufacture periodic wakeups merely to imitate a historical tick loop.
+
+Dense spatial work remains outside this abstraction when the graph adds no semantic leverage. Bulk block breaking, mesh/physics inner loops, and similar hot paths can stay specialized while their sparse boundary interactions enter the graph.
 
 ## Layer 3: dependency storage and propagation
 

@@ -62,3 +62,7 @@ RUSTC_WRAPPER=/usr/local/bin/sccache cargo run --release -p quiescence-runtime -
 ```
 
 This is not yet a stable benchmark suite; it exists to catch catastrophic runtime regressions while the graph representation is still changing rapidly.
+
+## Sparse reactions
+
+Read-tracked reactions can forecast generation-stamped, atomic state transitions. Dependency changes invalidate stale forecasts, allowing tick-shaped source logic to execute at causal boundaries instead of polling. See `quiescence-runtime/examples/vanilla_furnace.rs` for a furnace-shaped example.
