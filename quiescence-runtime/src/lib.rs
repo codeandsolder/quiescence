@@ -491,6 +491,33 @@ impl Graph {
         Ok(())
     }
 
+    /// Schedule one externally sourced reaction callback.
+    ///
+    /// External events are intentionally not deduplicated and are not tied to the reaction's
+    /// dependency generation. Each accepted event causes one reevaluation when dequeued.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown reaction or an event in the past.
+    pub fn schedule_reaction_event(
+        &mut self,
+        reaction: ReactionId,
+        at: SimTime,
+        priority: i32,
+    ) -> Result<(), RuntimeError> {
+        self.reactions
+            .get(reaction.index())
+            .ok_or(RuntimeError::UnknownReaction(reaction))?;
+        if at < self.now {
+            return Err(RuntimeError::EventInPast {
+                now: self.now,
+                requested: at,
+            });
+        }
+        self.push_event_with_priority(at, priority, EventKind::ExternalReaction { reaction });
+        Ok(())
+    }
+
     pub fn settle(&mut self) -> Result<(), RuntimeError> {
         let mut steps = 0_usize;
         while let Some(work) = self.dirty.pop_front() {
@@ -728,6 +755,13 @@ impl Graph {
                 }
                 Ok(())
             }
+            EventKind::ExternalReaction { reaction } => {
+                self.reactions
+                    .get(reaction.index())
+                    .ok_or(RuntimeError::UnknownReaction(reaction))?;
+                self.mark_dirty(WorkId::Reaction(reaction));
+                Ok(())
+            }
             EventKind::ScheduledReaction { reaction, key } => {
                 self.pending_scheduled_reactions.remove(&(reaction, key));
                 self.mark_dirty(WorkId::Reaction(reaction));
@@ -909,6 +943,9 @@ enum EventKind {
         reaction: ReactionId,
         generation: u64,
         writes: Vec<StateWrite>,
+    },
+    ExternalReaction {
+        reaction: ReactionId,
     },
     ScheduledReaction {
         reaction: ReactionId,
@@ -1339,6 +1376,69 @@ mod tests {
             g.set_atom_now(numeric, 8),
             Err(RuntimeError::ExpectedAtom(id)) if id == numeric
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn external_reaction_events_preserve_duplicates() -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = Graph::new(RuntimeConfig::default());
+        let evaluations = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&evaluations);
+        let reaction = g.add_reaction("external callback", move |_| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Ok(ReactionOutput::idle())
+        })?;
+        g.settle()?;
+        assert_eq!(evaluations.load(Ordering::Relaxed), 1);
+
+        g.schedule_reaction_event(reaction, SimTime::from_millis(10), 0)?;
+        g.schedule_reaction_event(reaction, SimTime::from_millis(10), 0)?;
+        g.advance_to(SimTime::from_millis(10))?;
+        assert_eq!(evaluations.load(Ordering::Relaxed), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn external_reaction_events_honor_priority_without_dedup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = Graph::new(RuntimeConfig::default());
+        let marker = g.add_input("marker", q0()?, 0.0)?;
+        let normal = g.add_reaction("normal external", move |c| {
+            if c.now() == SimTime::ZERO {
+                Ok(ReactionOutput::idle())
+            } else {
+                Ok(ReactionOutput::immediate(vec![StateWrite::new(
+                    marker, 2.0,
+                )]))
+            }
+        })?;
+        let high = g.add_reaction("high external", move |c| {
+            if c.now() == SimTime::ZERO {
+                Ok(ReactionOutput::idle())
+            } else {
+                Ok(ReactionOutput::immediate(vec![StateWrite::new(
+                    marker, 1.0,
+                )]))
+            }
+        })?;
+        g.settle()?;
+        g.schedule_reaction_event(normal, SimTime::from_millis(10), 0)?;
+        g.schedule_reaction_event(high, SimTime::from_millis(10), -1)?;
+        g.advance_to(SimTime::from_millis(10))?;
+
+        let marker_values: Vec<_> = g
+            .take_transitions()
+            .into_iter()
+            .filter(|transition| transition.node == marker)
+            .map(|transition| transition.new)
+            .collect();
+        assert_eq!(
+            marker_values,
+            vec![
+                CanonicalValue::Numeric(Bucket::new(1)),
+                CanonicalValue::Numeric(Bucket::new(2)),
+            ]
+        );
         Ok(())
     }
 

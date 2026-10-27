@@ -22,6 +22,7 @@ The runtime is intentionally domain-neutral. Industrial/factory simulation and b
 - Future input events and generation-stamped predicted events.
 - Explicit reaction-only reevaluation deadlines (`ReactionOutput::reevaluate_after`) when reaching a causal boundary matters but no state should be written yet.
 - Keyed schedule-once reaction wakeups for callback semantics that must survive dependency changes. Duplicate `(reaction, key)` requests preserve the first pending deadline; same-time callbacks order by lower numeric priority, then insertion order.
+- Unkeyed external reaction events for dense or stochastic source adapters. They preserve duplicate callbacks, survive dependency changes, and use the same causal time/priority ordering without forcing source RNG state into the graph.
 - Cyclic graphs as a normal case.
 - Bounded same-time stabilization with explicit `CalculationInstability` instead of an infinite loop.
 - Validity timers for nodes that know when they next need reconsideration.
@@ -74,4 +75,4 @@ This is not yet a stable benchmark suite; it exists to catch catastrophic runtim
 
 ## Sparse reactions
 
-Read-tracked reactions can forecast generation-stamped, atomic state transitions. Dependency changes invalidate stale forecasts, allowing tick-shaped source logic to execute at causal boundaries instead of polling. See `quiescence-runtime/examples/vanilla_furnace.rs` for a furnace-shaped deadline example and `quiescence-runtime/examples/vanilla_hopper.rs` for a recovered cooldown shape where inventory snapshot handles are not dependencies during cooldown, become dependencies only once the hopper is ready-but-blocked, and commit atomically with the next deadline after a successful transfer.
+Read-tracked reactions can forecast generation-stamped, atomic state transitions. Dependency changes invalidate stale forecasts, allowing tick-shaped source logic to execute at causal boundaries instead of polling. See `quiescence-runtime/examples/vanilla_furnace.rs` for a furnace-shaped deadline example and `quiescence-runtime/examples/vanilla_hopper.rs` for a recovered cooldown shape where inventory snapshot handles are not dependencies during cooldown, become dependencies only once the hopper is ready-but-blocked, and commit atomically with the next deadline after a successful transfer. Dense stochastic selectors can remain adapter-owned and inject each selected callback through `Graph::schedule_reaction_event`; duplicate selections remain distinct events.

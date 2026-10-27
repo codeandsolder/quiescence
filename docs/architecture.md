@@ -48,7 +48,7 @@ A reaction uses the same read-tracking context, but its output is a forecasted s
 
 This keeps evaluation pure while making side effects explicit and inspectable. A reaction does not mutate graph state while deciding what should happen; the runtime applies its write batch only when the causal boundary is reached.
 
-This distinction is important for recovered game logic. A furnace, machine controller, crop timer, cooldown, scheduled block update, or network state machine generally has sparse semantic boundaries even when the source implementation polls it every tick. The graph should store facts such as absolute deadlines and epochs, then derive continuously changing presentation values such as progress bars from `(state, now)` on demand. It should not manufacture periodic wakeups merely to imitate a historical tick loop.
+This distinction is important for recovered game logic. A furnace, machine controller, cooldown, scheduled block update, stochastic callback handler, or network state machine generally has sparse semantic boundaries even when the source implementation polls it every tick. The graph should store facts such as absolute deadlines and epochs, then derive continuously changing presentation values such as progress bars from `(state, now)` on demand. It should not manufacture periodic wakeups merely to imitate a historical tick loop.
 
 Dynamic dependencies can also change by temporal phase. A cooldown reaction can depend only on its deadline while waiting, then begin reading inventory/topology snapshots at expiry; if it is blocked, those snapshots become the dependencies that can wake it. This is a direct way to avoid both polling and irrelevant invalidations.
 
@@ -72,8 +72,9 @@ The prototype uses one binary heap of scheduled events. The API distinguishes tw
 
 - **Forecasts** are generation-stamped predictions derived from current dependencies. If a dependency changes before the forecast fires, the old event becomes stale.
 - **Scheduled callbacks** are keyed schedule-once wakeups. Once accepted they survive dependency changes; another request with the same `(reaction, key)` is ignored until the callback is dequeued. Same-time callbacks order by lower numeric priority and then insertion sequence. The key is intentionally domain-neutral: a Minecraft adapter can intern `(position, block)` while another domain can choose a different identity.
+- **External causal events** are unkeyed reaction wakeups injected by a source adapter. They also survive dependency changes, but duplicates are preserved: selecting the same target twice is two callbacks. This is the right boundary for dense spatial/random schedulers whose RNG state, iteration order, or selection machinery should remain outside the graph.
 
-This distinction matters because rescheduling a prediction when its assumptions change is correct, while moving an already-pending vanilla block tick merely because a neighbor changed is not. The API should not require the current heap/set implementation.
+This distinction matters because rescheduling a prediction when its assumptions change is correct, moving an already-pending vanilla block tick merely because a neighbor changed is not, and deduplicating two independently emitted random opportunities is also not. The API should not require the current heap/set implementation.
 
 Possible replacements include calendar queues, timing wheels, hierarchical queues, per-region queues or specialized indexes for certificate expiry.
 
