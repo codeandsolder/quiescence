@@ -23,7 +23,7 @@ Numeric facts use decimal quantization plus last-digit hysteresis:
 working value -> quantizer/hysteresis -> integer observable bucket
 ```
 
-Today the working value is commonly `f64`. That is not part of graph equality, serialization or dependency semantics.
+Today the working numeric value is commonly `f64`. That is not part of graph equality, serialization or dependency semantics. The runtime also supports exact atom nodes: a `u64` canonical handle participates directly in equality/dependency semantics and is intended for immutable/interned structured snapshots whose contents live in a domain store.
 
 Future policies may use:
 
@@ -49,6 +49,8 @@ A reaction uses the same read-tracking context, but its output is a forecasted s
 This keeps evaluation pure while making side effects explicit and inspectable. A reaction does not mutate graph state while deciding what should happen; the runtime applies its write batch only when the causal boundary is reached.
 
 This distinction is important for recovered game logic. A furnace, machine controller, crop timer, cooldown, scheduled block update, or network state machine generally has sparse semantic boundaries even when the source implementation polls it every tick. The graph should store facts such as absolute deadlines and epochs, then derive continuously changing presentation values such as progress bars from `(state, now)` on demand. It should not manufacture periodic wakeups merely to imitate a historical tick loop.
+
+Dynamic dependencies can also change by temporal phase. A cooldown reaction can depend only on its deadline while waiting, then begin reading inventory/topology snapshots at expiry; if it is blocked, those snapshots become the dependencies that can wake it. This is a direct way to avoid both polling and irrelevant invalidations.
 
 Dense spatial work remains outside this abstraction when the graph adds no semantic leverage. Bulk block breaking, mesh/physics inner loops, and similar hot paths can stay specialized while their sparse boundary interactions enter the graph.
 

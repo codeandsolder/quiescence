@@ -100,6 +100,11 @@ impl ReactionOutput {
     pub fn immediate(writes: Vec<StateWrite>) -> Self {
         Self::after(SimDuration::ZERO, writes)
     }
+
+    #[must_use]
+    pub fn reevaluate_after(delay: SimDuration) -> Self {
+        Self::after(delay, Vec::new())
+    }
 }
 
 impl EvalOutput {
@@ -1252,6 +1257,43 @@ mod tests {
             g.set_atom_now(numeric, 8),
             Err(RuntimeError::ExpectedAtom(id)) if id == numeric
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn delayed_reevaluation_defers_dynamic_atom_dependencies()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = Graph::new(RuntimeConfig::default());
+        let ready_at_ms = g.add_input("ready_at_ms", q0()?, 10.0)?;
+        let snapshot = g.add_atom_input("snapshot", 1)?;
+        let observed = g.add_atom_input("observed", 0)?;
+        let evaluations = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&evaluations);
+        let _reaction = g.add_reaction("deadline-gated snapshot", move |c| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            let now_ms = c.now().as_nanos() / 1_000_000;
+            let ready_at = c.read_f64(ready_at_ms)? as i64;
+            if now_ms < ready_at {
+                return Ok(ReactionOutput::reevaluate_after(SimDuration::from_millis(
+                    ready_at - now_ms,
+                )));
+            }
+            Ok(ReactionOutput::immediate(vec![StateWrite::atom(
+                observed,
+                c.read_atom(snapshot)?,
+            )]))
+        })?;
+        g.settle()?;
+        assert_eq!(evaluations.load(Ordering::Relaxed), 1);
+
+        g.schedule_atom(snapshot, SimTime::from_millis(5), 2)?;
+        g.advance_to(SimTime::from_millis(5))?;
+        assert_eq!(evaluations.load(Ordering::Relaxed), 1);
+        assert_eq!(g.value_atom(observed)?, 0);
+
+        g.advance_to(SimTime::from_millis(10))?;
+        assert_eq!(g.value_atom(observed)?, 2);
+        assert_eq!(evaluations.load(Ordering::Relaxed), 2);
         Ok(())
     }
 
