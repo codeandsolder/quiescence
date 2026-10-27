@@ -68,7 +68,12 @@ The invariant is only:
 
 ## Layer 4: temporal scheduling
 
-The prototype uses one binary heap of scheduled events with generation stamps. The API should not require that implementation.
+The prototype uses one binary heap of scheduled events. The API distinguishes two causal meanings:
+
+- **Forecasts** are generation-stamped predictions derived from current dependencies. If a dependency changes before the forecast fires, the old event becomes stale.
+- **Scheduled callbacks** are keyed schedule-once wakeups. Once accepted they survive dependency changes; another request with the same `(reaction, key)` is ignored until the callback is dequeued. Same-time callbacks order by lower numeric priority and then insertion sequence. The key is intentionally domain-neutral: a Minecraft adapter can intern `(position, block)` while another domain can choose a different identity.
+
+This distinction matters because rescheduling a prediction when its assumptions change is correct, while moving an already-pending vanilla block tick merely because a neighbor changed is not. The API should not require the current heap/set implementation.
 
 Possible replacements include calendar queues, timing wheels, hierarchical queues, per-region queues or specialized indexes for certificate expiry.
 

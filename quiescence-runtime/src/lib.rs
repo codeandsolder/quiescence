@@ -74,10 +74,18 @@ impl StateWrite {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScheduledReevaluation {
+    pub key: u64,
+    pub after: SimDuration,
+    pub priority: i32,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReactionOutput {
     pub transition_after: Option<SimDuration>,
     pub writes: Vec<StateWrite>,
+    pub scheduled_reevaluations: Vec<ScheduledReevaluation>,
 }
 impl ReactionOutput {
     #[must_use]
@@ -85,6 +93,7 @@ impl ReactionOutput {
         Self {
             transition_after: None,
             writes: Vec::new(),
+            scheduled_reevaluations: Vec::new(),
         }
     }
 
@@ -93,6 +102,7 @@ impl ReactionOutput {
         Self {
             transition_after: Some(delay),
             writes,
+            scheduled_reevaluations: Vec::new(),
         }
     }
 
@@ -104,6 +114,29 @@ impl ReactionOutput {
     #[must_use]
     pub fn reevaluate_after(delay: SimDuration) -> Self {
         Self::after(delay, Vec::new())
+    }
+
+    #[must_use]
+    pub fn schedule_once_after(delay: SimDuration, key: u64, priority: i32) -> Self {
+        Self {
+            transition_after: None,
+            writes: Vec::new(),
+            scheduled_reevaluations: vec![ScheduledReevaluation {
+                key,
+                after: delay,
+                priority,
+            }],
+        }
+    }
+
+    #[must_use]
+    pub fn and_schedule_once_after(mut self, delay: SimDuration, key: u64, priority: i32) -> Self {
+        self.scheduled_reevaluations.push(ScheduledReevaluation {
+            key,
+            after: delay,
+            priority,
+        });
+        self
     }
 }
 
@@ -234,6 +267,7 @@ pub struct Graph {
     node_is_dirty: Vec<bool>,
     reaction_is_dirty: Vec<bool>,
     events: BinaryHeap<ScheduledEvent>,
+    pending_scheduled_reactions: BTreeSet<(ReactionId, u64)>,
     next_sequence: u64,
     transitions: Vec<TransitionRecord>,
 }
@@ -251,6 +285,7 @@ impl Graph {
             node_is_dirty: Vec::new(),
             reaction_is_dirty: Vec::new(),
             events: BinaryHeap::new(),
+            pending_scheduled_reactions: BTreeSet::new(),
             next_sequence: 0,
             transitions: Vec::new(),
         }
@@ -596,21 +631,29 @@ impl Graph {
         reaction.generation = reaction.generation.saturating_add(1);
         let generation = reaction.generation;
 
-        if let Some(delay) = output.transition_after {
+        let ReactionOutput {
+            transition_after,
+            writes,
+            scheduled_reevaluations,
+        } = output;
+        if let Some(delay) = transition_after {
             if delay == SimDuration::ZERO {
-                self.apply_state_writes(&output.writes)?;
+                self.apply_state_writes(&writes)?;
             } else {
                 self.push_event(
                     self.now.saturating_add(delay),
                     EventKind::ReactionTransition {
                         reaction: id,
                         generation,
-                        writes: output.writes,
+                        writes,
                     },
                 );
             }
-        } else if !output.writes.is_empty() {
+        } else if !writes.is_empty() {
             return Err(RuntimeError::UnscheduledReactionWrites(id));
+        }
+        for request in scheduled_reevaluations {
+            self.schedule_reaction_once(id, request);
         }
         Ok(())
     }
@@ -683,6 +726,11 @@ impl Graph {
                 if self.nodes[node.index()].generation == generation {
                     self.mark_dirty(WorkId::Node(node));
                 }
+                Ok(())
+            }
+            EventKind::ScheduledReaction { reaction, key } => {
+                self.pending_scheduled_reactions.remove(&(reaction, key));
+                self.mark_dirty(WorkId::Reaction(reaction));
                 Ok(())
             }
             EventKind::ReactionTransition {
@@ -797,10 +845,36 @@ impl Graph {
         }
     }
 
+    fn schedule_reaction_once(&mut self, reaction: ReactionId, request: ScheduledReevaluation) {
+        if !self
+            .pending_scheduled_reactions
+            .insert((reaction, request.key))
+        {
+            return;
+        }
+        self.push_event_with_priority(
+            self.now.saturating_add(request.after),
+            request.priority,
+            EventKind::ScheduledReaction {
+                reaction,
+                key: request.key,
+            },
+        );
+    }
+
     fn push_event(&mut self, at: SimTime, kind: EventKind) {
+        self.push_event_with_priority(at, 0, kind);
+    }
+
+    fn push_event_with_priority(&mut self, at: SimTime, priority: i32, kind: EventKind) {
         let sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.saturating_add(1);
-        self.events.push(ScheduledEvent { at, sequence, kind });
+        self.events.push(ScheduledEvent {
+            at,
+            priority,
+            sequence,
+            kind,
+        });
     }
 
     fn node(&self, id: NodeId) -> Result<&Node, RuntimeError> {
@@ -836,10 +910,15 @@ enum EventKind {
         generation: u64,
         writes: Vec<StateWrite>,
     },
+    ScheduledReaction {
+        reaction: ReactionId,
+        key: u64,
+    },
 }
 #[derive(Clone, Debug, PartialEq)]
 struct ScheduledEvent {
     at: SimTime,
+    priority: i32,
     sequence: u64,
     kind: EventKind,
 }
@@ -849,6 +928,7 @@ impl Ord for ScheduledEvent {
         other
             .at
             .cmp(&self.at)
+            .then_with(|| other.priority.cmp(&self.priority))
             .then_with(|| other.sequence.cmp(&self.sequence))
     }
 }
@@ -983,8 +1063,10 @@ impl From<QuantizeError> for RuntimeError {
 
 #[cfg(test)]
 mod tests {
-    use super::{EvalOutput, Graph, ReactionOutput, RuntimeConfig, RuntimeError, StateWrite};
-    use quiescence_core::{Quantization, SimDuration, SimTime};
+    use super::{
+        CanonicalValue, EvalOutput, Graph, ReactionOutput, RuntimeConfig, RuntimeError, StateWrite,
+    };
+    use quiescence_core::{Bucket, Quantization, SimDuration, SimTime};
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -1257,6 +1339,89 @@ mod tests {
             g.set_atom_now(numeric, 8),
             Err(RuntimeError::ExpectedAtom(id)) if id == numeric
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn keyed_scheduled_reaction_preserves_first_pending_request()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = Graph::new(RuntimeConfig::default());
+        let trigger = g.add_input("trigger", q0()?, 1.0)?;
+        let evaluations = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&evaluations);
+        let _reaction = g.add_reaction("schedule once", move |c| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            if c.read_bool(trigger)? {
+                Ok(ReactionOutput::schedule_once_after(
+                    SimDuration::from_millis(10),
+                    7,
+                    0,
+                ))
+            } else {
+                Ok(ReactionOutput::idle())
+            }
+        })?;
+        g.settle()?;
+        assert_eq!(g.next_event_time(), Some(SimTime::from_millis(10)));
+
+        g.schedule_input(trigger, SimTime::from_millis(5), 2.0)?;
+        g.advance_to(SimTime::from_millis(5))?;
+        assert_eq!(evaluations.load(Ordering::Relaxed), 2);
+        assert_eq!(g.next_event_time(), Some(SimTime::from_millis(10)));
+
+        g.advance_to(SimTime::from_millis(10))?;
+        assert_eq!(evaluations.load(Ordering::Relaxed), 3);
+        assert_eq!(g.next_event_time(), Some(SimTime::from_millis(20)));
+        Ok(())
+    }
+
+    #[test]
+    fn scheduled_reaction_priority_orders_same_time_callbacks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = Graph::new(RuntimeConfig::default());
+        let marker = g.add_input("marker", q0()?, 0.0)?;
+        let _normal = g.add_reaction("normal priority", move |c| {
+            if c.now() == SimTime::ZERO {
+                Ok(ReactionOutput::schedule_once_after(
+                    SimDuration::from_millis(10),
+                    1,
+                    0,
+                ))
+            } else {
+                Ok(ReactionOutput::immediate(vec![StateWrite::new(
+                    marker, 2.0,
+                )]))
+            }
+        })?;
+        let _high = g.add_reaction("high priority", move |c| {
+            if c.now() == SimTime::ZERO {
+                Ok(ReactionOutput::schedule_once_after(
+                    SimDuration::from_millis(10),
+                    1,
+                    -1,
+                ))
+            } else {
+                Ok(ReactionOutput::immediate(vec![StateWrite::new(
+                    marker, 1.0,
+                )]))
+            }
+        })?;
+        g.settle()?;
+        g.advance_to(SimTime::from_millis(10))?;
+        assert_eq!(g.value_f64(marker)?, 2.0);
+        let marker_values: Vec<_> = g
+            .take_transitions()
+            .into_iter()
+            .filter(|transition| transition.node == marker)
+            .map(|transition| transition.new)
+            .collect();
+        assert_eq!(
+            marker_values,
+            vec![
+                CanonicalValue::Numeric(Bucket::new(1)),
+                CanonicalValue::Numeric(Bucket::new(2)),
+            ]
+        );
         Ok(())
     }
 
