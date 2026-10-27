@@ -1,7 +1,8 @@
 #![forbid(unsafe_code)]
 
 use quiescence_core::{
-    Bucket, Estimate, NodeId, Quantization, QuantizeError, ReactionId, SimDuration, SimTime,
+    Bucket, Estimate, HistoryId, NodeId, Quantization, QuantizeError, ReactionId, SimDuration,
+    SimTime,
 };
 use std::{
     cell::RefCell,
@@ -75,6 +76,19 @@ impl StateWrite {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WindowRecord {
+    pub history: HistoryId,
+    pub key: u64,
+}
+
+impl WindowRecord {
+    #[must_use]
+    pub const fn new(history: HistoryId, key: u64) -> Self {
+        Self { history, key }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ScheduledReevaluation {
     pub key: u64,
     pub after: SimDuration,
@@ -85,6 +99,7 @@ pub struct ScheduledReevaluation {
 pub struct ReactionOutput {
     pub transition_after: Option<SimDuration>,
     pub writes: Vec<StateWrite>,
+    pub window_records: Vec<WindowRecord>,
     pub scheduled_reevaluations: Vec<ScheduledReevaluation>,
 }
 impl ReactionOutput {
@@ -93,6 +108,7 @@ impl ReactionOutput {
         Self {
             transition_after: None,
             writes: Vec::new(),
+            window_records: Vec::new(),
             scheduled_reevaluations: Vec::new(),
         }
     }
@@ -102,6 +118,7 @@ impl ReactionOutput {
         Self {
             transition_after: Some(delay),
             writes,
+            window_records: Vec::new(),
             scheduled_reevaluations: Vec::new(),
         }
     }
@@ -121,6 +138,7 @@ impl ReactionOutput {
         Self {
             transition_after: None,
             writes: Vec::new(),
+            window_records: Vec::new(),
             scheduled_reevaluations: vec![ScheduledReevaluation {
                 key,
                 after: delay,
@@ -136,6 +154,12 @@ impl ReactionOutput {
             after: delay,
             priority,
         });
+        self
+    }
+
+    #[must_use]
+    pub fn and_record_window(mut self, history: HistoryId, key: u64) -> Self {
+        self.window_records.push(WindowRecord::new(history, key));
         self
     }
 }
@@ -175,6 +199,7 @@ impl EvalOutput {
 pub struct EvalContext<'a> {
     now: SimTime,
     nodes: &'a [Node],
+    windows: &'a [EventWindow],
     reads: RefCell<BTreeSet<NodeId>>,
 }
 impl EvalContext<'_> {
@@ -222,8 +247,50 @@ impl EvalContext<'_> {
         };
         Ok(value)
     }
+    pub fn window_count(&self, id: HistoryId, key: u64) -> Result<usize, EvalError> {
+        let window = self
+            .windows
+            .get(id.index())
+            .ok_or(EvalError::UnknownHistory(id))?;
+        Ok(window.count_at(self.now, key))
+    }
+
     fn dependencies(&self) -> BTreeSet<NodeId> {
         self.reads.borrow().clone()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WindowEvent {
+    at: SimTime,
+    key: u64,
+}
+
+struct EventWindow {
+    name: String,
+    duration: SimDuration,
+    events: VecDeque<WindowEvent>,
+}
+
+impl EventWindow {
+    fn count_at(&self, now: SimTime, key: u64) -> usize {
+        self.events
+            .iter()
+            .filter(|event| {
+                event.key == key
+                    && now.as_nanos().saturating_sub(event.at.as_nanos())
+                        <= self.duration.as_nanos()
+            })
+            .count()
+    }
+
+    fn record(&mut self, now: SimTime, key: u64) {
+        while self.events.front().is_some_and(|event| {
+            now.as_nanos().saturating_sub(event.at.as_nanos()) > self.duration.as_nanos()
+        }) {
+            self.events.pop_front();
+        }
+        self.events.push_back(WindowEvent { at: now, key });
     }
 }
 
@@ -262,6 +329,7 @@ pub struct Graph {
     now: SimTime,
     nodes: Vec<Node>,
     reactions: Vec<Reaction>,
+    windows: Vec<EventWindow>,
     reaction_dependents: BTreeMap<NodeId, BTreeSet<ReactionId>>,
     dirty: VecDeque<WorkId>,
     node_is_dirty: Vec<bool>,
@@ -280,6 +348,7 @@ impl Graph {
             now: SimTime::ZERO,
             nodes: Vec::new(),
             reactions: Vec::new(),
+            windows: Vec::new(),
             reaction_dependents: BTreeMap::new(),
             dirty: VecDeque::new(),
             node_is_dirty: Vec::new(),
@@ -293,6 +362,22 @@ impl Graph {
     #[must_use]
     pub const fn now(&self) -> SimTime {
         self.now
+    }
+
+    pub fn add_event_window(
+        &mut self,
+        name: impl Into<String>,
+        duration: SimDuration,
+    ) -> Result<HistoryId, RuntimeError> {
+        let raw_id =
+            u32::try_from(self.windows.len()).map_err(|_| RuntimeError::TooManyHistories)?;
+        let id = HistoryId::from_index(raw_id);
+        self.windows.push(EventWindow {
+            name: name.into(),
+            duration,
+            events: VecDeque::new(),
+        });
+        Ok(id)
     }
 
     pub fn add_input(
@@ -412,6 +497,22 @@ impl Graph {
             .get(id.index())
             .ok_or(RuntimeError::UnknownReaction(id))?
             .name)
+    }
+
+    pub fn event_window_name(&self, id: HistoryId) -> Result<&str, RuntimeError> {
+        Ok(&self
+            .windows
+            .get(id.index())
+            .ok_or(RuntimeError::UnknownHistory(id))?
+            .name)
+    }
+
+    pub fn event_window_count(&self, id: HistoryId, key: u64) -> Result<usize, RuntimeError> {
+        let window = self
+            .windows
+            .get(id.index())
+            .ok_or(RuntimeError::UnknownHistory(id))?;
+        Ok(window.count_at(self.now, key))
     }
 
     pub fn value_bucket(&self, id: NodeId) -> Result<Bucket, RuntimeError> {
@@ -588,6 +689,7 @@ impl Graph {
         let context = EvalContext {
             now: self.now,
             nodes: &self.nodes,
+            windows: &self.windows,
             reads: RefCell::new(BTreeSet::new()),
         };
         let output =
@@ -643,6 +745,7 @@ impl Graph {
         let context = EvalContext {
             now: self.now,
             nodes: &self.nodes,
+            windows: &self.windows,
             reads: RefCell::new(BTreeSet::new()),
         };
         let output = evaluator(&context).map_err(|source| RuntimeError::ReactionEvaluation {
@@ -661,11 +764,12 @@ impl Graph {
         let ReactionOutput {
             transition_after,
             writes,
+            window_records,
             scheduled_reevaluations,
         } = output;
         if let Some(delay) = transition_after {
             if delay == SimDuration::ZERO {
-                self.apply_state_writes(&writes)?;
+                self.apply_reaction_effects(&writes, &window_records)?;
             } else {
                 self.push_event(
                     self.now.saturating_add(delay),
@@ -673,11 +777,12 @@ impl Graph {
                         reaction: id,
                         generation,
                         writes,
+                        window_records,
                     },
                 );
             }
-        } else if !writes.is_empty() {
-            return Err(RuntimeError::UnscheduledReactionWrites(id));
+        } else if !writes.is_empty() || !window_records.is_empty() {
+            return Err(RuntimeError::UnscheduledReactionEffects(id));
         }
         for request in scheduled_reevaluations {
             self.schedule_reaction_once(id, request);
@@ -771,6 +876,7 @@ impl Graph {
                 reaction,
                 generation,
                 writes,
+                window_records,
             } => {
                 let current_generation = self
                     .reactions
@@ -778,12 +884,29 @@ impl Graph {
                     .ok_or(RuntimeError::UnknownReaction(reaction))?
                     .generation;
                 if current_generation == generation {
-                    self.apply_state_writes(&writes)?;
+                    self.apply_reaction_effects(&writes, &window_records)?;
                     self.mark_dirty(WorkId::Reaction(reaction));
                 }
                 Ok(())
             }
         }
+    }
+
+    fn apply_reaction_effects(
+        &mut self,
+        writes: &[StateWrite],
+        window_records: &[WindowRecord],
+    ) -> Result<(), RuntimeError> {
+        for record in window_records {
+            if self.windows.get(record.history.index()).is_none() {
+                return Err(RuntimeError::UnknownHistory(record.history));
+            }
+        }
+        self.apply_state_writes(writes)?;
+        for record in window_records {
+            self.windows[record.history.index()].record(self.now, record.key);
+        }
+        Ok(())
     }
 
     fn apply_state_writes(&mut self, writes: &[StateWrite]) -> Result<(), RuntimeError> {
@@ -943,6 +1066,7 @@ enum EventKind {
         reaction: ReactionId,
         generation: u64,
         writes: Vec<StateWrite>,
+        window_records: Vec<WindowRecord>,
     },
     ExternalReaction {
         reaction: ReactionId,
@@ -989,6 +1113,7 @@ pub enum EvalError {
     UnknownNode(NodeId),
     ExpectedNumeric(NodeId),
     ExpectedAtom(NodeId),
+    UnknownHistory(HistoryId),
     Message(String),
 }
 impl fmt::Display for EvalError {
@@ -997,6 +1122,7 @@ impl fmt::Display for EvalError {
             Self::UnknownNode(id) => write!(f, "evaluator read unknown node {id:?}"),
             Self::ExpectedNumeric(id) => write!(f, "evaluator expected numeric node {id:?}"),
             Self::ExpectedAtom(id) => write!(f, "evaluator expected atom node {id:?}"),
+            Self::UnknownHistory(id) => write!(f, "evaluator read unknown history {id:?}"),
             Self::Message(m) => f.write_str(m),
         }
     }
@@ -1013,8 +1139,10 @@ pub enum RuntimeError {
     ExpectedAtom(NodeId),
     TooManyNodes,
     TooManyReactions,
+    TooManyHistories,
     UnknownReaction(ReactionId),
-    UnscheduledReactionWrites(ReactionId),
+    UnknownHistory(HistoryId),
+    UnscheduledReactionEffects(ReactionId),
     DuplicateStateWrite(NodeId),
     CorruptEventQueue,
     EventInPast {
@@ -1046,11 +1174,13 @@ impl fmt::Display for RuntimeError {
             Self::ExpectedAtom(id) => write!(f, "node {id:?} is not an atom"),
             Self::TooManyNodes => f.write_str("graph contains too many nodes"),
             Self::TooManyReactions => f.write_str("graph contains too many reactions"),
+            Self::TooManyHistories => f.write_str("graph contains too many temporal histories"),
             Self::UnknownReaction(id) => write!(f, "unknown reaction {id:?}"),
-            Self::UnscheduledReactionWrites(id) => {
+            Self::UnknownHistory(id) => write!(f, "unknown temporal history {id:?}"),
+            Self::UnscheduledReactionEffects(id) => {
                 write!(
                     f,
-                    "reaction {id:?} returned writes without a transition time"
+                    "reaction {id:?} returned effects without a transition time"
                 )
             }
             Self::DuplicateStateWrite(id) => {
@@ -1376,6 +1506,49 @@ mod tests {
             g.set_atom_now(numeric, 8),
             Err(RuntimeError::ExpectedAtom(id)) if id == numeric
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn lazy_event_window_counts_keyed_history_without_expiry_wakeups()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = Graph::new(RuntimeConfig::default());
+        let history = g.add_event_window("toggle history", SimDuration::from_millis(60))?;
+        let burned_out = g.add_input("burned out", q0()?, 0.0)?;
+        let key = 0x00ab_cdef_u64;
+        let reaction = g.add_reaction("window threshold", move |c| {
+            if c.now() == SimTime::ZERO {
+                return Ok(ReactionOutput::idle());
+            }
+            let next_count = c.window_count(history, key)?.saturating_add(1);
+            let writes = if next_count >= 8 {
+                vec![StateWrite::new(burned_out, 1.0)]
+            } else {
+                Vec::new()
+            };
+            Ok(ReactionOutput::immediate(writes).and_record_window(history, key))
+        })?;
+        g.settle()?;
+
+        for millisecond in 1..=7 {
+            g.schedule_reaction_event(reaction, SimTime::from_millis(millisecond), 0)?;
+        }
+        g.advance_to(SimTime::from_millis(7))?;
+        assert_eq!(g.event_window_count(history, key)?, 7);
+        assert_eq!(g.value_f64(burned_out)?, 0.0);
+
+        g.schedule_reaction_event(reaction, SimTime::from_millis(8), 0)?;
+        g.advance_to(SimTime::from_millis(8))?;
+        assert_eq!(g.event_window_count(history, key)?, 8);
+        assert_eq!(g.value_f64(burned_out)?, 1.0);
+        assert_eq!(g.next_event_time(), None);
+
+        g.advance_to(SimTime::from_millis(61))?;
+        assert_eq!(g.event_window_count(history, key)?, 8);
+        g.advance_to(SimTime::from_millis(62))?;
+        assert_eq!(g.event_window_count(history, key)?, 7);
+        g.advance_to(SimTime::from_millis(69))?;
+        assert_eq!(g.event_window_count(history, key)?, 0);
         Ok(())
     }
 

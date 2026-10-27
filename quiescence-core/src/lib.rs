@@ -17,6 +17,20 @@ impl NodeId {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct HistoryId(u32);
+
+impl HistoryId {
+    #[must_use]
+    pub const fn from_index(index: u32) -> Self {
+        Self(index)
+    }
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ReactionId(u32);
 
 impl ReactionId {

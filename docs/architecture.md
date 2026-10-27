@@ -80,6 +80,12 @@ Possible replacements include calendar queues, timing wheels, hierarchical queue
 
 A stale prediction may be left in a queue and discarded cheaply when its generation no longer matches.
 
+### Lazy temporal windows
+
+Some recovered behavior depends on bounded history rather than a future deadline. An event window stores exact `(time, key)` records and answers keyed counts at the current causal time. Recording history is part of a reaction transition, so it commits alongside ordinary state writes. Expiration is lazy: a record simply stops contributing once its age exceeds the configured duration, and old front entries are physically pruned on later records. No expiry event is created merely to maintain bookkeeping.
+
+This deliberately is not a normal reactive dependency yet. Reading a window does not wake a reaction when wall time alone makes a record stale; the caller must already have a causal event at which the history can matter. That matches the first recovered use case, redstone-torch burnout, where the source only checks/prunes history during scheduled torch callbacks. If a future corpus case requires autonomous "wake exactly when this window count decays" semantics, that should be added as an explicit stronger contract rather than silently imposed on every history record.
+
 ## Layer 5: cycle solving
 
 The generic fallback is bounded same-time microstepping. It exists because failure must be finite and diagnosable.
