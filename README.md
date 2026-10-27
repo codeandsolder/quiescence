@@ -12,24 +12,31 @@ The runtime is intentionally domain-neutral. Industrial/factory simulation and b
 
 ## Current prototype
 
-- Per-node decimal quantization.
+- Per-node decimal quantization for numeric facts.
 - Built-in hysteresis measured in least-significant decimal digits.
-- `f64` working values behind the quantization boundary; canonical observable state is an integer bucket.
+- Exact atom nodes for canonical interned/snapshot identities such as immutable resource-state handles.
+- `f64` numeric working values behind the quantization boundary; canonical observable state is either an integer bucket or an exact atom.
 - Dynamic dependency discovery during evaluation.
-- Equality cutoff: unchanged buckets do not wake dependants.
+- Equality cutoff: unchanged canonical values do not wake dependants.
 - Delayed outputs; delay can itself be read from another node.
 - Future input events and generation-stamped predicted events.
 - Cyclic graphs as a normal case.
 - Bounded same-time stabilization with explicit `CalculationInstability` instead of an infinite loop.
 - Validity timers for nodes that know when they next need reconsideration.
 
-The numerical layer is deliberately replaceable. Point `f64` evaluation is merely the first implementation; bounded/refinable estimates can be added without changing graph semantics.
+The numerical layer is deliberately replaceable. Point `f64` evaluation is merely the first implementation; bounded/refinable estimates can be added without changing graph semantics. Exact atoms are deliberately much simpler: an atom is already canonical graph-observable identity and compares exactly.
 
 ## Numerical semantics
 
 A numeric node declares `decimal_places` and `hysteresis_lsd`. Working arithmetic may use floating point, but floating point is not graph-observable state. Graph equality, serialization and propagation decisions use the canonical integer bucket.
 
 A one-LSD hysteresis widens the retention region by one last digit before a node moves into a new bucket. This makes the chosen information resolution part of the model and gives the runtime a natural early-termination boundary.
+
+## Exact atom semantics
+
+An atom node stores an exact `u64` canonical identity. It is intended for interned values or handles into an immutable/persistent domain store: inventory snapshots, item-stack identities, block-state snapshots, topology versions, and similar facts that should participate in dependencies and transactions but should never be coerced through floating point.
+
+The graph does not interpret the handle. Equal handles mean equal observable state; changing a handle invalidates readers exactly like changing a numeric bucket. Reactions can atomically commit mixed numeric and atom writes, so a domain transaction can publish a new canonical snapshot together with counters, deadlines, or rates without exposing an intermediate state.
 
 ## Cycles
 

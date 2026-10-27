@@ -15,9 +15,9 @@ These are the pieces callers should be able to rely on:
 
 Everything else is replaceable.
 
-## Layer 1: observable numeric policy
+## Layer 1: canonical observable policy
 
-The first implementation uses decimal quantization plus last-digit hysteresis:
+Numeric facts use decimal quantization plus last-digit hysteresis:
 
 ```text
 working value -> quantizer/hysteresis -> integer observable bucket
@@ -36,11 +36,15 @@ Future policies may use:
 
 The important contract is that an evaluator either determines the correct observable bucket or explicitly reports that more precision/refinement is required.
 
+Not every fact is numeric. Exact atom nodes store a canonical `u64` identity with ordinary exact equality. The intended use is a stable handle into an interned, immutable, or persistent domain store rather than a lossy encoding of structured state. This lets inventories, item stacks, block states, topology snapshots, and other structured resources participate in the same dependency and causal-transition machinery without making Quiescence depend on their domain types.
+
+The canonical-state contract is therefore broader than numeric quantization: a node exposes a stable comparable value, currently either a numeric bucket or an exact atom. Future canonical representations may be added without changing causal scheduling semantics.
+
 ## Layer 2: evaluation and reactions
 
 A derived-node evaluator reads nodes through an evaluation context and produces a candidate result plus temporal information. Reads form the current dependency set.
 
-A reaction uses the same read-tracking context, but its output is a forecasted state transition: an optional causal delay plus an atomic batch of writes to state/input nodes. Reaction dependencies are dynamic just like derived-node dependencies. If any dependency changes before the forecasted transition, the reaction is reevaluated and the old generation-stamped forecast becomes stale.
+A reaction uses the same read-tracking context, but its output is a forecasted state transition: an optional causal delay plus an atomic batch of numeric and/or exact-atom writes to state/input nodes. Reaction dependencies are dynamic just like derived-node dependencies. If any dependency changes before the forecasted transition, the reaction is reevaluated and the old generation-stamped forecast becomes stale.
 
 This keeps evaluation pure while making side effects explicit and inspectable. A reaction does not mutate graph state while deciding what should happen; the runtime applies its write batch only when the causal boundary is reached.
 
@@ -51,6 +55,8 @@ Dense spatial work remains outside this abstraction when the graph adds no seman
 ## Layer 3: dependency storage and propagation
 
 The prototype uses per-node `BTreeSet`s because they make correctness easy to inspect. This is intentionally disposable.
+
+The current exact-atom prototype stores node state as a numeric-or-atom enum. In a same-load three-run smoke comparison against `7a45dc9`, the median 100k-node full-propagation path moved from about 21.7 ms to 22.6 ms (roughly 4%); sparse cutoff latency remained dominated by noise. If exact atoms remain sparse, moving their payloads into a side arena is an obvious way to remove that common numeric-node storage/cache tax without changing semantics.
 
 Likely later representations include packed adjacency lists, generation-stamped edge arenas, small-vector fast paths, SCC-local layouts and compiled stable regions.
 

@@ -35,15 +35,42 @@ pub struct EvalOutput {
     pub delay: SimDuration,
     pub valid_for: Option<SimDuration>,
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CanonicalValue {
+    Numeric(Bucket),
+    Atom(u64),
+}
+
+impl fmt::Display for CanonicalValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Numeric(bucket) => write!(f, "{}", bucket.raw()),
+            Self::Atom(value) => write!(f, "atom:{value}"),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct StateWrite {
-    pub node: NodeId,
-    pub value: f64,
+pub enum StateWrite {
+    Numeric { node: NodeId, value: f64 },
+    Atom { node: NodeId, value: u64 },
 }
 impl StateWrite {
     #[must_use]
     pub const fn new(node: NodeId, value: f64) -> Self {
-        Self { node, value }
+        Self::Numeric { node, value }
+    }
+
+    #[must_use]
+    pub const fn atom(node: NodeId, value: u64) -> Self {
+        Self::Atom { node, value }
+    }
+
+    #[must_use]
+    pub const fn node(self) -> NodeId {
+        match self {
+            Self::Numeric { node, .. } | Self::Atom { node, .. } => node,
+        }
     }
 }
 
@@ -123,7 +150,10 @@ impl EvalContext<'_> {
             .get(id.index())
             .ok_or(EvalError::UnknownNode(id))?;
         self.reads.borrow_mut().insert(id);
-        Ok(node.bucket)
+        let NodeState::Numeric { bucket, .. } = node.state else {
+            return Err(EvalError::ExpectedNumeric(id));
+        };
+        Ok(bucket)
     }
     pub fn read_f64(&self, id: NodeId) -> Result<f64, EvalError> {
         let node = self
@@ -131,20 +161,45 @@ impl EvalContext<'_> {
             .get(id.index())
             .ok_or(EvalError::UnknownNode(id))?;
         self.reads.borrow_mut().insert(id);
-        Ok(node.quantization.decode(node.bucket))
+        let NodeState::Numeric {
+            quantization,
+            bucket,
+        } = node.state
+        else {
+            return Err(EvalError::ExpectedNumeric(id));
+        };
+        Ok(quantization.decode(bucket))
     }
     pub fn read_bool(&self, id: NodeId) -> Result<bool, EvalError> {
         Ok(self.read_bucket(id)?.raw() != 0)
+    }
+    pub fn read_atom(&self, id: NodeId) -> Result<u64, EvalError> {
+        let node = self
+            .nodes
+            .get(id.index())
+            .ok_or(EvalError::UnknownNode(id))?;
+        self.reads.borrow_mut().insert(id);
+        let NodeState::Atom(value) = node.state else {
+            return Err(EvalError::ExpectedAtom(id));
+        };
+        Ok(value)
     }
     fn dependencies(&self) -> BTreeSet<NodeId> {
         self.reads.borrow().clone()
     }
 }
 
+enum NodeState {
+    Numeric {
+        quantization: Quantization,
+        bucket: Bucket,
+    },
+    Atom(u64),
+}
+
 struct Node {
     name: String,
-    quantization: Quantization,
-    bucket: Bucket,
+    state: NodeState,
     evaluator: Option<EvalFn>,
     dependencies: BTreeSet<NodeId>,
     dependents: BTreeSet<NodeId>,
@@ -209,6 +264,25 @@ impl Graph {
         self.add_node(name, q, initial, None)
     }
 
+    pub fn add_atom_input(
+        &mut self,
+        name: impl Into<String>,
+        initial: u64,
+    ) -> Result<NodeId, RuntimeError> {
+        let raw_id = u32::try_from(self.nodes.len()).map_err(|_| RuntimeError::TooManyNodes)?;
+        let id = NodeId::from_index(raw_id);
+        self.nodes.push(Node {
+            name: name.into(),
+            state: NodeState::Atom(initial),
+            evaluator: None,
+            dependencies: BTreeSet::new(),
+            dependents: BTreeSet::new(),
+            generation: 0,
+        });
+        self.node_is_dirty.push(false);
+        Ok(id)
+    }
+
     pub fn add_derived<F>(
         &mut self,
         name: impl Into<String>,
@@ -235,8 +309,10 @@ impl Graph {
         let derived = evaluator.is_some();
         self.nodes.push(Node {
             name: name.into(),
-            quantization: q,
-            bucket,
+            state: NodeState::Numeric {
+                quantization: q,
+                bucket,
+            },
             evaluator,
             dependencies: BTreeSet::new(),
             dependents: BTreeSet::new(),
@@ -257,6 +333,9 @@ impl Graph {
             .nodes
             .get_mut(id.index())
             .ok_or(RuntimeError::UnknownNode(id))?;
+        if !matches!(node.state, NodeState::Numeric { .. }) {
+            return Err(RuntimeError::ExpectedNumeric(id));
+        }
         node.evaluator = Some(Arc::new(evaluator));
         self.mark_dirty(WorkId::Node(id));
         Ok(())
@@ -296,15 +375,35 @@ impl Graph {
     }
 
     pub fn value_bucket(&self, id: NodeId) -> Result<Bucket, RuntimeError> {
-        Ok(self.node(id)?.bucket)
+        let NodeState::Numeric { bucket, .. } = self.node(id)?.state else {
+            return Err(RuntimeError::ExpectedNumeric(id));
+        };
+        Ok(bucket)
     }
     pub fn value_f64(&self, id: NodeId) -> Result<f64, RuntimeError> {
-        let n = self.node(id)?;
-        Ok(n.quantization.decode(n.bucket))
+        let NodeState::Numeric {
+            quantization,
+            bucket,
+        } = self.node(id)?.state
+        else {
+            return Err(RuntimeError::ExpectedNumeric(id));
+        };
+        Ok(quantization.decode(bucket))
+    }
+    pub fn value_atom(&self, id: NodeId) -> Result<u64, RuntimeError> {
+        let NodeState::Atom(value) = self.node(id)?.state else {
+            return Err(RuntimeError::ExpectedAtom(id));
+        };
+        Ok(value)
     }
 
     pub fn set_input_now(&mut self, id: NodeId, value: f64) -> Result<(), RuntimeError> {
-        self.apply_input(id, value)?;
+        self.apply_state_writes(&[StateWrite::new(id, value)])?;
+        self.settle()
+    }
+
+    pub fn set_atom_now(&mut self, id: NodeId, value: u64) -> Result<(), RuntimeError> {
+        self.apply_state_writes(&[StateWrite::atom(id, value)])?;
         self.settle()
     }
 
@@ -321,7 +420,34 @@ impl Graph {
                 requested: at,
             });
         }
-        self.push_event(at, EventKind::SetInput { node: id, value });
+        self.push_event(
+            at,
+            EventKind::SetState {
+                write: StateWrite::new(id, value),
+            },
+        );
+        Ok(())
+    }
+
+    pub fn schedule_atom(
+        &mut self,
+        id: NodeId,
+        at: SimTime,
+        value: u64,
+    ) -> Result<(), RuntimeError> {
+        self.node(id)?;
+        if at < self.now {
+            return Err(RuntimeError::EventInPast {
+                now: self.now,
+                requested: at,
+            });
+        }
+        self.push_event(
+            at,
+            EventKind::SetState {
+                write: StateWrite::atom(id, value),
+            },
+        );
         Ok(())
     }
 
@@ -402,10 +528,14 @@ impl Graph {
         let deps = context.dependencies();
         self.update_dependencies(WorkId::Node(id), deps)?;
 
-        let current = self.nodes[id.index()].bucket;
-        let next = self.nodes[id.index()]
-            .quantization
-            .resolve(Some(current), output.estimate)?;
+        let (quantization, current) = match self.nodes[id.index()].state {
+            NodeState::Numeric {
+                quantization,
+                bucket,
+            } => (quantization, bucket),
+            NodeState::Atom(_) => return Err(RuntimeError::ExpectedNumeric(id)),
+        };
+        let next = quantization.resolve(Some(current), output.estimate)?;
         let generation = self.nodes[id.index()].generation.saturating_add(1);
         self.nodes[id.index()].generation = generation;
 
@@ -422,14 +552,14 @@ impl Graph {
             return Ok(());
         }
         if output.delay == SimDuration::ZERO {
-            self.commit(id, next);
+            self.commit(id, CanonicalValue::Numeric(next))?;
         } else {
             self.push_event(
                 self.now.saturating_add(output.delay),
                 EventKind::Commit {
                     node: id,
                     generation,
-                    bucket: next,
+                    value: CanonicalValue::Numeric(next),
                 },
             );
         }
@@ -531,15 +661,15 @@ impl Graph {
 
     fn apply_event(&mut self, event: EventKind) -> Result<(), RuntimeError> {
         match event {
-            EventKind::SetInput { node, value } => self.apply_input(node, value),
+            EventKind::SetState { write } => self.apply_state_writes(&[write]),
             EventKind::Commit {
                 node,
                 generation,
-                bucket,
+                value,
             } => {
                 self.node(node)?;
                 if self.nodes[node.index()].generation == generation {
-                    self.commit(node, bucket);
+                    self.commit(node, value)?;
                 }
                 Ok(())
             }
@@ -569,50 +699,71 @@ impl Graph {
         }
     }
 
-    fn apply_input(&mut self, id: NodeId, value: f64) -> Result<(), RuntimeError> {
-        self.apply_state_writes(&[StateWrite::new(id, value)])
-    }
-
     fn apply_state_writes(&mut self, writes: &[StateWrite]) -> Result<(), RuntimeError> {
         let mut seen = BTreeSet::new();
         let mut resolved = Vec::with_capacity(writes.len());
         for write in writes {
-            self.node(write.node)?;
-            if !seen.insert(write.node) {
-                return Err(RuntimeError::DuplicateStateWrite(write.node));
+            let node_id = write.node();
+            self.node(node_id)?;
+            if !seen.insert(node_id) {
+                return Err(RuntimeError::DuplicateStateWrite(node_id));
             }
-            if self.nodes[write.node.index()].evaluator.is_some() {
-                return Err(RuntimeError::NotAnInput(write.node));
+            if self.nodes[node_id.index()].evaluator.is_some() {
+                return Err(RuntimeError::NotAnInput(node_id));
             }
-            let current = self.nodes[write.node.index()].bucket;
-            let next = self.nodes[write.node.index()]
-                .quantization
-                .resolve(Some(current), Estimate::point(write.value))?;
-            resolved.push((write.node, current, next));
+            let current = canonical_value(&self.nodes[node_id.index()]);
+            let next = match (*write, &self.nodes[node_id.index()].state) {
+                (
+                    StateWrite::Numeric { value, .. },
+                    NodeState::Numeric {
+                        quantization,
+                        bucket,
+                    },
+                ) => CanonicalValue::Numeric(
+                    quantization.resolve(Some(*bucket), Estimate::point(value))?,
+                ),
+                (StateWrite::Atom { value, .. }, NodeState::Atom(_)) => CanonicalValue::Atom(value),
+                (StateWrite::Numeric { .. }, NodeState::Atom(_)) => {
+                    return Err(RuntimeError::ExpectedNumeric(node_id));
+                }
+                (StateWrite::Atom { .. }, NodeState::Numeric { .. }) => {
+                    return Err(RuntimeError::ExpectedAtom(node_id));
+                }
+            };
+            resolved.push((node_id, current, next));
         }
         for (node, current, next) in resolved {
             if next != current {
                 self.nodes[node.index()].generation =
                     self.nodes[node.index()].generation.saturating_add(1);
-                self.commit(node, next);
+                self.commit(node, next)?;
             }
         }
         Ok(())
     }
 
-    fn commit(&mut self, id: NodeId, bucket: Bucket) {
+    fn commit(&mut self, id: NodeId, value: CanonicalValue) -> Result<(), RuntimeError> {
         let node = &mut self.nodes[id.index()];
-        let old = node.bucket;
-        if old == bucket {
-            return;
+        let old = canonical_value(node);
+        if old == value {
+            return Ok(());
         }
-        node.bucket = bucket;
+        match (&mut node.state, value) {
+            (NodeState::Numeric { bucket, .. }, CanonicalValue::Numeric(next)) => *bucket = next,
+            (NodeState::Atom(current), CanonicalValue::Atom(next)) => *current = next,
+            (NodeState::Numeric { .. }, CanonicalValue::Atom(_)) => {
+                return Err(RuntimeError::ExpectedNumeric(id));
+            }
+            (NodeState::Atom(_), CanonicalValue::Numeric(_)) => {
+                return Err(RuntimeError::ExpectedAtom(id));
+            }
+        }
         self.transitions.push(TransitionRecord {
             at: self.now,
             node: id,
             node_name: node.name.clone(),
             old,
-            new: bucket,
+            new: value,
         });
         let node_dependents: Vec<_> = node.dependents.iter().copied().collect();
         for dependent in node_dependents {
@@ -627,6 +778,7 @@ impl Graph {
         for dependent in reaction_dependents {
             self.mark_dirty(WorkId::Reaction(dependent));
         }
+        Ok(())
     }
 
     fn mark_dirty(&mut self, work: WorkId) {
@@ -653,16 +805,22 @@ impl Graph {
     }
 }
 
+fn canonical_value(node: &Node) -> CanonicalValue {
+    match node.state {
+        NodeState::Numeric { bucket, .. } => CanonicalValue::Numeric(bucket),
+        NodeState::Atom(value) => CanonicalValue::Atom(value),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 enum EventKind {
-    SetInput {
-        node: NodeId,
-        value: f64,
+    SetState {
+        write: StateWrite,
     },
     Commit {
         node: NodeId,
         generation: u64,
-        bucket: Bucket,
+        value: CanonicalValue,
     },
     Reevaluate {
         node: NodeId,
@@ -700,19 +858,23 @@ pub struct TransitionRecord {
     pub at: SimTime,
     pub node: NodeId,
     pub node_name: String,
-    pub old: Bucket,
-    pub new: Bucket,
+    pub old: CanonicalValue,
+    pub new: CanonicalValue,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EvalError {
     UnknownNode(NodeId),
+    ExpectedNumeric(NodeId),
+    ExpectedAtom(NodeId),
     Message(String),
 }
 impl fmt::Display for EvalError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnknownNode(id) => write!(f, "evaluator read unknown node {id:?}"),
+            Self::ExpectedNumeric(id) => write!(f, "evaluator expected numeric node {id:?}"),
+            Self::ExpectedAtom(id) => write!(f, "evaluator expected atom node {id:?}"),
             Self::Message(m) => f.write_str(m),
         }
     }
@@ -725,6 +887,8 @@ pub enum RuntimeError {
     UnknownNode(NodeId),
     MissingEvaluator(NodeId),
     NotAnInput(NodeId),
+    ExpectedNumeric(NodeId),
+    ExpectedAtom(NodeId),
     TooManyNodes,
     TooManyReactions,
     UnknownReaction(ReactionId),
@@ -756,6 +920,8 @@ impl fmt::Display for RuntimeError {
             Self::UnknownNode(id) => write!(f, "unknown node {id:?}"),
             Self::MissingEvaluator(id) => write!(f, "node {id:?} has no evaluator"),
             Self::NotAnInput(id) => write!(f, "node {id:?} is derived, not an input"),
+            Self::ExpectedNumeric(id) => write!(f, "node {id:?} is not numeric"),
+            Self::ExpectedAtom(id) => write!(f, "node {id:?} is not an atom"),
             Self::TooManyNodes => f.write_str("graph contains too many nodes"),
             Self::TooManyReactions => f.write_str("graph contains too many reactions"),
             Self::UnknownReaction(id) => write!(f, "unknown reaction {id:?}"),
@@ -976,6 +1142,116 @@ mod tests {
         assert_eq!(evaluations.load(Ordering::Relaxed), before);
         g.set_input_now(enabled, 1.0)?;
         assert_eq!(g.value_f64(sink)?, 2.0);
+        Ok(())
+    }
+
+    #[test]
+    fn atom_state_uses_exact_equality_and_dynamic_dependencies()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = Graph::new(RuntimeConfig::default());
+        let snapshot = g.add_atom_input("inventory_snapshot", 10)?;
+        let sink = g.add_input("sink", q0()?, 0.0)?;
+        let evaluations = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&evaluations);
+        let _reaction = g.add_reaction("observe snapshot", move |c| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            let snapshot_value = c.read_atom(snapshot)?;
+            Ok(ReactionOutput::immediate(vec![StateWrite::new(
+                sink,
+                snapshot_value as f64,
+            )]))
+        })?;
+        g.settle()?;
+        assert_eq!(g.value_atom(snapshot)?, 10);
+        assert_eq!(g.value_f64(sink)?, 10.0);
+        let before = evaluations.load(Ordering::Relaxed);
+
+        g.set_atom_now(snapshot, 10)?;
+        assert_eq!(evaluations.load(Ordering::Relaxed), before);
+        g.set_atom_now(snapshot, 11)?;
+        assert!(evaluations.load(Ordering::Relaxed) > before);
+        assert_eq!(g.value_f64(sink)?, 11.0);
+        Ok(())
+    }
+
+    #[test]
+    fn scheduled_atom_change_invalidates_reaction_forecast()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = Graph::new(RuntimeConfig::default());
+        let snapshot = g.add_atom_input("snapshot", 1)?;
+        let output = g.add_input("output", q0()?, 0.0)?;
+        let _reaction = g.add_reaction("snapshot forecast", move |c| {
+            if c.read_atom(snapshot)? == 1 {
+                Ok(ReactionOutput::after(
+                    SimDuration::from_millis(10),
+                    vec![StateWrite::new(output, 1.0)],
+                ))
+            } else {
+                Ok(ReactionOutput::idle())
+            }
+        })?;
+        g.settle()?;
+        assert_eq!(g.next_event_time(), Some(SimTime::from_millis(10)));
+        g.schedule_atom(snapshot, SimTime::from_millis(5), 2)?;
+        g.advance_to(SimTime::from_millis(10))?;
+        assert_eq!(g.value_atom(snapshot)?, 2);
+        assert_eq!(g.value_f64(output)?, 0.0);
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_numeric_and_atom_reaction_writes_are_atomic() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut g = Graph::new(RuntimeConfig::default());
+        let trigger = g.add_input("trigger", q0()?, 0.0)?;
+        let count = g.add_input("count", q0()?, 0.0)?;
+        let snapshot = g.add_atom_input("snapshot", 100)?;
+        let mismatches = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&mismatches);
+        let _observer = g.add_derived("observer", q0()?, 0.0, move |c| {
+            let count_value = c.read_f64(count)? as u64;
+            let snapshot_value = c.read_atom(snapshot)?;
+            if snapshot_value != count_value + 100 {
+                seen.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(EvalOutput::immediate(count_value as f64))
+        })?;
+        let _reaction = g.add_reaction("mixed transaction", move |c| {
+            if c.read_bool(trigger)? {
+                Ok(ReactionOutput::after(
+                    SimDuration::from_millis(1),
+                    vec![StateWrite::new(count, 1.0), StateWrite::atom(snapshot, 101)],
+                ))
+            } else {
+                Ok(ReactionOutput::idle())
+            }
+        })?;
+        g.settle()?;
+        g.set_input_now(trigger, 1.0)?;
+        g.advance_to(SimTime::from_millis(1))?;
+        assert_eq!(g.value_f64(count)?, 1.0);
+        assert_eq!(g.value_atom(snapshot)?, 101);
+        assert_eq!(mismatches.load(Ordering::Relaxed), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn node_kinds_are_checked_at_runtime() -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = Graph::new(RuntimeConfig::default());
+        let numeric = g.add_input("numeric", q0()?, 1.0)?;
+        let atom = g.add_atom_input("atom", 7)?;
+        assert!(
+            matches!(g.value_atom(numeric), Err(RuntimeError::ExpectedAtom(id)) if id == numeric)
+        );
+        assert!(matches!(g.value_f64(atom), Err(RuntimeError::ExpectedNumeric(id)) if id == atom));
+        assert!(matches!(
+            g.set_input_now(atom, 1.0),
+            Err(RuntimeError::ExpectedNumeric(id)) if id == atom
+        ));
+        assert!(matches!(
+            g.set_atom_now(numeric, 8),
+            Err(RuntimeError::ExpectedAtom(id)) if id == numeric
+        ));
         Ok(())
     }
 

@@ -50,8 +50,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                 "             @ {:>10} ns  {:<28} {} -> {}",
                 t.at.as_nanos(),
                 t.node_name,
-                t.old.raw(),
-                t.new.raw()
+                t.old,
+                t.new
             );
         }
     }
