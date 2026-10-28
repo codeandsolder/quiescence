@@ -248,6 +248,7 @@ pub struct EvalContext<'a> {
     windows: &'a [EventWindow],
     reads: RefCell<BTreeSet<NodeId>>,
     scheduled_key: Option<u64>,
+    external_token: Option<u64>,
 }
 impl EvalContext<'_> {
     #[must_use]
@@ -259,6 +260,12 @@ impl EvalContext<'_> {
     #[must_use]
     pub const fn scheduled_key(&self) -> Option<u64> {
         self.scheduled_key
+    }
+
+    /// Source-defined token attached to an unkeyed external event, when applicable.
+    #[must_use]
+    pub const fn external_token(&self) -> Option<u64> {
+        self.external_token
     }
     pub fn read_bucket(&self, id: NodeId) -> Result<Bucket, EvalError> {
         let node = self
@@ -371,6 +378,7 @@ struct Reaction {
     generation: u64,
     track_dependencies: bool,
     pending_scheduled_key: Option<u64>,
+    pending_external_token: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -542,6 +550,7 @@ impl Graph {
             generation: 0,
             track_dependencies: true,
             pending_scheduled_key: None,
+            pending_external_token: None,
         });
         self.reaction_is_dirty.push(false);
         self.mark_dirty(WorkId::Reaction(id));
@@ -574,6 +583,7 @@ impl Graph {
             generation: 0,
             track_dependencies: false,
             pending_scheduled_key: None,
+            pending_external_token: None,
         });
         self.reaction_is_dirty.push(false);
         Ok(id)
@@ -703,7 +713,49 @@ impl Graph {
                 requested: at,
             });
         }
-        self.push_event_with_priority(at, priority, EventKind::ExternalReaction { reaction });
+        self.push_event_with_priority(
+            at,
+            priority,
+            EventKind::ExternalReaction {
+                reaction,
+                token: None,
+            },
+        );
+        Ok(())
+    }
+
+    /// Schedule one externally sourced reaction callback with an opaque source token.
+    ///
+    /// Tokens are delivered per event and do not participate in deduplication. Multiple events for
+    /// the same reaction and token remain distinct callbacks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown reaction or an event in the past.
+    pub fn schedule_reaction_event_with_token(
+        &mut self,
+        reaction: ReactionId,
+        at: SimTime,
+        priority: i32,
+        token: u64,
+    ) -> Result<(), RuntimeError> {
+        self.reactions
+            .get(reaction.index())
+            .ok_or(RuntimeError::UnknownReaction(reaction))?;
+        if at < self.now {
+            return Err(RuntimeError::EventInPast {
+                now: self.now,
+                requested: at,
+            });
+        }
+        self.push_event_with_priority(
+            at,
+            priority,
+            EventKind::ExternalReaction {
+                reaction,
+                token: Some(token),
+            },
+        );
         Ok(())
     }
 
@@ -780,6 +832,7 @@ impl Graph {
             windows: &self.windows,
             reads: RefCell::new(BTreeSet::new()),
             scheduled_key: None,
+            external_token: None,
         };
         let output =
             evaluator(&context).map_err(|source| RuntimeError::Evaluation { node: id, source })?;
@@ -825,7 +878,7 @@ impl Graph {
     }
 
     fn evaluate_reaction(&mut self, id: ReactionId) -> Result<(), RuntimeError> {
-        let (evaluator, track_dependencies, scheduled_key) = {
+        let (evaluator, track_dependencies, scheduled_key, external_token) = {
             let reaction = self
                 .reactions
                 .get_mut(id.index())
@@ -834,6 +887,7 @@ impl Graph {
                 reaction.evaluator.clone(),
                 reaction.track_dependencies,
                 reaction.pending_scheduled_key.take(),
+                reaction.pending_external_token.take(),
             )
         };
         let context = EvalContext {
@@ -842,6 +896,7 @@ impl Graph {
             windows: &self.windows,
             reads: RefCell::new(BTreeSet::new()),
             scheduled_key,
+            external_token,
         };
         let output = evaluator(&context).map_err(|source| RuntimeError::ReactionEvaluation {
             reaction: id,
@@ -971,12 +1026,13 @@ impl Graph {
                 }
                 Ok(())
             }
-            EventKind::ExternalReaction { reaction } => {
+            EventKind::ExternalReaction { reaction, token } => {
                 let target = self
                     .reactions
                     .get_mut(reaction.index())
                     .ok_or(RuntimeError::UnknownReaction(reaction))?;
                 target.pending_scheduled_key = None;
+                target.pending_external_token = token;
                 self.mark_dirty(WorkId::Reaction(reaction));
                 Ok(())
             }
@@ -987,6 +1043,7 @@ impl Graph {
                     .get_mut(reaction.index())
                     .ok_or(RuntimeError::UnknownReaction(reaction))?;
                 target.pending_scheduled_key = Some(key);
+                target.pending_external_token = None;
                 self.mark_dirty(WorkId::Reaction(reaction));
                 Ok(())
             }
@@ -1188,6 +1245,7 @@ enum EventKind {
     },
     ExternalReaction {
         reaction: ReactionId,
+        token: Option<u64>,
     },
     ScheduledReaction {
         reaction: ReactionId,
@@ -1668,6 +1726,31 @@ mod tests {
         assert_eq!(g.event_window_count(history, key)?, 7);
         g.advance_to(SimTime::from_millis(69))?;
         assert_eq!(g.event_window_count(history, key)?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn external_reaction_event_tokens_are_delivered_per_duplicate()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = Graph::new(RuntimeConfig::default());
+        let tokens = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&tokens);
+        let callback = g.add_event_callback("tokenized external callback", move |context| {
+            observed
+                .lock()
+                .map_err(|_| EvalError::Message(String::from("token capture lock poisoned")))?
+                .push(context.external_token());
+            Ok(ReactionOutput::idle())
+        })?;
+        g.schedule_reaction_event_with_token(callback, SimTime::from_millis(10), 0, 11)?;
+        g.schedule_reaction_event_with_token(callback, SimTime::from_millis(10), 0, 12)?;
+        g.advance_to(SimTime::from_millis(10))?;
+        assert_eq!(
+            *tokens
+                .lock()
+                .map_err(|_| String::from("token capture lock poisoned"))?,
+            vec![Some(11), Some(12)]
+        );
         Ok(())
     }
 
