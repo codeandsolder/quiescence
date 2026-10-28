@@ -21,7 +21,7 @@ The runtime is intentionally domain-neutral. Industrial/factory simulation and b
 - Delayed outputs; delay can itself be read from another node.
 - Future input events and generation-stamped predicted events.
 - Explicit reaction-only reevaluation deadlines (`ReactionOutput::reevaluate_after`) when reaching a causal boundary matters but no state should be written yet.
-- Keyed schedule-once reaction wakeups for callback semantics that must survive dependency changes. Duplicate `(reaction, key)` requests preserve the first pending deadline; same-time callbacks order by lower numeric priority, then insertion order.
+- Keyed schedule-once reaction wakeups for callback semantics that must survive dependency changes. A reaction can schedule either itself or an explicit target reaction; duplicate `(target reaction, key)` requests preserve the first pending deadline, and same-time callbacks order by lower numeric priority then insertion order.
 - Unkeyed external reaction events for dense or stochastic source adapters. They preserve duplicate callbacks, survive dependency changes, and use the same causal time/priority ordering without forcing source RNG state into the graph.
 - Cyclic graphs as a normal case.
 - Bounded same-time stabilization with explicit `CalculationInstability` instead of an infinite loop.

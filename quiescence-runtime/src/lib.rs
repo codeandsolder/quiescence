@@ -95,12 +95,21 @@ pub struct ScheduledReevaluation {
     pub priority: i32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScheduledReactionCallback {
+    pub reaction: ReactionId,
+    pub key: u64,
+    pub after: SimDuration,
+    pub priority: i32,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReactionOutput {
     pub transition_after: Option<SimDuration>,
     pub writes: Vec<StateWrite>,
     pub window_records: Vec<WindowRecord>,
     pub scheduled_reevaluations: Vec<ScheduledReevaluation>,
+    pub scheduled_callbacks: Vec<ScheduledReactionCallback>,
 }
 impl ReactionOutput {
     #[must_use]
@@ -110,6 +119,7 @@ impl ReactionOutput {
             writes: Vec::new(),
             window_records: Vec::new(),
             scheduled_reevaluations: Vec::new(),
+            scheduled_callbacks: Vec::new(),
         }
     }
 
@@ -120,6 +130,7 @@ impl ReactionOutput {
             writes,
             window_records: Vec::new(),
             scheduled_reevaluations: Vec::new(),
+            scheduled_callbacks: Vec::new(),
         }
     }
 
@@ -144,12 +155,47 @@ impl ReactionOutput {
                 after: delay,
                 priority,
             }],
+            scheduled_callbacks: Vec::new(),
         }
     }
 
     #[must_use]
     pub fn and_schedule_once_after(mut self, delay: SimDuration, key: u64, priority: i32) -> Self {
         self.scheduled_reevaluations.push(ScheduledReevaluation {
+            key,
+            after: delay,
+            priority,
+        });
+        self
+    }
+
+    #[must_use]
+    pub fn schedule_reaction_once_after(
+        reaction: ReactionId,
+        delay: SimDuration,
+        key: u64,
+        priority: i32,
+    ) -> Self {
+        let mut output = Self::idle();
+        output.scheduled_callbacks.push(ScheduledReactionCallback {
+            reaction,
+            key,
+            after: delay,
+            priority,
+        });
+        output
+    }
+
+    #[must_use]
+    pub fn and_schedule_reaction_once_after(
+        mut self,
+        reaction: ReactionId,
+        delay: SimDuration,
+        key: u64,
+        priority: i32,
+    ) -> Self {
+        self.scheduled_callbacks.push(ScheduledReactionCallback {
+            reaction,
             key,
             after: delay,
             priority,
@@ -766,6 +812,7 @@ impl Graph {
             writes,
             window_records,
             scheduled_reevaluations,
+            scheduled_callbacks,
         } = output;
         if let Some(delay) = transition_after {
             if delay == SimDuration::ZERO {
@@ -786,6 +833,19 @@ impl Graph {
         }
         for request in scheduled_reevaluations {
             self.schedule_reaction_once(id, request);
+        }
+        for callback in scheduled_callbacks {
+            self.reactions
+                .get(callback.reaction.index())
+                .ok_or(RuntimeError::UnknownReaction(callback.reaction))?;
+            self.schedule_reaction_once(
+                callback.reaction,
+                ScheduledReevaluation {
+                    key: callback.key,
+                    after: callback.after,
+                    priority: callback.priority,
+                },
+            );
         }
         Ok(())
     }
@@ -1645,6 +1705,44 @@ mod tests {
         g.advance_to(SimTime::from_millis(10))?;
         assert_eq!(evaluations.load(Ordering::Relaxed), 3);
         assert_eq!(g.next_event_time(), Some(SimTime::from_millis(20)));
+        Ok(())
+    }
+
+    #[test]
+    fn keyed_schedule_can_target_a_different_reaction() -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = Graph::new(RuntimeConfig::default());
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let observed_callbacks = Arc::clone(&callbacks);
+        let callback = g.add_reaction("scheduled callback target", move |c| {
+            if c.now() != SimTime::ZERO {
+                observed_callbacks.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(ReactionOutput::idle())
+        })?;
+        let producer_calls = Arc::new(AtomicUsize::new(0));
+        let observed_producer = Arc::clone(&producer_calls);
+        let producer = g.add_reaction("schedule producer", move |_| {
+            let call = observed_producer.fetch_add(1, Ordering::Relaxed);
+            if call < 2 {
+                Ok(ReactionOutput::schedule_reaction_once_after(
+                    callback,
+                    SimDuration::from_millis(10),
+                    7,
+                    -1,
+                ))
+            } else {
+                Ok(ReactionOutput::idle())
+            }
+        })?;
+        g.settle()?;
+        g.schedule_reaction_event(producer, SimTime::from_millis(5), 0)?;
+        g.advance_to(SimTime::from_millis(5))?;
+        assert_eq!(callbacks.load(Ordering::Relaxed), 0);
+        assert_eq!(g.next_event_time(), Some(SimTime::from_millis(10)));
+        g.advance_to(SimTime::from_millis(9))?;
+        assert_eq!(callbacks.load(Ordering::Relaxed), 0);
+        g.advance_to(SimTime::from_millis(10))?;
+        assert_eq!(callbacks.load(Ordering::Relaxed), 1);
         Ok(())
     }
 
