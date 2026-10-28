@@ -12,6 +12,7 @@ These are the pieces callers should be able to rely on:
 4. **Time is causal, not a polling cadence.** Work is scheduled because an event, certificate expiry or dependency change can matter.
 5. **Cycles are first-class.** Positive-delay cycles are ordinary temporal behavior. Same-time cycles must either settle under the selected solver or report instability.
 6. **Future knowledge is optional.** Correct state at `now` is mandatory; forecast depth is an optimization that may degrade gracefully under a budget.
+7. **External interaction occurs only at quiescent boundaries.** Other threads/domains enqueue causal input; the graph owner imports it between settled states. Nobody observes or mutates a half-stabilized graph.
 
 Everything else is replaceable.
 
@@ -53,6 +54,22 @@ This distinction is important for recovered game logic. A furnace, machine contr
 Dynamic dependencies can also change by temporal phase. A cooldown reaction can depend only on its deadline while waiting, then begin reading inventory/topology snapshots at expiry; if it is blocked, those snapshots become the dependencies that can wake it. This is a direct way to avoid both polling and irrelevant invalidations.
 
 Dense spatial work remains outside this abstraction when the graph adds no semantic leverage. Bulk block breaking, mesh/physics inner loops, and similar hot paths can stay specialized while their sparse boundary interactions enter the graph.
+
+## External interaction boundary
+
+The runtime has one mutable owner. External producers communicate through a thread-safe interaction queue, not by borrowing `Graph`. An interaction is either an atomic batch of canonical input writes or an explicit callback delivery with optional source token. Each interaction carries either an explicit causal timestamp or `QuiescentNow`, which resolves to the graph owner's time when that boundary is imported.
+
+`Graph::is_quiescent()` is stronger than "the dirty queue is empty": no event may still be due at the current simulation instant. `Graph::quiesce()` processes all such work. `Graph::process_interactions()` quiesces before and after draining the ingress queue, which establishes a simple ownership rule for background execution:
+
+1. only the worker mutates/advances the graph;
+2. producers enqueue interactions from any thread;
+3. each drain observes a finite prefix of the ingress queue;
+4. same-time consequences settle before the worker publishes state;
+5. readers consume an immutable `QuiescentSnapshot` of canonical node values.
+
+The snapshot is not intended to capture evaluator code, causal queues or other runtime machinery. Those stay worker-owned. It is the stable observable projection needed by foreground/UI code and by systems deciding what interaction to enqueue next.
+
+Internal causal scheduling remains separate. Forecasts and schedule-once callbacks are outputs of graph computation and never leave/re-enter through the external ingress merely for architectural symmetry.
 
 ## Layer 3: dependency storage and propagation
 

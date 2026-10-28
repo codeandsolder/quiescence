@@ -9,7 +9,7 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque},
     fmt,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 type EvalFn =
@@ -72,6 +72,185 @@ impl StateWrite {
         match self {
             Self::Numeric { node, .. } | Self::Atom { node, .. } => node,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InteractionMoment {
+    /// Resolve to the graph owner's simulation time when the interaction is imported.
+    QuiescentNow,
+    /// Preserve an explicit simulation timestamp supplied by the producer.
+    At(SimTime),
+}
+
+impl InteractionMoment {
+    const fn resolve(self, now: SimTime) -> SimTime {
+        match self {
+            Self::QuiescentNow => now,
+            Self::At(at) => at,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ExternalInteraction {
+    StateBatch {
+        moment: InteractionMoment,
+        priority: i32,
+        writes: Vec<StateWrite>,
+    },
+    Callback {
+        moment: InteractionMoment,
+        priority: i32,
+        reaction: ReactionId,
+        token: Option<u64>,
+    },
+}
+
+#[derive(Default)]
+struct InteractionQueue {
+    pending: VecDeque<ExternalInteraction>,
+}
+
+#[derive(Clone)]
+pub struct InteractionSender {
+    shared: Arc<Mutex<InteractionQueue>>,
+}
+
+pub struct InteractionInbox {
+    shared: Arc<Mutex<InteractionQueue>>,
+}
+
+#[must_use]
+pub fn interaction_channel() -> (InteractionSender, InteractionInbox) {
+    let shared = Arc::new(Mutex::new(InteractionQueue::default()));
+    (
+        InteractionSender {
+            shared: Arc::clone(&shared),
+        },
+        InteractionInbox { shared },
+    )
+}
+
+impl InteractionSender {
+    pub fn submit(&self, interaction: ExternalInteraction) -> Result<(), InteractionIngressError> {
+        self.shared
+            .lock()
+            .map_err(|_| InteractionIngressError::QueuePoisoned)?
+            .pending
+            .push_back(interaction);
+        Ok(())
+    }
+
+    pub fn state_now(
+        &self,
+        priority: i32,
+        writes: Vec<StateWrite>,
+    ) -> Result<(), InteractionIngressError> {
+        self.submit(ExternalInteraction::StateBatch {
+            moment: InteractionMoment::QuiescentNow,
+            priority,
+            writes,
+        })
+    }
+
+    pub fn state_at(
+        &self,
+        at: SimTime,
+        priority: i32,
+        writes: Vec<StateWrite>,
+    ) -> Result<(), InteractionIngressError> {
+        self.submit(ExternalInteraction::StateBatch {
+            moment: InteractionMoment::At(at),
+            priority,
+            writes,
+        })
+    }
+
+    pub fn callback_now(
+        &self,
+        reaction: ReactionId,
+        priority: i32,
+    ) -> Result<(), InteractionIngressError> {
+        self.submit(ExternalInteraction::Callback {
+            moment: InteractionMoment::QuiescentNow,
+            priority,
+            reaction,
+            token: None,
+        })
+    }
+
+    pub fn callback_now_with_token(
+        &self,
+        reaction: ReactionId,
+        priority: i32,
+        token: u64,
+    ) -> Result<(), InteractionIngressError> {
+        self.submit(ExternalInteraction::Callback {
+            moment: InteractionMoment::QuiescentNow,
+            priority,
+            reaction,
+            token: Some(token),
+        })
+    }
+
+    pub fn callback_at(
+        &self,
+        reaction: ReactionId,
+        at: SimTime,
+        priority: i32,
+    ) -> Result<(), InteractionIngressError> {
+        self.submit(ExternalInteraction::Callback {
+            moment: InteractionMoment::At(at),
+            priority,
+            reaction,
+            token: None,
+        })
+    }
+
+    pub fn callback_at_with_token(
+        &self,
+        reaction: ReactionId,
+        at: SimTime,
+        priority: i32,
+        token: u64,
+    ) -> Result<(), InteractionIngressError> {
+        self.submit(ExternalInteraction::Callback {
+            moment: InteractionMoment::At(at),
+            priority,
+            reaction,
+            token: Some(token),
+        })
+    }
+}
+
+impl InteractionInbox {
+    pub fn pending_count(&self) -> Result<usize, InteractionIngressError> {
+        Ok(self
+            .shared
+            .lock()
+            .map_err(|_| InteractionIngressError::QueuePoisoned)?
+            .pending
+            .len())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QuiescentSnapshot {
+    pub at: SimTime,
+    pub next_event_time: Option<SimTime>,
+    values: Vec<CanonicalValue>,
+}
+
+impl QuiescentSnapshot {
+    #[must_use]
+    pub fn value(&self, node: NodeId) -> Option<CanonicalValue> {
+        self.values.get(node.index()).copied()
+    }
+
+    #[must_use]
+    pub fn node_count(&self) -> usize {
+        self.values.len()
     }
 }
 
@@ -427,6 +606,66 @@ impl Graph {
         self.now
     }
 
+    /// True only at an externally observable safe point: no dirty computation and no event due at
+    /// the current simulation time. Future events do not prevent quiescence.
+    #[must_use]
+    pub fn is_quiescent(&self) -> bool {
+        self.dirty.is_empty() && self.events.peek().is_none_or(|event| event.at > self.now)
+    }
+
+    /// Process all work and events that are causally due at the current simulation time.
+    pub fn quiesce(&mut self) -> Result<(), RuntimeError> {
+        self.advance_to(self.now)
+    }
+
+    /// Capture immutable canonical state at a quiescent boundary.
+    pub fn quiescent_snapshot(&self) -> Result<QuiescentSnapshot, RuntimeError> {
+        if !self.is_quiescent() {
+            return Err(self.not_quiescent_error());
+        }
+        Ok(QuiescentSnapshot {
+            at: self.now,
+            next_event_time: self.events.peek().map(|event| event.at),
+            values: self.nodes.iter().map(canonical_value).collect(),
+        })
+    }
+
+    /// Import externally produced interactions without executing future timestamps.
+    ///
+    /// The graph must already be quiescent. `InteractionMoment::QuiescentNow` is resolved while the
+    /// inbox lock is held, so every interaction drained by this call sees the same simulation time.
+    pub fn import_interactions(&mut self, inbox: &InteractionInbox) -> Result<usize, RuntimeError> {
+        if !self.is_quiescent() {
+            return Err(self.not_quiescent_error());
+        }
+        let mut queue = inbox.shared.lock().map_err(|_| {
+            RuntimeError::InteractionIngress(InteractionIngressError::QueuePoisoned)
+        })?;
+        for interaction in &queue.pending {
+            self.validate_external_interaction(interaction)?;
+        }
+        let interactions: Vec<_> = queue.pending.drain(..).collect();
+        drop(queue);
+        let count = interactions.len();
+        for interaction in interactions {
+            self.enqueue_external_interaction(interaction);
+        }
+        Ok(count)
+    }
+
+    /// Quiesce, import all currently queued external interactions, then process every interaction
+    /// due at the resulting current time. Future timestamped interactions remain in the graph's
+    /// causal event queue.
+    pub fn process_interactions(
+        &mut self,
+        inbox: &InteractionInbox,
+    ) -> Result<usize, RuntimeError> {
+        self.quiesce()?;
+        let count = self.import_interactions(inbox)?;
+        self.quiesce()?;
+        Ok(count)
+    }
+
     pub fn add_event_window(
         &mut self,
         name: impl Into<String>,
@@ -634,6 +873,95 @@ impl Graph {
             return Err(RuntimeError::ExpectedAtom(id));
         };
         Ok(value)
+    }
+
+    fn not_quiescent_error(&self) -> RuntimeError {
+        RuntimeError::NotQuiescent {
+            at: self.now,
+            dirty_work: self.dirty.len(),
+            due_event: self
+                .events
+                .peek()
+                .filter(|event| event.at <= self.now)
+                .map(|event| event.at),
+        }
+    }
+
+    fn validate_external_interaction(
+        &self,
+        interaction: &ExternalInteraction,
+    ) -> Result<(), RuntimeError> {
+        let moment = match interaction {
+            ExternalInteraction::StateBatch { moment, .. }
+            | ExternalInteraction::Callback { moment, .. } => *moment,
+        };
+        let at = moment.resolve(self.now);
+        if at < self.now {
+            return Err(RuntimeError::EventInPast {
+                now: self.now,
+                requested: at,
+            });
+        }
+        match interaction {
+            ExternalInteraction::StateBatch { writes, .. } => {
+                self.validate_state_write_batch(writes)
+            }
+            ExternalInteraction::Callback { reaction, .. } => {
+                self.reactions
+                    .get(reaction.index())
+                    .ok_or(RuntimeError::UnknownReaction(*reaction))?;
+                Ok(())
+            }
+        }
+    }
+
+    fn validate_state_write_batch(&self, writes: &[StateWrite]) -> Result<(), RuntimeError> {
+        let mut seen = BTreeSet::new();
+        for write in writes {
+            let node_id = write.node();
+            let node = self.node(node_id)?;
+            if !seen.insert(node_id) {
+                return Err(RuntimeError::DuplicateStateWrite(node_id));
+            }
+            if node.evaluator.is_some() {
+                return Err(RuntimeError::NotAnInput(node_id));
+            }
+            match (write, &node.state) {
+                (StateWrite::Numeric { .. }, NodeState::Numeric { .. })
+                | (StateWrite::Atom { .. }, NodeState::Atom(_)) => {}
+                (StateWrite::Numeric { .. }, NodeState::Atom(_)) => {
+                    return Err(RuntimeError::ExpectedNumeric(node_id));
+                }
+                (StateWrite::Atom { .. }, NodeState::Numeric { .. }) => {
+                    return Err(RuntimeError::ExpectedAtom(node_id));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn enqueue_external_interaction(&mut self, interaction: ExternalInteraction) {
+        match interaction {
+            ExternalInteraction::StateBatch {
+                moment,
+                priority,
+                writes,
+            } => self.push_event_with_priority(
+                moment.resolve(self.now),
+                priority,
+                EventKind::SetStateBatch { writes },
+            ),
+            ExternalInteraction::Callback {
+                moment,
+                priority,
+                reaction,
+                token,
+            } => self.push_event_with_priority(
+                moment.resolve(self.now),
+                priority,
+                EventKind::ExternalReaction { reaction, token },
+            ),
+        }
     }
 
     pub fn set_input_now(&mut self, id: NodeId, value: f64) -> Result<(), RuntimeError> {
@@ -1008,6 +1336,7 @@ impl Graph {
     fn apply_event(&mut self, event: EventKind) -> Result<(), RuntimeError> {
         match event {
             EventKind::SetState { write } => self.apply_state_writes(&[write]),
+            EventKind::SetStateBatch { writes } => self.apply_state_writes(&writes),
             EventKind::Commit {
                 node,
                 generation,
@@ -1228,6 +1557,9 @@ enum EventKind {
     SetState {
         write: StateWrite,
     },
+    SetStateBatch {
+        writes: Vec<StateWrite>,
+    },
     Commit {
         node: NodeId,
         generation: u64,
@@ -1305,6 +1637,19 @@ impl fmt::Display for EvalError {
 }
 impl std::error::Error for EvalError {}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InteractionIngressError {
+    QueuePoisoned,
+}
+impl fmt::Display for InteractionIngressError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::QueuePoisoned => f.write_str("interaction ingress queue lock poisoned"),
+        }
+    }
+}
+impl std::error::Error for InteractionIngressError {}
+
 #[derive(Debug)]
 pub enum RuntimeError {
     Quantize(QuantizeError),
@@ -1320,6 +1665,12 @@ pub enum RuntimeError {
     UnknownHistory(HistoryId),
     UnscheduledReactionEffects(ReactionId),
     DuplicateStateWrite(NodeId),
+    InteractionIngress(InteractionIngressError),
+    NotQuiescent {
+        at: SimTime,
+        dirty_work: usize,
+        due_event: Option<SimTime>,
+    },
     CorruptEventQueue,
     EventInPast {
         now: SimTime,
@@ -1365,6 +1716,15 @@ impl fmt::Display for RuntimeError {
                     "reaction transition writes state node {id:?} more than once"
                 )
             }
+            Self::InteractionIngress(source) => write!(f, "interaction ingress failed: {source}"),
+            Self::NotQuiescent {
+                at,
+                dirty_work,
+                due_event,
+            } => write!(
+                f,
+                "graph is not quiescent at {at:?}: {dirty_work} dirty work items, due event {due_event:?}"
+            ),
             Self::CorruptEventQueue => f.write_str("event queue became inconsistent"),
             Self::EventInPast { now, requested } => write!(
                 f,
@@ -1394,6 +1754,7 @@ impl std::error::Error for RuntimeError {
             Self::Evaluation { source, .. } | Self::ReactionEvaluation { source, .. } => {
                 Some(source)
             }
+            Self::InteractionIngress(source) => Some(source),
             _ => None,
         }
     }
@@ -1407,13 +1768,16 @@ impl From<QuantizeError> for RuntimeError {
 #[cfg(test)]
 mod tests {
     use super::{
-        CanonicalValue, EvalError, EvalOutput, Graph, ReactionOutput, RuntimeConfig, RuntimeError,
-        StateWrite,
+        CanonicalValue, EvalError, EvalOutput, Graph, InteractionIngressError, ReactionOutput,
+        RuntimeConfig, RuntimeError, StateWrite, interaction_channel,
     };
     use quiescence_core::{Bucket, Quantization, SimDuration, SimTime};
-    use std::sync::{
-        Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+    use std::{
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+        thread,
     };
 
     fn q0() -> Result<Quantization, Box<dyn std::error::Error>> {
@@ -1726,6 +2090,151 @@ mod tests {
         assert_eq!(g.event_window_count(history, key)?, 7);
         g.advance_to(SimTime::from_millis(69))?;
         assert_eq!(g.event_window_count(history, key)?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn interaction_ingress_crosses_threads_and_returns_quiescent_snapshot()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = Graph::new(RuntimeConfig::default());
+        let left = g.add_atom_input("left", 0)?;
+        let right = g.add_atom_input("right", 0)?;
+        let mismatches = Arc::new(AtomicUsize::new(0));
+        let seen_mismatch = Arc::clone(&mismatches);
+        let _observer = g.add_derived("paired observer", q0()?, 0.0, move |context| {
+            let left_value = context.read_atom(left)?;
+            let right_value = context.read_atom(right)?;
+            if left_value != right_value {
+                seen_mismatch.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(EvalOutput::immediate((left_value + right_value) as f64))
+        })?;
+        let callbacks = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&callbacks);
+        let callback = g.add_event_callback("background interaction", move |context| {
+            observed
+                .lock()
+                .map_err(|_| EvalError::Message(String::from("callback capture lock poisoned")))?
+                .push((context.now(), context.external_token()));
+            Ok(ReactionOutput::idle())
+        })?;
+        g.quiesce()?;
+        g.advance_to(SimTime::from_millis(25))?;
+        let (sender, inbox) = interaction_channel();
+        let producer = thread::spawn(move || -> Result<(), InteractionIngressError> {
+            sender.state_now(
+                -1,
+                vec![StateWrite::atom(left, 1), StateWrite::atom(right, 1)],
+            )?;
+            sender.callback_now_with_token(callback, 0, 77)?;
+            sender.callback_now_with_token(callback, 0, 77)?;
+            Ok(())
+        });
+        producer
+            .join()
+            .map_err(|_| String::from("interaction producer thread panicked"))??;
+        assert_eq!(inbox.pending_count()?, 3);
+        assert_eq!(g.process_interactions(&inbox)?, 3);
+        assert_eq!(inbox.pending_count()?, 0);
+        assert!(g.is_quiescent());
+        assert_eq!(mismatches.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            *callbacks
+                .lock()
+                .map_err(|_| String::from("callback capture lock poisoned"))?,
+            vec![
+                (SimTime::from_millis(25), Some(77)),
+                (SimTime::from_millis(25), Some(77)),
+            ]
+        );
+        let snapshot = g.quiescent_snapshot()?;
+        assert_eq!(snapshot.at, SimTime::from_millis(25));
+        assert_eq!(snapshot.next_event_time, None);
+        assert_eq!(snapshot.value(left), Some(CanonicalValue::Atom(1)));
+        assert_eq!(snapshot.value(right), Some(CanonicalValue::Atom(1)));
+        assert_eq!(snapshot.node_count(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn imported_now_interaction_is_not_quiescent_until_processed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = Graph::new(RuntimeConfig::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let callback = g.add_event_callback("explicit quiescence", move |_| {
+            observed.fetch_add(1, Ordering::Relaxed);
+            Ok(ReactionOutput::idle())
+        })?;
+        g.quiesce()?;
+        let (sender, inbox) = interaction_channel();
+        sender.callback_now(callback, 0)?;
+        assert_eq!(g.import_interactions(&inbox)?, 1);
+        assert!(!g.is_quiescent());
+        assert!(matches!(
+            g.quiescent_snapshot(),
+            Err(RuntimeError::NotQuiescent { .. })
+        ));
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        g.quiesce()?;
+        assert!(g.is_quiescent());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn future_interactions_import_without_running_early() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut g = Graph::new(RuntimeConfig::default());
+        let tokens = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&tokens);
+        let callback = g.add_event_callback("future ingress", move |context| {
+            observed
+                .lock()
+                .map_err(|_| EvalError::Message(String::from("future capture lock poisoned")))?
+                .push(context.external_token());
+            Ok(ReactionOutput::idle())
+        })?;
+        g.quiesce()?;
+        let (sender, inbox) = interaction_channel();
+        sender.callback_at_with_token(callback, SimTime::from_millis(40), 0, 9)?;
+        assert_eq!(g.process_interactions(&inbox)?, 1);
+        assert!(g.is_quiescent());
+        let snapshot = g.quiescent_snapshot()?;
+        assert_eq!(snapshot.next_event_time, Some(SimTime::from_millis(40)));
+        assert!(
+            tokens
+                .lock()
+                .map_err(|_| String::from("future capture lock poisoned"))?
+                .is_empty()
+        );
+        g.advance_to(SimTime::from_millis(40))?;
+        assert_eq!(
+            *tokens
+                .lock()
+                .map_err(|_| String::from("future capture lock poisoned"))?,
+            vec![Some(9)]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_interaction_batch_stays_in_inbox() -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = Graph::new(RuntimeConfig::default());
+        let atom = g.add_atom_input("atom", 0)?;
+        g.quiesce()?;
+        let (sender, inbox) = interaction_channel();
+        sender.state_now(
+            0,
+            vec![StateWrite::atom(atom, 1), StateWrite::atom(atom, 2)],
+        )?;
+        assert!(matches!(
+            g.process_interactions(&inbox),
+            Err(RuntimeError::DuplicateStateWrite(id)) if id == atom
+        ));
+        assert_eq!(inbox.pending_count()?, 1);
+        assert_eq!(g.value_atom(atom)?, 0);
+        assert!(g.is_quiescent());
         Ok(())
     }
 
