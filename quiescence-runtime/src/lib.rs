@@ -247,11 +247,18 @@ pub struct EvalContext<'a> {
     nodes: &'a [Node],
     windows: &'a [EventWindow],
     reads: RefCell<BTreeSet<NodeId>>,
+    scheduled_key: Option<u64>,
 }
 impl EvalContext<'_> {
     #[must_use]
     pub const fn now(&self) -> SimTime {
         self.now
+    }
+
+    /// Key of the keyed scheduled callback that caused this evaluation, when applicable.
+    #[must_use]
+    pub const fn scheduled_key(&self) -> Option<u64> {
+        self.scheduled_key
     }
     pub fn read_bucket(&self, id: NodeId) -> Result<Bucket, EvalError> {
         let node = self
@@ -363,6 +370,7 @@ struct Reaction {
     dependencies: BTreeSet<NodeId>,
     generation: u64,
     track_dependencies: bool,
+    pending_scheduled_key: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -533,6 +541,7 @@ impl Graph {
             dependencies: BTreeSet::new(),
             generation: 0,
             track_dependencies: true,
+            pending_scheduled_key: None,
         });
         self.reaction_is_dirty.push(false);
         self.mark_dirty(WorkId::Reaction(id));
@@ -564,6 +573,7 @@ impl Graph {
             dependencies: BTreeSet::new(),
             generation: 0,
             track_dependencies: false,
+            pending_scheduled_key: None,
         });
         self.reaction_is_dirty.push(false);
         Ok(id)
@@ -769,6 +779,7 @@ impl Graph {
             nodes: &self.nodes,
             windows: &self.windows,
             reads: RefCell::new(BTreeSet::new()),
+            scheduled_key: None,
         };
         let output =
             evaluator(&context).map_err(|source| RuntimeError::Evaluation { node: id, source })?;
@@ -814,17 +825,23 @@ impl Graph {
     }
 
     fn evaluate_reaction(&mut self, id: ReactionId) -> Result<(), RuntimeError> {
-        let reaction = self
-            .reactions
-            .get(id.index())
-            .ok_or(RuntimeError::UnknownReaction(id))?;
-        let evaluator = reaction.evaluator.clone();
-        let track_dependencies = reaction.track_dependencies;
+        let (evaluator, track_dependencies, scheduled_key) = {
+            let reaction = self
+                .reactions
+                .get_mut(id.index())
+                .ok_or(RuntimeError::UnknownReaction(id))?;
+            (
+                reaction.evaluator.clone(),
+                reaction.track_dependencies,
+                reaction.pending_scheduled_key.take(),
+            )
+        };
         let context = EvalContext {
             now: self.now,
             nodes: &self.nodes,
             windows: &self.windows,
             reads: RefCell::new(BTreeSet::new()),
+            scheduled_key,
         };
         let output = evaluator(&context).map_err(|source| RuntimeError::ReactionEvaluation {
             reaction: id,
@@ -955,14 +972,21 @@ impl Graph {
                 Ok(())
             }
             EventKind::ExternalReaction { reaction } => {
-                self.reactions
-                    .get(reaction.index())
+                let target = self
+                    .reactions
+                    .get_mut(reaction.index())
                     .ok_or(RuntimeError::UnknownReaction(reaction))?;
+                target.pending_scheduled_key = None;
                 self.mark_dirty(WorkId::Reaction(reaction));
                 Ok(())
             }
             EventKind::ScheduledReaction { reaction, key } => {
                 self.pending_scheduled_reactions.remove(&(reaction, key));
+                let target = self
+                    .reactions
+                    .get_mut(reaction.index())
+                    .ok_or(RuntimeError::UnknownReaction(reaction))?;
+                target.pending_scheduled_key = Some(key);
                 self.mark_dirty(WorkId::Reaction(reaction));
                 Ok(())
             }
@@ -1325,11 +1349,12 @@ impl From<QuantizeError> for RuntimeError {
 #[cfg(test)]
 mod tests {
     use super::{
-        CanonicalValue, EvalOutput, Graph, ReactionOutput, RuntimeConfig, RuntimeError, StateWrite,
+        CanonicalValue, EvalError, EvalOutput, Graph, ReactionOutput, RuntimeConfig, RuntimeError,
+        StateWrite,
     };
     use quiescence_core::{Bucket, Quantization, SimDuration, SimTime};
     use std::sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     };
 
@@ -1747,8 +1772,14 @@ mod tests {
         let mut g = Graph::new(RuntimeConfig::default());
         let callbacks = Arc::new(AtomicUsize::new(0));
         let observed_callbacks = Arc::clone(&callbacks);
-        let callback = g.add_event_callback("scheduled callback target", move |_| {
+        let observed_keys = Arc::new(Mutex::new(Vec::new()));
+        let callback_keys = Arc::clone(&observed_keys);
+        let callback = g.add_event_callback("scheduled callback target", move |context| {
             observed_callbacks.fetch_add(1, Ordering::Relaxed);
+            callback_keys
+                .lock()
+                .map_err(|_| EvalError::Message(String::from("callback-key lock poisoned")))?
+                .push(context.scheduled_key());
             Ok(ReactionOutput::idle())
         })?;
         let producer_calls = Arc::new(AtomicUsize::new(0));
@@ -1775,6 +1806,12 @@ mod tests {
         assert_eq!(callbacks.load(Ordering::Relaxed), 0);
         g.advance_to(SimTime::from_millis(10))?;
         assert_eq!(callbacks.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            *observed_keys
+                .lock()
+                .map_err(|_| String::from("callback-key lock poisoned"))?,
+            vec![Some(7)]
+        );
         Ok(())
     }
 
