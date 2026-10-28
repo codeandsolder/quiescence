@@ -65,9 +65,9 @@ The runtime has one mutable owner. External producers communicate through a thre
 2. producers enqueue interactions from any thread;
 3. each drain observes a finite prefix of the ingress queue;
 4. same-time consequences settle before the worker publishes state;
-5. readers consume an immutable `QuiescentSnapshot` of canonical node values.
+5. readers consume an immutable quiescent publication of canonical node values and committed transitions.
 
-The snapshot is not intended to capture evaluator code, causal queues or other runtime machinery. Those stay worker-owned. It is the stable observable projection needed by foreground/UI code and by systems deciding what interaction to enqueue next.
+When the owner has no internal causal event it chooses to advance toward, `InteractionInbox::wait_for_pending()` provides a blocking wakeup rather than requiring queue polling. `QuiescentPublication` combines the stable `QuiescentSnapshot` with transition records accumulated since the previous publication; publishing drains those records while all evaluator/runtime machinery remains worker-owned. The snapshot is not intended to capture evaluator code, causal queues or other runtime machinery.
 
 Internal causal scheduling remains separate. Forecasts and schedule-once callbacks are outputs of graph computation and never leave/re-enter through the external ingress merely for architectural symmetry.
 

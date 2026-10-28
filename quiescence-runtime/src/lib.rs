@@ -9,7 +9,7 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque},
     fmt,
-    sync::{Arc, Mutex},
+    sync::{Arc, Condvar, Mutex},
 };
 
 type EvalFn =
@@ -112,18 +112,24 @@ struct InteractionQueue {
     pending: VecDeque<ExternalInteraction>,
 }
 
+#[derive(Default)]
+struct InteractionShared {
+    queue: Mutex<InteractionQueue>,
+    ready: Condvar,
+}
+
 #[derive(Clone)]
 pub struct InteractionSender {
-    shared: Arc<Mutex<InteractionQueue>>,
+    shared: Arc<InteractionShared>,
 }
 
 pub struct InteractionInbox {
-    shared: Arc<Mutex<InteractionQueue>>,
+    shared: Arc<InteractionShared>,
 }
 
 #[must_use]
 pub fn interaction_channel() -> (InteractionSender, InteractionInbox) {
-    let shared = Arc::new(Mutex::new(InteractionQueue::default()));
+    let shared = Arc::new(InteractionShared::default());
     (
         InteractionSender {
             shared: Arc::clone(&shared),
@@ -134,11 +140,15 @@ pub fn interaction_channel() -> (InteractionSender, InteractionInbox) {
 
 impl InteractionSender {
     pub fn submit(&self, interaction: ExternalInteraction) -> Result<(), InteractionIngressError> {
-        self.shared
-            .lock()
-            .map_err(|_| InteractionIngressError::QueuePoisoned)?
-            .pending
-            .push_back(interaction);
+        {
+            let mut queue = self
+                .shared
+                .queue
+                .lock()
+                .map_err(|_| InteractionIngressError::QueuePoisoned)?;
+            queue.pending.push_back(interaction);
+        }
+        self.shared.ready.notify_one();
         Ok(())
     }
 
@@ -228,10 +238,33 @@ impl InteractionInbox {
     pub fn pending_count(&self) -> Result<usize, InteractionIngressError> {
         Ok(self
             .shared
+            .queue
             .lock()
             .map_err(|_| InteractionIngressError::QueuePoisoned)?
             .pending
             .len())
+    }
+
+    /// Block the owning worker until at least one external interaction is pending.
+    ///
+    /// If an interaction was already queued, this returns immediately. The caller still owns the
+    /// policy for advancing simulation time; this is only a wakeup primitive for an otherwise idle
+    /// graph owner.
+    ///
+    /// # Errors
+    /// Returns an error if the ingress queue lock is poisoned.
+    pub fn wait_for_pending(&self) -> Result<usize, InteractionIngressError> {
+        let queue = self
+            .shared
+            .queue
+            .lock()
+            .map_err(|_| InteractionIngressError::QueuePoisoned)?;
+        let queue = self
+            .shared
+            .ready
+            .wait_while(queue, |queue| queue.pending.is_empty())
+            .map_err(|_| InteractionIngressError::QueuePoisoned)?;
+        Ok(queue.pending.len())
     }
 }
 
@@ -252,6 +285,12 @@ impl QuiescentSnapshot {
     pub fn node_count(&self) -> usize {
         self.values.len()
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QuiescentPublication {
+    pub snapshot: QuiescentSnapshot,
+    pub transitions: Vec<TransitionRecord>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -638,7 +677,7 @@ impl Graph {
         if !self.is_quiescent() {
             return Err(self.not_quiescent_error());
         }
-        let mut queue = inbox.shared.lock().map_err(|_| {
+        let mut queue = inbox.shared.queue.lock().map_err(|_| {
             RuntimeError::InteractionIngress(InteractionIngressError::QueuePoisoned)
         })?;
         for interaction in &queue.pending {
@@ -664,6 +703,43 @@ impl Graph {
         let count = self.import_interactions(inbox)?;
         self.quiesce()?;
         Ok(count)
+    }
+
+    /// Drain committed transition records together with a stable observable snapshot.
+    ///
+    /// # Errors
+    /// Returns `RuntimeError::NotQuiescent` if causal work is still due at the current time.
+    pub fn publish_quiescent(&mut self) -> Result<QuiescentPublication, RuntimeError> {
+        let snapshot = self.quiescent_snapshot()?;
+        Ok(QuiescentPublication {
+            snapshot,
+            transitions: std::mem::take(&mut self.transitions),
+        })
+    }
+
+    /// Process currently visible interactions and publish the resulting stable state in one worker
+    /// operation.
+    ///
+    /// # Errors
+    /// Propagates quiescence, interaction validation/import, and evaluation errors.
+    pub fn process_interactions_and_publish(
+        &mut self,
+        inbox: &InteractionInbox,
+    ) -> Result<(usize, QuiescentPublication), RuntimeError> {
+        let count = self.process_interactions(inbox)?;
+        Ok((count, self.publish_quiescent()?))
+    }
+
+    /// Advance to a requested simulation time and publish the resulting quiescent state.
+    ///
+    /// # Errors
+    /// Propagates temporal, evaluation, and quiescence errors.
+    pub fn advance_to_and_publish(
+        &mut self,
+        target: SimTime,
+    ) -> Result<QuiescentPublication, RuntimeError> {
+        self.advance_to(target)?;
+        self.publish_quiescent()
     }
 
     pub fn add_event_window(
@@ -2120,6 +2196,7 @@ mod tests {
         })?;
         g.quiesce()?;
         g.advance_to(SimTime::from_millis(25))?;
+        let _baseline = g.publish_quiescent()?;
         let (sender, inbox) = interaction_channel();
         let producer = thread::spawn(move || -> Result<(), InteractionIngressError> {
             sender.state_now(
@@ -2134,7 +2211,8 @@ mod tests {
             .join()
             .map_err(|_| String::from("interaction producer thread panicked"))??;
         assert_eq!(inbox.pending_count()?, 3);
-        assert_eq!(g.process_interactions(&inbox)?, 3);
+        let (processed, publication) = g.process_interactions_and_publish(&inbox)?;
+        assert_eq!(processed, 3);
         assert_eq!(inbox.pending_count()?, 0);
         assert!(g.is_quiescent());
         assert_eq!(mismatches.load(Ordering::Relaxed), 0);
@@ -2147,12 +2225,43 @@ mod tests {
                 (SimTime::from_millis(25), Some(77)),
             ]
         );
-        let snapshot = g.quiescent_snapshot()?;
-        assert_eq!(snapshot.at, SimTime::from_millis(25));
-        assert_eq!(snapshot.next_event_time, None);
-        assert_eq!(snapshot.value(left), Some(CanonicalValue::Atom(1)));
-        assert_eq!(snapshot.value(right), Some(CanonicalValue::Atom(1)));
-        assert_eq!(snapshot.node_count(), 3);
+        assert_eq!(publication.snapshot.at, SimTime::from_millis(25));
+        assert_eq!(publication.snapshot.next_event_time, None);
+        assert_eq!(
+            publication.snapshot.value(left),
+            Some(CanonicalValue::Atom(1))
+        );
+        assert_eq!(
+            publication.snapshot.value(right),
+            Some(CanonicalValue::Atom(1))
+        );
+        assert_eq!(publication.snapshot.node_count(), 3);
+        assert!(
+            publication
+                .transitions
+                .iter()
+                .any(|record| record.node == left)
+        );
+        assert!(
+            publication
+                .transitions
+                .iter()
+                .any(|record| record.node == right)
+        );
+        assert!(g.publish_quiescent()?.transitions.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn interaction_inbox_waits_without_polling_and_wakes_on_submit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (sender, inbox) = interaction_channel();
+        let waiter = thread::spawn(move || inbox.wait_for_pending());
+        sender.state_now(0, Vec::new())?;
+        let pending = waiter
+            .join()
+            .map_err(|_| String::from("interaction waiter thread panicked"))??;
+        assert_eq!(pending, 1);
         Ok(())
     }
 
@@ -2208,7 +2317,8 @@ mod tests {
                 .map_err(|_| String::from("future capture lock poisoned"))?
                 .is_empty()
         );
-        g.advance_to(SimTime::from_millis(40))?;
+        let publication = g.advance_to_and_publish(SimTime::from_millis(40))?;
+        assert_eq!(publication.snapshot.at, SimTime::from_millis(40));
         assert_eq!(
             *tokens
                 .lock()
