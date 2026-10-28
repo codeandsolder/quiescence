@@ -362,6 +362,7 @@ struct Reaction {
     evaluator: ReactionFn,
     dependencies: BTreeSet<NodeId>,
     generation: u64,
+    track_dependencies: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -531,9 +532,40 @@ impl Graph {
             evaluator: Arc::new(evaluator),
             dependencies: BTreeSet::new(),
             generation: 0,
+            track_dependencies: true,
         });
         self.reaction_is_dirty.push(false);
         self.mark_dirty(WorkId::Reaction(id));
+        Ok(id)
+    }
+
+    /// Add an event-only callback reaction.
+    ///
+    /// Event callbacks are dormant until explicitly scheduled. Reads performed while they run are
+    /// intentionally not registered as reactive dependencies, so observing current state during a
+    /// callback cannot cause later state changes to invoke that callback spontaneously.
+    pub fn add_event_callback<F>(
+        &mut self,
+        name: impl Into<String>,
+        evaluator: F,
+    ) -> Result<ReactionId, RuntimeError>
+    where
+        F: for<'a> Fn(&EvalContext<'a>) -> Result<ReactionOutput, EvalError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let raw_id =
+            u32::try_from(self.reactions.len()).map_err(|_| RuntimeError::TooManyReactions)?;
+        let id = ReactionId::from_index(raw_id);
+        self.reactions.push(Reaction {
+            name: name.into(),
+            evaluator: Arc::new(evaluator),
+            dependencies: BTreeSet::new(),
+            generation: 0,
+            track_dependencies: false,
+        });
+        self.reaction_is_dirty.push(false);
         Ok(id)
     }
 
@@ -782,12 +814,12 @@ impl Graph {
     }
 
     fn evaluate_reaction(&mut self, id: ReactionId) -> Result<(), RuntimeError> {
-        let evaluator = self
+        let reaction = self
             .reactions
             .get(id.index())
-            .ok_or(RuntimeError::UnknownReaction(id))?
-            .evaluator
-            .clone();
+            .ok_or(RuntimeError::UnknownReaction(id))?;
+        let evaluator = reaction.evaluator.clone();
+        let track_dependencies = reaction.track_dependencies;
         let context = EvalContext {
             now: self.now,
             nodes: &self.nodes,
@@ -798,8 +830,10 @@ impl Graph {
             reaction: id,
             source,
         })?;
-        let deps = context.dependencies();
-        self.update_dependencies(WorkId::Reaction(id), deps)?;
+        if track_dependencies {
+            let deps = context.dependencies();
+            self.update_dependencies(WorkId::Reaction(id), deps)?;
+        }
         let reaction = self
             .reactions
             .get_mut(id.index())
@@ -1713,10 +1747,8 @@ mod tests {
         let mut g = Graph::new(RuntimeConfig::default());
         let callbacks = Arc::new(AtomicUsize::new(0));
         let observed_callbacks = Arc::clone(&callbacks);
-        let callback = g.add_reaction("scheduled callback target", move |c| {
-            if c.now() != SimTime::ZERO {
-                observed_callbacks.fetch_add(1, Ordering::Relaxed);
-            }
+        let callback = g.add_event_callback("scheduled callback target", move |_| {
+            observed_callbacks.fetch_add(1, Ordering::Relaxed);
             Ok(ReactionOutput::idle())
         })?;
         let producer_calls = Arc::new(AtomicUsize::new(0));
@@ -1743,6 +1775,31 @@ mod tests {
         assert_eq!(callbacks.load(Ordering::Relaxed), 0);
         g.advance_to(SimTime::from_millis(10))?;
         assert_eq!(callbacks.load(Ordering::Relaxed), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn event_callback_is_dormant_and_does_not_subscribe_to_reads()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = Graph::new(RuntimeConfig::default());
+        let observed = g.add_input("observed", q0()?, 1.0)?;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = Arc::clone(&calls);
+        let callback = g.add_event_callback("event-only callback", move |context| {
+            context.read_bool(observed)?;
+            callback_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(ReactionOutput::idle())
+        })?;
+        g.settle()?;
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+
+        g.schedule_reaction_event(callback, SimTime::from_millis(10), 0)?;
+        g.advance_to(SimTime::from_millis(10))?;
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        g.schedule_input(observed, SimTime::from_millis(20), 0.0)?;
+        g.advance_to(SimTime::from_millis(20))?;
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
         Ok(())
     }
 
