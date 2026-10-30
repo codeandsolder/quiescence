@@ -131,7 +131,9 @@ pub struct Quantization {
 impl Quantization {
     pub const MAX_DECIMAL_PLACES: u8 = 15;
 
-    pub fn new(decimal_places: u8, hysteresis_lsd: u32) -> Result<Self, QuantizeError> {
+    /// # Errors
+    /// Returns [`QuantizeError::TooManyDecimalPlaces`] when the requested precision exceeds the supported bound.
+    pub const fn new(decimal_places: u8, hysteresis_lsd: u32) -> Result<Self, QuantizeError> {
         if decimal_places > Self::MAX_DECIMAL_PLACES {
             return Err(QuantizeError::TooManyDecimalPlaces(decimal_places));
         }
@@ -154,10 +156,20 @@ impl Quantization {
         10_f64.powi(i32::from(self.decimal_places))
     }
     #[must_use]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "decoding intentionally maps the exact integer bucket into the f64 estimate domain"
+    )]
     pub fn decode(self, bucket: Bucket) -> f64 {
         bucket.raw() as f64 / self.scale()
     }
 
+    /// # Errors
+    /// Returns a [`QuantizeError`] for non-finite inputs, out-of-range rounded values, or intervals spanning multiple buckets.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "hysteresis comparisons intentionally operate in the f64 estimate domain"
+    )]
     pub fn resolve(
         self,
         previous: Option<Bucket>,
@@ -192,6 +204,14 @@ impl Quantization {
     }
 }
 
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "the i64 bounds are intentionally projected into f64 before validating the rounded value"
+)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the value is finite, rounded to an integer, and range-checked before conversion"
+)]
 fn round_i64(value: f64) -> Result<i64, QuantizeError> {
     if !value.is_finite() {
         return Err(QuantizeError::NonFiniteEstimate);
