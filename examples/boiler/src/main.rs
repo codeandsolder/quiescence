@@ -26,6 +26,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         )))
     })?;
     let burner = g.add_derived("boiler.burner", bit, 1.0, move |c| {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the one-decimal reaction delay is rounded to whole milliseconds before scheduling"
+        )]
         let delay = SimDuration::from_millis(c.read_f64(reaction)?.round() as i64);
         Ok(EvalOutput::after(f64::from(c.read_bool(can_fire)?), delay))
     })?;

@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rust-1-99-shared-sccache:
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@f360aee0f8e6f5c191901b61d94296471f320c3b # main
+    with:
+      rust-toolchain: "1.99.0"
+      rust-components: "clippy rustfmt"
+      command: >-
+        cargo +1.99.0 fmt --all -- --check &&
+        CARGO_BUILD_WARNINGS=deny cargo +1.99.0 clippy --locked --workspace --all-targets -- -D warnings &&
+        cargo +1.99.0 test --locked --workspace --all-targets &&
+        RUSTDOCFLAGS="-D warnings" cargo +1.99.0 doc --locked --workspace --no-deps

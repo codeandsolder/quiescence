@@ -46,7 +46,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "toggle_count={}",
         graph.event_window_count(history, torch_position)?
     );
-    println!("burned_out={}", graph.value_f64(burned_out)? as i64);
+    println!("burned_out={}", graph.value_bucket(burned_out)?.raw());
     println!("expiry_event={:?}", graph.next_event_time());
 
     graph.advance_to(SimTime::from_millis(

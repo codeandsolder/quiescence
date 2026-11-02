@@ -1,4 +1,4 @@
-use quiescence_core::{Quantization, SimDuration, SimTime};
+use quiescence_core::{Bucket, Quantization, SimDuration, SimTime};
 use quiescence_runtime::{Graph, ReactionOutput, RuntimeConfig, StateWrite};
 use std::sync::{
     Arc,
@@ -8,7 +8,7 @@ use std::sync::{
 const TICK_MS: i64 = 50;
 const COOLDOWN_TICKS: i64 = 8;
 
-fn transfer(source: u64, destination: u64) -> Option<(u64, u64)> {
+const fn transfer(source: u64, destination: u64) -> Option<(u64, u64)> {
     match (source, destination) {
         // Handles stand for immutable canonical inventory snapshots. The transaction logic that
         // creates new snapshots is deliberately outside Quiescence.
@@ -30,7 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _hopper = graph.add_reaction("recovered vanilla hopper cooldown", move |context| {
         evaluation_counter.fetch_add(1, Ordering::Relaxed);
         let now_ms = context.now().as_nanos() / 1_000_000;
-        let ready_at = context.read_f64(ready_at_ms)? as i64;
+        let ready_at = context.read_bucket(ready_at_ms)?.raw();
 
         // Recovered source shape: cooldown -= 1, attempt when <= 0, successful transfer resets
         // cooldown to 8. Once activation cadence is known to be 50 ms, the per-tick counter is an
@@ -49,7 +49,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(ReactionOutput::immediate(vec![
             StateWrite::atom(source_inventory, next_source),
             StateWrite::atom(destination_inventory, next_destination),
-            StateWrite::new(ready_at_ms, (now_ms + COOLDOWN_TICKS * TICK_MS) as f64),
+            StateWrite::new(
+                ready_at_ms,
+                q.decode(Bucket::new(now_ms + COOLDOWN_TICKS * TICK_MS)),
+            ),
         ]))
     })?;
 
@@ -80,7 +83,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!(
         "first_next_ready_ms={}",
-        graph.value_f64(ready_at_ms)? as i64
+        graph.value_bucket(ready_at_ms)?.raw()
     );
 
     // After success the reaction immediately shrinks its dependency set back to the deadline.
@@ -113,7 +116,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!(
         "second_next_ready_ms={}",
-        graph.value_f64(ready_at_ms)? as i64
+        graph.value_bucket(ready_at_ms)?.raw()
     );
     println!(
         "reaction_evaluations={}",
