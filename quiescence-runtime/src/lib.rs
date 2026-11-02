@@ -139,6 +139,8 @@ pub fn interaction_channel() -> (InteractionSender, InteractionInbox) {
 }
 
 impl InteractionSender {
+    /// # Errors
+    /// Returns an error if the shared ingress queue lock is poisoned.
     pub fn submit(&self, interaction: ExternalInteraction) -> Result<(), InteractionIngressError> {
         {
             let mut queue = self
@@ -152,6 +154,8 @@ impl InteractionSender {
         Ok(())
     }
 
+    /// # Errors
+    /// Returns an error if the shared ingress queue lock is poisoned.
     pub fn state_now(
         &self,
         priority: i32,
@@ -164,6 +168,8 @@ impl InteractionSender {
         })
     }
 
+    /// # Errors
+    /// Returns an error if the shared ingress queue lock is poisoned.
     pub fn state_at(
         &self,
         at: SimTime,
@@ -177,6 +183,8 @@ impl InteractionSender {
         })
     }
 
+    /// # Errors
+    /// Returns an error if the shared ingress queue lock is poisoned.
     pub fn callback_now(
         &self,
         reaction: ReactionId,
@@ -190,6 +198,8 @@ impl InteractionSender {
         })
     }
 
+    /// # Errors
+    /// Returns an error if the shared ingress queue lock is poisoned.
     pub fn callback_now_with_token(
         &self,
         reaction: ReactionId,
@@ -204,6 +214,8 @@ impl InteractionSender {
         })
     }
 
+    /// # Errors
+    /// Returns an error if the shared ingress queue lock is poisoned.
     pub fn callback_at(
         &self,
         reaction: ReactionId,
@@ -218,6 +230,8 @@ impl InteractionSender {
         })
     }
 
+    /// # Errors
+    /// Returns an error if the shared ingress queue lock is poisoned.
     pub fn callback_at_with_token(
         &self,
         reaction: ReactionId,
@@ -235,6 +249,8 @@ impl InteractionSender {
 }
 
 impl InteractionInbox {
+    /// # Errors
+    /// Returns an error if the shared ingress queue lock is poisoned.
     pub fn pending_count(&self) -> Result<usize, InteractionIngressError> {
         Ok(self
             .shared
@@ -282,7 +298,7 @@ impl QuiescentSnapshot {
     }
 
     #[must_use]
-    pub fn node_count(&self) -> usize {
+    pub const fn node_count(&self) -> usize {
         self.values.len()
     }
 }
@@ -342,7 +358,7 @@ impl ReactionOutput {
     }
 
     #[must_use]
-    pub fn after(delay: SimDuration, writes: Vec<StateWrite>) -> Self {
+    pub const fn after(delay: SimDuration, writes: Vec<StateWrite>) -> Self {
         Self {
             transition_after: Some(delay),
             writes,
@@ -353,12 +369,12 @@ impl ReactionOutput {
     }
 
     #[must_use]
-    pub fn immediate(writes: Vec<StateWrite>) -> Self {
+    pub const fn immediate(writes: Vec<StateWrite>) -> Self {
         Self::after(SimDuration::ZERO, writes)
     }
 
     #[must_use]
-    pub fn reevaluate_after(delay: SimDuration) -> Self {
+    pub const fn reevaluate_after(delay: SimDuration) -> Self {
         Self::after(delay, Vec::new())
     }
 
@@ -485,6 +501,8 @@ impl EvalContext<'_> {
     pub const fn external_token(&self) -> Option<u64> {
         self.external_token
     }
+    /// # Errors
+    /// Returns an error if the node does not exist or is not numeric.
     pub fn read_bucket(&self, id: NodeId) -> Result<Bucket, EvalError> {
         let node = self
             .nodes
@@ -496,6 +514,8 @@ impl EvalContext<'_> {
         };
         Ok(bucket)
     }
+    /// # Errors
+    /// Returns an error if the node does not exist or is not numeric.
     pub fn read_f64(&self, id: NodeId) -> Result<f64, EvalError> {
         let node = self
             .nodes
@@ -511,9 +531,13 @@ impl EvalContext<'_> {
         };
         Ok(quantization.decode(bucket))
     }
+    /// # Errors
+    /// Returns an error if the node does not exist or is not numeric.
     pub fn read_bool(&self, id: NodeId) -> Result<bool, EvalError> {
         Ok(self.read_bucket(id)?.raw() != 0)
     }
+    /// # Errors
+    /// Returns an error if the node does not exist or is not an atom.
     pub fn read_atom(&self, id: NodeId) -> Result<u64, EvalError> {
         let node = self
             .nodes
@@ -525,6 +549,8 @@ impl EvalContext<'_> {
         };
         Ok(value)
     }
+    /// # Errors
+    /// Returns an error if the temporal history does not exist.
     pub fn window_count(&self, id: HistoryId, key: u64) -> Result<usize, EvalError> {
         let window = self
             .windows
@@ -623,7 +649,7 @@ pub struct Graph {
 
 impl Graph {
     #[must_use]
-    pub fn new(config: RuntimeConfig) -> Self {
+    pub const fn new(config: RuntimeConfig) -> Self {
         Self {
             config,
             now: SimTime::ZERO,
@@ -653,11 +679,17 @@ impl Graph {
     }
 
     /// Process all work and events that are causally due at the current simulation time.
+    ///
+    /// # Errors
+    /// Propagates evaluation, scheduling, quantization, or calculation-instability errors.
     pub fn quiesce(&mut self) -> Result<(), RuntimeError> {
         self.advance_to(self.now)
     }
 
     /// Capture immutable canonical state at a quiescent boundary.
+    ///
+    /// # Errors
+    /// Returns an error if the graph is not currently quiescent.
     pub fn quiescent_snapshot(&self) -> Result<QuiescentSnapshot, RuntimeError> {
         if !self.is_quiescent() {
             return Err(self.not_quiescent_error());
@@ -673,6 +705,9 @@ impl Graph {
     ///
     /// The graph must already be quiescent. `InteractionMoment::QuiescentNow` is resolved while the
     /// inbox lock is held, so every interaction drained by this call sees the same simulation time.
+    ///
+    /// # Errors
+    /// Returns an error if the graph is not quiescent, the ingress queue is poisoned, or a queued interaction is invalid.
     pub fn import_interactions(&mut self, inbox: &InteractionInbox) -> Result<usize, RuntimeError> {
         if !self.is_quiescent() {
             return Err(self.not_quiescent_error());
@@ -695,6 +730,9 @@ impl Graph {
     /// Quiesce, import all currently queued external interactions, then process every interaction
     /// due at the resulting current time. Future timestamped interactions remain in the graph's
     /// causal event queue.
+    ///
+    /// # Errors
+    /// Propagates quiescence, ingress, interaction-validation, and evaluation errors.
     pub fn process_interactions(
         &mut self,
         inbox: &InteractionInbox,
@@ -742,6 +780,8 @@ impl Graph {
         self.publish_quiescent()
     }
 
+    /// # Errors
+    /// Returns an error if the graph cannot allocate another temporal history identifier.
     pub fn add_event_window(
         &mut self,
         name: impl Into<String>,
@@ -758,6 +798,8 @@ impl Graph {
         Ok(id)
     }
 
+    /// # Errors
+    /// Returns an error if the graph cannot allocate another node or the initial value cannot be quantized.
     pub fn add_input(
         &mut self,
         name: impl Into<String>,
@@ -767,6 +809,8 @@ impl Graph {
         self.add_node(name, q, initial, None)
     }
 
+    /// # Errors
+    /// Returns an error if the graph cannot allocate another node identifier.
     pub fn add_atom_input(
         &mut self,
         name: impl Into<String>,
@@ -786,6 +830,8 @@ impl Graph {
         Ok(id)
     }
 
+    /// # Errors
+    /// Returns an error if the graph cannot allocate another node or the initial value cannot be quantized.
     pub fn add_derived<F>(
         &mut self,
         name: impl Into<String>,
@@ -828,6 +874,8 @@ impl Graph {
         Ok(id)
     }
 
+    /// # Errors
+    /// Returns an error if the node does not exist or is not numeric.
     pub fn set_evaluator<F>(&mut self, id: NodeId, evaluator: F) -> Result<(), RuntimeError>
     where
         F: for<'a> Fn(&EvalContext<'a>) -> Result<EvalOutput, EvalError> + Send + Sync + 'static,
@@ -844,6 +892,8 @@ impl Graph {
         Ok(())
     }
 
+    /// # Errors
+    /// Returns an error if the graph cannot allocate another reaction identifier.
     pub fn add_reaction<F>(
         &mut self,
         name: impl Into<String>,
@@ -877,6 +927,9 @@ impl Graph {
     /// Event callbacks are dormant until explicitly scheduled. Reads performed while they run are
     /// intentionally not registered as reactive dependencies, so observing current state during a
     /// callback cannot cause later state changes to invoke that callback spontaneously.
+    ///
+    /// # Errors
+    /// Returns an error if the graph cannot allocate another reaction identifier.
     pub fn add_event_callback<F>(
         &mut self,
         name: impl Into<String>,
@@ -904,6 +957,8 @@ impl Graph {
         Ok(id)
     }
 
+    /// # Errors
+    /// Returns an error if the reaction does not exist.
     pub fn reaction_name(&self, id: ReactionId) -> Result<&str, RuntimeError> {
         Ok(&self
             .reactions
@@ -912,6 +967,8 @@ impl Graph {
             .name)
     }
 
+    /// # Errors
+    /// Returns an error if the temporal history does not exist.
     pub fn event_window_name(&self, id: HistoryId) -> Result<&str, RuntimeError> {
         Ok(&self
             .windows
@@ -920,6 +977,8 @@ impl Graph {
             .name)
     }
 
+    /// # Errors
+    /// Returns an error if the temporal history does not exist.
     pub fn event_window_count(&self, id: HistoryId, key: u64) -> Result<usize, RuntimeError> {
         let window = self
             .windows
@@ -928,12 +987,16 @@ impl Graph {
         Ok(window.count_at(self.now, key))
     }
 
+    /// # Errors
+    /// Returns an error if the node does not exist or is not numeric.
     pub fn value_bucket(&self, id: NodeId) -> Result<Bucket, RuntimeError> {
         let NodeState::Numeric { bucket, .. } = self.node(id)?.state else {
             return Err(RuntimeError::ExpectedNumeric(id));
         };
         Ok(bucket)
     }
+    /// # Errors
+    /// Returns an error if the node does not exist or is not numeric.
     pub fn value_f64(&self, id: NodeId) -> Result<f64, RuntimeError> {
         let NodeState::Numeric {
             quantization,
@@ -944,6 +1007,8 @@ impl Graph {
         };
         Ok(quantization.decode(bucket))
     }
+    /// # Errors
+    /// Returns an error if the node does not exist or is not an atom.
     pub fn value_atom(&self, id: NodeId) -> Result<u64, RuntimeError> {
         let NodeState::Atom(value) = self.node(id)?.state else {
             return Err(RuntimeError::ExpectedAtom(id));
@@ -1040,16 +1105,22 @@ impl Graph {
         }
     }
 
+    /// # Errors
+    /// Propagates node validation, quantization, evaluation, and calculation-instability errors.
     pub fn set_input_now(&mut self, id: NodeId, value: f64) -> Result<(), RuntimeError> {
         self.apply_state_writes(&[StateWrite::new(id, value)])?;
         self.settle()
     }
 
+    /// # Errors
+    /// Propagates node validation, evaluation, and calculation-instability errors.
     pub fn set_atom_now(&mut self, id: NodeId, value: u64) -> Result<(), RuntimeError> {
         self.apply_state_writes(&[StateWrite::atom(id, value)])?;
         self.settle()
     }
 
+    /// # Errors
+    /// Returns an error if the node does not exist or the requested time is in the past.
     pub fn schedule_input(
         &mut self,
         id: NodeId,
@@ -1072,6 +1143,8 @@ impl Graph {
         Ok(())
     }
 
+    /// # Errors
+    /// Returns an error if the node does not exist or the requested time is in the past.
     pub fn schedule_atom(
         &mut self,
         id: NodeId,
@@ -1163,6 +1236,8 @@ impl Graph {
         Ok(())
     }
 
+    /// # Errors
+    /// Propagates evaluation, scheduling, quantization, and calculation-instability errors.
     pub fn settle(&mut self) -> Result<(), RuntimeError> {
         let mut steps = 0_usize;
         while let Some(work) = self.dirty.pop_front() {
@@ -1196,6 +1271,8 @@ impl Graph {
         Ok(())
     }
 
+    /// # Errors
+    /// Returns an error for backwards time travel or if processing due work fails.
     pub fn advance_to(&mut self, target: SimTime) -> Result<(), RuntimeError> {
         if target < self.now {
             return Err(RuntimeError::EventInPast {
@@ -1227,8 +1304,7 @@ impl Graph {
     fn evaluate(&mut self, id: NodeId) -> Result<(), RuntimeError> {
         let evaluator = self.nodes[id.index()]
             .evaluator
-            .as_ref()
-            .cloned()
+            .clone()
             .ok_or(RuntimeError::MissingEvaluator(id))?;
         let context = EvalContext {
             now: self.now,
@@ -1369,40 +1445,51 @@ impl Graph {
             self.node(*dep)?;
         }
         let old = match dependent {
-            WorkId::Node(id) => {
-                std::mem::replace(&mut self.nodes[id.index()].dependencies, new.clone())
-            }
-            WorkId::Reaction(id) => std::mem::replace(
+            WorkId::Node(id) => std::mem::take(
+                &mut self
+                    .nodes
+                    .get_mut(id.index())
+                    .ok_or(RuntimeError::UnknownNode(id))?
+                    .dependencies,
+            ),
+            WorkId::Reaction(id) => std::mem::take(
                 &mut self
                     .reactions
                     .get_mut(id.index())
                     .ok_or(RuntimeError::UnknownReaction(id))?
                     .dependencies,
-                new.clone(),
             ),
         };
-        for dep in old.difference(&new) {
+        let removed: Vec<_> = old.difference(&new).copied().collect();
+        let added: Vec<_> = new.difference(&old).copied().collect();
+
+        match dependent {
+            WorkId::Node(id) => self.nodes[id.index()].dependencies = new,
+            WorkId::Reaction(id) => self.reactions[id.index()].dependencies = new,
+        }
+
+        for dep in removed {
             match dependent {
                 WorkId::Node(id) => {
                     self.nodes[dep.index()].dependents.remove(&id);
                 }
                 WorkId::Reaction(id) => {
-                    if let Some(reactions) = self.reaction_dependents.get_mut(dep) {
+                    if let Some(reactions) = self.reaction_dependents.get_mut(&dep) {
                         reactions.remove(&id);
                         if reactions.is_empty() {
-                            self.reaction_dependents.remove(dep);
+                            self.reaction_dependents.remove(&dep);
                         }
                     }
                 }
             }
         }
-        for dep in new.difference(&old) {
+        for dep in added {
             match dependent {
                 WorkId::Node(id) => {
                     self.nodes[dep.index()].dependents.insert(id);
                 }
                 WorkId::Reaction(id) => {
-                    self.reaction_dependents.entry(*dep).or_default().insert(id);
+                    self.reaction_dependents.entry(dep).or_default().insert(id);
                 }
             }
         }
@@ -1621,7 +1708,7 @@ impl Graph {
     }
 }
 
-fn canonical_value(node: &Node) -> CanonicalValue {
+const fn canonical_value(node: &Node) -> CanonicalValue {
     match node.state {
         NodeState::Numeric { bucket, .. } => CanonicalValue::Numeric(bucket),
         NodeState::Atom(value) => CanonicalValue::Atom(value),
@@ -1889,7 +1976,7 @@ mod tests {
         let out = g.add_derived("out", q0()?, 0.0, move |c| {
             Ok(EvalOutput::after(
                 c.read_f64(command)?,
-                SimDuration::from_millis(c.read_f64(reaction)? as i64),
+                SimDuration::from_millis(c.read_bucket(reaction)?.raw()),
             ))
         })?;
         g.settle()?;
@@ -1965,7 +2052,7 @@ mod tests {
         let _observer = g.add_derived("observer", q0()?, 0.0, move |c| {
             let left_value = c.read_f64(left)?;
             let right_value = c.read_f64(right)?;
-            if left_value != right_value {
+            if c.read_bucket(left)? != c.read_bucket(right)? {
                 seen.fetch_add(1, Ordering::Relaxed);
             }
             Ok(EvalOutput::immediate(left_value + right_value))
@@ -2021,27 +2108,27 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let mut g = Graph::new(RuntimeConfig::default());
         let snapshot = g.add_atom_input("inventory_snapshot", 10)?;
-        let sink = g.add_input("sink", q0()?, 0.0)?;
+        let sink = g.add_atom_input("sink", 0)?;
         let evaluations = Arc::new(AtomicUsize::new(0));
         let calls = Arc::clone(&evaluations);
         let _reaction = g.add_reaction("observe snapshot", move |c| {
             calls.fetch_add(1, Ordering::Relaxed);
             let snapshot_value = c.read_atom(snapshot)?;
-            Ok(ReactionOutput::immediate(vec![StateWrite::new(
+            Ok(ReactionOutput::immediate(vec![StateWrite::atom(
                 sink,
-                snapshot_value as f64,
+                snapshot_value,
             )]))
         })?;
         g.settle()?;
         assert_eq!(g.value_atom(snapshot)?, 10);
-        assert_eq!(g.value_f64(sink)?, 10.0);
+        assert_eq!(g.value_atom(sink)?, 10);
         let before = evaluations.load(Ordering::Relaxed);
 
         g.set_atom_now(snapshot, 10)?;
         assert_eq!(evaluations.load(Ordering::Relaxed), before);
         g.set_atom_now(snapshot, 11)?;
         assert!(evaluations.load(Ordering::Relaxed) > before);
-        assert_eq!(g.value_f64(sink)?, 11.0);
+        assert_eq!(g.value_atom(sink)?, 11);
         Ok(())
     }
 
@@ -2080,12 +2167,13 @@ mod tests {
         let mismatches = Arc::new(AtomicUsize::new(0));
         let seen = Arc::clone(&mismatches);
         let _observer = g.add_derived("observer", q0()?, 0.0, move |c| {
-            let count_value = c.read_f64(count)? as u64;
+            let count_value = u64::try_from(c.read_bucket(count)?.raw())
+                .map_err(|_| EvalError::Message(String::from("count bucket is negative")))?;
             let snapshot_value = c.read_atom(snapshot)?;
             if snapshot_value != count_value + 100 {
                 seen.fetch_add(1, Ordering::Relaxed);
             }
-            Ok(EvalOutput::immediate(count_value as f64))
+            Ok(EvalOutput::immediate(c.read_f64(count)?))
         })?;
         let _reaction = g.add_reaction("mixed transaction", move |c| {
             if c.read_bool(trigger)? {
@@ -2183,7 +2271,7 @@ mod tests {
             if left_value != right_value {
                 seen_mismatch.fetch_add(1, Ordering::Relaxed);
             }
-            Ok(EvalOutput::immediate((left_value + right_value) as f64))
+            Ok(EvalOutput::immediate(0.0))
         })?;
         let callbacks = Arc::new(Mutex::new(Vec::new()));
         let observed = Arc::clone(&callbacks);
@@ -2248,7 +2336,7 @@ mod tests {
                 .iter()
                 .any(|record| record.node == right)
         );
-        assert!(g.publish_quiescent()?.transitions.is_empty());
+        assert_eq!(g.publish_quiescent()?.transitions.len(), 0);
         Ok(())
     }
 
@@ -2604,7 +2692,7 @@ mod tests {
         let _reaction = g.add_reaction("deadline-gated snapshot", move |c| {
             calls.fetch_add(1, Ordering::Relaxed);
             let now_ms = c.now().as_nanos() / 1_000_000;
-            let ready_at = c.read_f64(ready_at_ms)? as i64;
+            let ready_at = c.read_bucket(ready_at_ms)?.raw();
             if now_ms < ready_at {
                 return Ok(ReactionOutput::reevaluate_after(SimDuration::from_millis(
                     ready_at - now_ms,
