@@ -7,14 +7,14 @@ on:
     branches: [main]
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
 
 jobs:
   strict-rust:
-    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@915a27e0cf59aa54885c605a9711cb1b3c6cfe03 # main
+    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@e6202bf4dc1e13be77b73210f88c646e5348be49 # main
     with:
       ban-python-outside-ci: true
