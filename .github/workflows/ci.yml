@@ -5,17 +5,21 @@ on:
   pull_request:
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
 jobs:
   rust-1-99-shared-sccache:
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@f360aee0f8e6f5c191901b61d94296471f320c3b # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@23b86d2eeed31f7893c34e942c32cf6555299dbb # main
     with:
-      rust-toolchain: "1.99.0"
+      rust-toolchain: "1.99.1"
       rust-components: "clippy rustfmt"
       command: >-
-        cargo +1.99.0 fmt --all -- --check &&
-        CARGO_BUILD_WARNINGS=deny cargo +1.99.0 clippy --locked --workspace --all-targets -- -D warnings &&
-        cargo +1.99.0 test --locked --workspace --all-targets &&
-        RUSTDOCFLAGS="-D warnings" cargo +1.99.0 doc --locked --workspace --no-deps
+        cargo +1.99.1 fmt --all -- --check &&
+        CARGO_BUILD_WARNINGS=deny cargo +1.99.1 clippy --locked --workspace --all-targets -- -D warnings &&
+        cargo +1.99.1 test --locked --workspace --all-targets &&
+        RUSTDOCFLAGS="-D warnings" cargo +1.99.1 doc --locked --workspace --no-deps
