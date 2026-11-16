@@ -71,7 +71,9 @@ foreground / network / dense world code
         QuiescentSnapshot
 ```
 
-A sender may live on any thread. `Graph::process_interactions()` first finishes already-due causal work, drains exactly the interactions visible at that boundary, processes every newly due same-time consequence, and returns quiescent again. Interactions enqueued concurrently after the drain remain for the next boundary. If there is no internal causal event the domain wants to advance toward, `InteractionInbox::wait_for_pending()` lets the owner sleep until a producer submits work. This makes foreground and background execution the same semantic path rather than two simulation modes.
+A sender may live on any thread. `Graph::process_interactions()` first finishes already-due causal work, imports a finite prefix of the producer queue, processes its newly due consequences, and returns quiescent. The returned `InteractionImport` contains the accepted count and rejected requests with their original payloads and errors; invalid requests cannot block later valid requests. If processing fails after admission, `RuntimeError::InteractionProcessing` retains that import report together with the underlying error. Producers may enqueue the next prefix while validation runs, without waiting on the queue lock.
+
+When the owner has no internal event to advance toward, `InteractionInbox::wait_for_pending()` blocks until work arrives or the last sender is dropped. Pending work is drained before it returns `Disconnected`; dropping the inbox instead disconnects all senders and frees queued messages. This gives worker loops an explicit shutdown boundary without polling.
 
 State batches are validated and become one event, so dependants cannot observe a half-applied external update. Callback interactions preserve duplicates and optional source tokens. Explicit future timestamps are imported into the ordinary causal event queue; `QuiescentNow` is resolved by the graph owner and therefore does not require another thread to read or synchronize the simulation clock.
 
@@ -104,6 +106,16 @@ RUSTC_WRAPPER=/usr/local/bin/sccache cargo run --release -p quiescence-runtime -
 ```
 
 This is not yet a stable benchmark suite; it exists to catch catastrophic runtime regressions while the graph representation is still changing rapidly.
+
+### Interaction ingress smoke benchmark
+
+The ingress benchmark times submission, admission, and same-time callback settlement separately for 8,192 callbacks, with warmups and 21 median samples:
+
+```console
+RUSTC_WRAPPER=/usr/local/bin/sccache cargo run --release -p quiescence-runtime --example ingress_batch
+```
+
+This is a smoke test rather than a throughput guarantee; compare runs on the same pinned core and toolchain when changing the ingress path.
 
 ## Sparse reactions
 

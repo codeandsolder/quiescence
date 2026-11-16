@@ -109,9 +109,35 @@ pub enum ExternalInteraction {
     },
 }
 
-#[derive(Default)]
+/// An ingress item that could not be admitted to this graph at its import boundary.
+#[derive(Debug)]
+pub struct RejectedInteraction {
+    pub interaction: ExternalInteraction,
+    pub error: RuntimeError,
+}
+
+/// Admission results for a finite prefix of the producer queue. Rejected items
+/// remain owned by the caller for inspection, correction, or dead-letter handling.
+#[derive(Debug, Default)]
+pub struct InteractionImport {
+    pub accepted: usize,
+    pub rejected: Vec<RejectedInteraction>,
+}
+
 struct InteractionQueue {
     pending: VecDeque<ExternalInteraction>,
+    senders: usize,
+    receiver_alive: bool,
+}
+
+impl Default for InteractionQueue {
+    fn default() -> Self {
+        Self {
+            pending: VecDeque::new(),
+            senders: 1,
+            receiver_alive: true,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -120,7 +146,6 @@ struct InteractionShared {
     ready: Condvar,
 }
 
-#[derive(Clone)]
 pub struct InteractionSender {
     shared: Arc<InteractionShared>,
 }
@@ -140,9 +165,56 @@ pub fn interaction_channel() -> (InteractionSender, InteractionInbox) {
     )
 }
 
+impl Clone for InteractionSender {
+    fn clone(&self) -> Self {
+        // Clone cannot fail; recover a poisoned mutex solely to keep the
+        // sender count consistent. All fallible queue operations still report
+        // QueuePoisoned to the caller.
+        let mut queue = self
+            .shared
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        queue.senders += 1;
+        drop(queue);
+        Self {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+}
+
+impl Drop for InteractionSender {
+    fn drop(&mut self) {
+        let mut queue = self
+            .shared
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        queue.senders -= 1;
+        let last_sender = queue.senders == 0;
+        drop(queue);
+        if last_sender {
+            self.shared.ready.notify_all();
+        }
+    }
+}
+
+impl Drop for InteractionInbox {
+    fn drop(&mut self) {
+        let mut queue = self
+            .shared
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        queue.receiver_alive = false;
+        queue.pending.clear();
+    }
+}
+
 impl InteractionSender {
     /// # Errors
-    /// Returns an error if the shared ingress queue lock is poisoned.
+    /// Returns an error if the inbox has been dropped or the shared queue
+    /// lock was poisoned.
     pub fn submit(&self, interaction: ExternalInteraction) -> Result<(), InteractionIngressError> {
         {
             let mut queue = self
@@ -150,6 +222,9 @@ impl InteractionSender {
                 .queue
                 .lock()
                 .map_err(|_| InteractionIngressError::QueuePoisoned)?;
+            if !queue.receiver_alive {
+                return Err(InteractionIngressError::Disconnected);
+            }
             queue.pending.push_back(interaction);
         }
         self.shared.ready.notify_one();
@@ -263,14 +338,13 @@ impl InteractionInbox {
             .len())
     }
 
-    /// Block the owning worker until at least one external interaction is pending.
-    ///
-    /// If an interaction was already queued, this returns immediately. The caller still owns the
-    /// policy for advancing simulation time; this is only a wakeup primitive for an otherwise idle
-    /// graph owner.
+    /// Block until a queued interaction is available or the final producer
+    /// is dropped. Already queued interactions are delivered before shutdown.
+    /// The caller still owns the policy for advancing simulation time.
     ///
     /// # Errors
-    /// Returns an error if the ingress queue lock is poisoned.
+    /// Returns `Disconnected` when no senders remain and the queue is empty,
+    /// or `QueuePoisoned` if the shared mutex was poisoned.
     pub fn wait_for_pending(&self) -> Result<usize, InteractionIngressError> {
         let queue = self
             .shared
@@ -280,9 +354,15 @@ impl InteractionInbox {
         let queue = self
             .shared
             .ready
-            .wait_while(queue, |queue| queue.pending.is_empty())
+            .wait_while(queue, |queue| {
+                queue.pending.is_empty() && queue.senders != 0
+            })
             .map_err(|_| InteractionIngressError::QueuePoisoned)?;
-        Ok(queue.pending.len())
+        if queue.pending.is_empty() {
+            Err(InteractionIngressError::Disconnected)
+        } else {
+            Ok(queue.pending.len())
+        }
     }
 }
 
@@ -703,46 +783,66 @@ impl Graph {
         })
     }
 
-    /// Import externally produced interactions without executing future timestamps.
+    /// Import a finite FIFO prefix, admitting valid interactions and returning
+    /// invalid ones to the caller with their errors. A single bad producer
+    /// request cannot block later requests from other producers. No evaluator
+    /// executes in this method; future events remain deferred.
     ///
-    /// The graph must already be quiescent. `InteractionMoment::QuiescentNow` is resolved while the
-    /// inbox lock is held, so every interaction drained by this call sees the same simulation time.
+    /// `QuiescentNow` is resolved to the same owner time for this entire prefix.
+    /// The inbox mutex is released before validation, so producers can enqueue
+    /// the next prefix concurrently.
     ///
     /// # Errors
-    /// Returns an error if the graph is not quiescent, the ingress queue is poisoned, or a queued interaction is invalid.
-    pub fn import_interactions(&mut self, inbox: &InteractionInbox) -> Result<usize, RuntimeError> {
+    /// Returns an error if the graph is not quiescent or the ingress queue lock is poisoned.
+    pub fn import_interactions(
+        &mut self,
+        inbox: &InteractionInbox,
+    ) -> Result<InteractionImport, RuntimeError> {
         if !self.is_quiescent() {
             return Err(self.not_quiescent_error());
         }
         let mut queue = inbox.shared.queue.lock().map_err(|_| {
             RuntimeError::InteractionIngress(InteractionIngressError::QueuePoisoned)
         })?;
-        for interaction in &queue.pending {
-            self.validate_external_interaction(interaction)?;
-        }
-        let interactions: Vec<_> = queue.pending.drain(..).collect();
+        let interactions = std::mem::take(&mut queue.pending);
         drop(queue);
-        let count = interactions.len();
+
+        let mut result = InteractionImport::default();
         for interaction in interactions {
-            self.enqueue_external_interaction(interaction);
+            match self.validate_external_interaction(&interaction) {
+                Ok(()) => {
+                    self.enqueue_external_interaction(interaction);
+                    result.accepted += 1;
+                }
+                Err(error) => result
+                    .rejected
+                    .push(RejectedInteraction { interaction, error }),
+            }
         }
-        Ok(count)
+        Ok(result)
     }
 
-    /// Quiesce, import all currently queued external interactions, then process every interaction
-    /// due at the resulting current time. Future timestamped interactions remain in the graph's
-    /// causal event queue.
+    /// Quiesce, admit all valid currently queued external interactions, and
+    /// process every interaction due at the current time. Invalid interactions
+    /// are returned separately; future events remain in the causal event queue.
     ///
     /// # Errors
-    /// Propagates quiescence, ingress, interaction-validation, and evaluation errors.
+    /// Returns an `InteractionProcessing` error containing the full import
+    /// report if settlement fails after admission; no rejected item is lost.
+    /// Other errors cover pre-import quiescence and ingress-lock failures.
     pub fn process_interactions(
         &mut self,
         inbox: &InteractionInbox,
-    ) -> Result<usize, RuntimeError> {
+    ) -> Result<InteractionImport, RuntimeError> {
         self.quiesce()?;
-        let count = self.import_interactions(inbox)?;
-        self.quiesce()?;
-        Ok(count)
+        let result = self.import_interactions(inbox)?;
+        match self.quiesce() {
+            Ok(()) => Ok(result),
+            Err(source) => Err(RuntimeError::InteractionProcessing {
+                import: result,
+                source: Box::new(source),
+            }),
+        }
     }
 
     /// Drain committed transition records together with a stable observable snapshot.
@@ -765,9 +865,9 @@ impl Graph {
     pub fn process_interactions_and_publish(
         &mut self,
         inbox: &InteractionInbox,
-    ) -> Result<(usize, QuiescentPublication), RuntimeError> {
-        let count = self.process_interactions(inbox)?;
-        Ok((count, self.publish_quiescent()?))
+    ) -> Result<(InteractionImport, QuiescentPublication), RuntimeError> {
+        let result = self.process_interactions(inbox)?;
+        Ok((result, self.publish_quiescent()?))
     }
 
     /// Advance to a requested simulation time and publish the resulting quiescent state.
@@ -1886,11 +1986,13 @@ impl std::error::Error for EvalError {}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InteractionIngressError {
     QueuePoisoned,
+    Disconnected,
 }
 impl fmt::Display for InteractionIngressError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::QueuePoisoned => f.write_str("interaction ingress queue lock poisoned"),
+            Self::Disconnected => f.write_str("interaction ingress channel disconnected"),
         }
     }
 }
@@ -1912,6 +2014,10 @@ pub enum RuntimeError {
     UnscheduledReactionEffects(ReactionId),
     DuplicateStateWrite(NodeId),
     InteractionIngress(InteractionIngressError),
+    InteractionProcessing {
+        import: InteractionImport,
+        source: Box<Self>,
+    },
     NotQuiescent {
         at: SimTime,
         dirty_work: usize,
@@ -1963,6 +2069,9 @@ impl fmt::Display for RuntimeError {
                 )
             }
             Self::InteractionIngress(source) => write!(f, "interaction ingress failed: {source}"),
+            Self::InteractionProcessing { source, .. } => {
+                write!(f, "interaction processing failed after import: {source}")
+            }
             Self::NotQuiescent {
                 at,
                 dirty_work,
@@ -2001,6 +2110,7 @@ impl std::error::Error for RuntimeError {
                 Some(source)
             }
             Self::InteractionIngress(source) => Some(source),
+            Self::InteractionProcessing { source, .. } => Some(source.as_ref()),
             _ => None,
         }
     }
@@ -2689,7 +2799,8 @@ mod tests {
             .map_err(|_| String::from("interaction producer thread panicked"))??;
         assert_eq!(inbox.pending_count()?, 3);
         let (processed, publication) = g.process_interactions_and_publish(&inbox)?;
-        assert_eq!(processed, 3);
+        assert_eq!(processed.accepted, 3);
+        assert_eq!(processed.rejected.len(), 0);
         assert_eq!(inbox.pending_count()?, 0);
         assert!(g.is_quiescent());
         assert_eq!(mismatches.load(Ordering::Relaxed), 0);
@@ -2743,6 +2854,182 @@ mod tests {
     }
 
     #[test]
+    fn last_sender_drop_wakes_blocked_inbox() -> Result<(), Box<dyn std::error::Error>> {
+        let (sender, inbox) = interaction_channel();
+        let cloned = sender.clone();
+        let waiter = thread::spawn(move || inbox.wait_for_pending());
+        drop(sender);
+        drop(cloned);
+        let result = waiter
+            .join()
+            .map_err(|_| String::from("interaction waiter thread panicked"))?;
+        assert_eq!(result, Err(InteractionIngressError::Disconnected));
+        Ok(())
+    }
+
+    #[test]
+    fn closed_producer_side_drains_existing_queue_before_shutdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (sender, inbox) = interaction_channel();
+        sender.state_now(0, Vec::new())?;
+        drop(sender);
+        assert_eq!(inbox.wait_for_pending()?, 1);
+        let mut graph = Graph::new(RuntimeConfig::default());
+        let result = graph.process_interactions(&inbox)?;
+        assert_eq!(result.accepted, 1);
+        assert_eq!(result.rejected.len(), 0);
+        assert_eq!(inbox.pending_count()?, 0);
+        assert_eq!(
+            inbox.wait_for_pending(),
+            Err(InteractionIngressError::Disconnected)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dropping_inbox_disconnects_all_sender_clones_and_releases_queue()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (sender, inbox) = interaction_channel();
+        let clone = sender.clone();
+        sender.state_now(0, Vec::new())?;
+        drop(inbox);
+        assert_eq!(
+            sender.state_now(0, Vec::new()),
+            Err(InteractionIngressError::Disconnected)
+        );
+        assert_eq!(
+            clone.state_now(0, Vec::new()),
+            Err(InteractionIngressError::Disconnected)
+        );
+        let pending = sender
+            .shared
+            .queue
+            .lock()
+            .map_err(|_| String::from("ingress lock poisoned"))?
+            .pending
+            .len();
+        assert_eq!(pending, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn evaluation_failure_after_import_keeps_rejected_items_visible()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut graph = Graph::new(RuntimeConfig::default());
+        let input = graph.add_input("input", q0()?, 0.0)?;
+        let _derived = graph.add_derived("fallible", q0()?, 0.0, move |context| {
+            let value = context.read_f64(input)?;
+            if value > 0.0 {
+                return Err(EvalError::Message(String::from("transient failure")));
+            }
+            Ok(EvalOutput::immediate(value))
+        })?;
+        graph.quiesce()?;
+        let (sender, inbox) = interaction_channel();
+        sender.state_now(
+            0,
+            vec![StateWrite::new(input, 1.0), StateWrite::new(input, 2.0)],
+        )?;
+        sender.state_now(0, vec![StateWrite::new(input, 3.0)])?;
+        let (import, source) = match graph.process_interactions(&inbox) {
+            Err(RuntimeError::InteractionProcessing { import, source }) => (import, source),
+            other => return Err(format!("expected import processing error: {other:?}").into()),
+        };
+        assert_eq!(import.accepted, 1);
+        assert_eq!(import.rejected.len(), 1);
+        assert!(matches!(
+            import.rejected[0].error,
+            RuntimeError::DuplicateStateWrite(id) if id == input
+        ));
+        assert!(matches!(*source, RuntimeError::Evaluation { .. }));
+        assert_eq!(inbox.pending_count()?, 0);
+        assert_eq!(graph.value_bucket(input)?, Bucket::new(3));
+        assert!(!graph.is_quiescent());
+        Ok(())
+    }
+
+    #[test]
+    fn past_interaction_rejected_without_blocking_current_input()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut graph = Graph::new(RuntimeConfig::default());
+        let node = graph.add_atom_input("atom", 0)?;
+        let now = SimTime::from_millis(20);
+        graph.advance_to(now)?;
+        let (sender, inbox) = interaction_channel();
+        sender.state_at(SimTime::ZERO, 0, vec![StateWrite::atom(node, 3)])?;
+        sender.state_now(0, vec![StateWrite::atom(node, 4)])?;
+        let result = graph.process_interactions(&inbox)?;
+        assert_eq!(result.accepted, 1);
+        assert_eq!(result.rejected.len(), 1);
+        assert!(matches!(
+            result.rejected[0].error,
+            RuntimeError::EventInPast { now: reported, requested } if reported == now && requested == SimTime::ZERO
+        ));
+        assert_eq!(graph.value_atom(node)?, 4);
+        assert!(graph.is_quiescent());
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_producers_all_deliver_before_last_sender_shutdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const PRODUCERS: u64 = 4;
+        const PER_PRODUCER: u64 = 64;
+        let mut graph = Graph::new(RuntimeConfig::default());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&seen);
+        let callback = graph.add_event_callback("concurrent ingress", move |context| {
+            captured
+                .lock()
+                .map_err(|_| EvalError::Message(String::from("capture lock poisoned")))?
+                .push(context.external_token());
+            Ok(ReactionOutput::idle())
+        })?;
+        graph.quiesce()?;
+        let (sender, inbox) = interaction_channel();
+        let mut handles = Vec::new();
+        for id in 0..PRODUCERS {
+            let producer = sender.clone();
+            handles.push(thread::spawn(
+                move || -> Result<(), InteractionIngressError> {
+                    for index in 0..PER_PRODUCER {
+                        producer.callback_now_with_token(callback, 0, id * PER_PRODUCER + index)?;
+                    }
+                    Ok(())
+                },
+            ));
+        }
+        drop(sender);
+        let mut accepted = 0;
+        loop {
+            match inbox.wait_for_pending() {
+                Ok(_) => {
+                    let result = graph.process_interactions(&inbox)?;
+                    accepted += result.accepted;
+                    assert_eq!(result.rejected.len(), 0);
+                }
+                Err(InteractionIngressError::Disconnected) => break,
+                Err(other) => return Err(Box::new(other)),
+            }
+        }
+        for handle in handles {
+            handle
+                .join()
+                .map_err(|_| String::from("interaction producer panicked"))??;
+        }
+        assert_eq!(accepted, usize::try_from(PRODUCERS * PER_PRODUCER)?);
+        let mut tokens = seen
+            .lock()
+            .map_err(|_| String::from("capture lock poisoned"))?
+            .clone();
+        tokens.sort_unstable();
+        let expected: Vec<_> = (0..PRODUCERS * PER_PRODUCER).map(Some).collect();
+        assert_eq!(tokens, expected);
+        assert!(graph.is_quiescent());
+        Ok(())
+    }
+
+    #[test]
     fn imported_now_interaction_is_not_quiescent_until_processed()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut g = Graph::new(RuntimeConfig::default());
@@ -2755,7 +3042,9 @@ mod tests {
         g.quiesce()?;
         let (sender, inbox) = interaction_channel();
         sender.callback_now(callback, 0)?;
-        assert_eq!(g.import_interactions(&inbox)?, 1);
+        let imported = g.import_interactions(&inbox)?;
+        assert_eq!(imported.accepted, 1);
+        assert_eq!(imported.rejected.len(), 0);
         assert!(!g.is_quiescent());
         assert!(matches!(
             g.quiescent_snapshot(),
@@ -2784,7 +3073,9 @@ mod tests {
         g.quiesce()?;
         let (sender, inbox) = interaction_channel();
         sender.callback_at_with_token(callback, SimTime::from_millis(40), 0, 9)?;
-        assert_eq!(g.process_interactions(&inbox)?, 1);
+        let processed = g.process_interactions(&inbox)?;
+        assert_eq!(processed.accepted, 1);
+        assert_eq!(processed.rejected.len(), 0);
         assert!(g.is_quiescent());
         let snapshot = g.quiescent_snapshot()?;
         assert_eq!(snapshot.next_event_time, Some(SimTime::from_millis(40)));
@@ -2806,21 +3097,49 @@ mod tests {
     }
 
     #[test]
-    fn invalid_interaction_batch_stays_in_inbox() -> Result<(), Box<dyn std::error::Error>> {
+    fn invalid_interaction_is_reported_without_blocking_valid_work()
+    -> Result<(), Box<dyn std::error::Error>> {
         let mut g = Graph::new(RuntimeConfig::default());
         let atom = g.add_atom_input("atom", 0)?;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&seen);
+        let callback = g.add_event_callback("ordered callback", move |context| {
+            observed
+                .lock()
+                .map_err(|_| EvalError::Message(String::from("capture poisoned")))?
+                .push(context.external_token());
+            Ok(ReactionOutput::idle())
+        })?;
         g.quiesce()?;
         let (sender, inbox) = interaction_channel();
+        sender.callback_now_with_token(callback, 0, 11)?;
         sender.state_now(
             0,
             vec![StateWrite::atom(atom, 1), StateWrite::atom(atom, 2)],
         )?;
+        sender.callback_now_with_token(callback, 0, 12)?;
+        sender.callback_now(quiescence_core::ReactionId::from_index(u32::MAX), 0)?;
+        let result = g.process_interactions(&inbox)?;
+        assert_eq!(result.accepted, 2);
+        assert_eq!(result.rejected.len(), 2);
         assert!(matches!(
-            g.process_interactions(&inbox),
-            Err(RuntimeError::DuplicateStateWrite(id)) if id == atom
+            result.rejected[0].error,
+            RuntimeError::DuplicateStateWrite(id) if id == atom
         ));
-        assert_eq!(inbox.pending_count()?, 1);
+        assert!(matches!(
+            result.rejected[1].error,
+            RuntimeError::UnknownReaction(_)
+        ));
+        assert!(matches!(
+            &result.rejected[0].interaction,
+            super::ExternalInteraction::StateBatch { writes, .. } if writes.len() == 2
+        ));
+        assert_eq!(inbox.pending_count()?, 0);
         assert_eq!(g.value_atom(atom)?, 0);
+        assert_eq!(
+            *seen.lock().map_err(|_| String::from("capture poisoned"))?,
+            vec![Some(11), Some(12)]
+        );
         assert!(g.is_quiescent());
         Ok(())
     }
