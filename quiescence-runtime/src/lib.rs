@@ -13,10 +13,11 @@ use std::{
 };
 
 type EvalFn =
-    Arc<dyn for<'a> Fn(&EvalContext<'a>) -> Result<EvalOutput, EvalError> + Send + Sync + 'static>;
-type ReactionFn = Arc<
+    Box<dyn for<'a> Fn(&EvalContext<'a>) -> Result<EvalOutput, EvalError> + Send + Sync + 'static>;
+type ReactionFn = Box<
     dyn for<'a> Fn(&EvalContext<'a>) -> Result<ReactionOutput, EvalError> + Send + Sync + 'static,
 >;
+type ResolvedWrite = (NodeId, CanonicalValue, CanonicalValue);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RuntimeConfig {
@@ -560,8 +561,8 @@ impl EvalContext<'_> {
         Ok(window.count_at(self.now, key))
     }
 
-    fn dependencies(&self) -> BTreeSet<NodeId> {
-        self.reads.borrow().clone()
+    fn into_dependencies(self) -> BTreeSet<NodeId> {
+        self.reads.into_inner()
     }
 }
 
@@ -843,7 +844,7 @@ impl Graph {
     where
         F: for<'a> Fn(&EvalContext<'a>) -> Result<EvalOutput, EvalError> + Send + Sync + 'static,
     {
-        self.add_node(name, q, initial, Some(Arc::new(evaluator)))
+        self.add_node(name, q, initial, Some(Box::new(evaluator)))
     }
 
     fn add_node(
@@ -888,7 +889,7 @@ impl Graph {
         if !matches!(node.state, NodeState::Numeric { .. }) {
             return Err(RuntimeError::ExpectedNumeric(id));
         }
-        node.evaluator = Some(Arc::new(evaluator));
+        node.evaluator = Some(Box::new(evaluator));
         self.mark_dirty(WorkId::Node(id));
         Ok(())
     }
@@ -911,7 +912,7 @@ impl Graph {
         let id = ReactionId::from_index(raw_id);
         self.reactions.push(Reaction {
             name: name.into(),
-            evaluator: Arc::new(evaluator),
+            evaluator: Box::new(evaluator),
             dependencies: BTreeSet::new(),
             generation: 0,
             track_dependencies: true,
@@ -947,7 +948,7 @@ impl Graph {
         let id = ReactionId::from_index(raw_id);
         self.reactions.push(Reaction {
             name: name.into(),
-            evaluator: Arc::new(evaluator),
+            evaluator: Box::new(evaluator),
             dependencies: BTreeSet::new(),
             generation: 0,
             track_dependencies: false,
@@ -1266,13 +1267,26 @@ impl Graph {
                 WorkId::Node(id) => self.node_is_dirty[id.index()] = false,
                 WorkId::Reaction(id) => self.reaction_is_dirty[id.index()] = false,
             }
-            match work {
+            let result = match work {
                 WorkId::Node(id) => {
                     if self.nodes[id.index()].evaluator.is_some() {
-                        self.evaluate(id)?;
+                        self.evaluate(id)
+                    } else {
+                        Ok(())
                     }
                 }
-                WorkId::Reaction(id) => self.evaluate_reaction(id)?,
+                WorkId::Reaction(id) => self.evaluate_reaction(id),
+            };
+            if let Err(error) = result {
+                let already_dirty = match work {
+                    WorkId::Node(id) => &mut self.node_is_dirty[id.index()],
+                    WorkId::Reaction(id) => &mut self.reaction_is_dirty[id.index()],
+                };
+                if !*already_dirty {
+                    *already_dirty = true;
+                    self.dirty.push_front(work);
+                }
+                return Err(error);
             }
         }
         Ok(())
@@ -1308,7 +1322,10 @@ impl Graph {
             steps += 1;
             let event = self.events.pop().ok_or(RuntimeError::CorruptEventQueue)?;
             self.now = event.at;
-            self.apply_event(event.kind)?;
+            if let Err(error) = self.apply_event(&event.kind) {
+                self.events.push(event);
+                return Err(error);
+            }
             self.settle_with_budget(&mut steps)?;
         }
         self.now = target;
@@ -1328,7 +1345,7 @@ impl Graph {
     fn evaluate(&mut self, id: NodeId) -> Result<(), RuntimeError> {
         let evaluator = self.nodes[id.index()]
             .evaluator
-            .clone()
+            .as_ref()
             .ok_or(RuntimeError::MissingEvaluator(id))?;
         let context = EvalContext {
             now: self.now,
@@ -1340,8 +1357,6 @@ impl Graph {
         };
         let output =
             evaluator(&context).map_err(|source| RuntimeError::Evaluation { node: id, source })?;
-        let deps = context.dependencies();
-        self.update_dependencies(WorkId::Node(id), deps)?;
 
         let (quantization, current) = match self.nodes[id.index()].state {
             NodeState::Numeric {
@@ -1351,6 +1366,8 @@ impl Graph {
             NodeState::Atom(_) => return Err(RuntimeError::ExpectedNumeric(id)),
         };
         let next = quantization.resolve(Some(current), output.estimate)?;
+        let deps = context.into_dependencies();
+        self.update_dependencies(WorkId::Node(id), deps)?;
         let generation = self.nodes[id.index()].generation.saturating_add(1);
         self.nodes[id.index()].generation = generation;
 
@@ -1385,13 +1402,13 @@ impl Graph {
         let (evaluator, track_dependencies, scheduled_key, external_token) = {
             let reaction = self
                 .reactions
-                .get_mut(id.index())
+                .get(id.index())
                 .ok_or(RuntimeError::UnknownReaction(id))?;
             (
-                reaction.evaluator.clone(),
+                &reaction.evaluator,
                 reaction.track_dependencies,
-                reaction.pending_scheduled_key.take(),
-                reaction.pending_external_token.take(),
+                reaction.pending_scheduled_key,
+                reaction.pending_external_token,
             )
         };
         let context = EvalContext {
@@ -1406,17 +1423,11 @@ impl Graph {
             reaction: id,
             source,
         })?;
-        if track_dependencies {
-            let deps = context.dependencies();
-            self.update_dependencies(WorkId::Reaction(id), deps)?;
-        }
-        let reaction = self
-            .reactions
-            .get_mut(id.index())
-            .ok_or(RuntimeError::UnknownReaction(id))?;
-        reaction.generation = reaction.generation.saturating_add(1);
-        let generation = reaction.generation;
-
+        let dependencies = if track_dependencies {
+            Some(context.into_dependencies())
+        } else {
+            None
+        };
         let ReactionOutput {
             transition_after,
             writes,
@@ -1424,29 +1435,62 @@ impl Graph {
             scheduled_reevaluations,
             scheduled_callbacks,
         } = output;
-        // Validate all targets before committing effects or accepting any
-        // scheduled work, avoiding partial publication on a bad callback.
+
+        // Validate the entire proposed result before changing dependency
+        // subscriptions, consuming callback metadata, or publishing effects.
+        if transition_after.is_none() && (!writes.is_empty() || !window_records.is_empty()) {
+            return Err(RuntimeError::UnscheduledReactionEffects(id));
+        }
         for callback in &scheduled_callbacks {
             self.reactions
                 .get(callback.reaction.index())
                 .ok_or(RuntimeError::UnknownReaction(callback.reaction))?;
         }
-        if let Some(delay) = transition_after {
-            if delay == SimDuration::ZERO {
-                self.apply_reaction_effects(&writes, &window_records)?;
-            } else {
-                self.push_event(
-                    self.now.saturating_add(delay),
-                    EventKind::ReactionTransition {
-                        reaction: id,
-                        generation,
-                        writes,
-                        window_records,
-                    },
-                );
+        let prepared_writes = if let Some(delay) = transition_after {
+            for record in &window_records {
+                if self.windows.get(record.history.index()).is_none() {
+                    return Err(RuntimeError::UnknownHistory(record.history));
+                }
             }
-        } else if !writes.is_empty() || !window_records.is_empty() {
-            return Err(RuntimeError::UnscheduledReactionEffects(id));
+            if delay == SimDuration::ZERO {
+                Some(self.resolve_state_writes(&writes)?)
+            } else {
+                // Delayed writes will be resolved against the canonical state
+                // when they fire, but their types and targets are fixed now.
+                self.validate_state_write_batch(&writes)?;
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(deps) = dependencies {
+            self.update_dependencies(WorkId::Reaction(id), deps)?;
+        }
+        let reaction = self
+            .reactions
+            .get_mut(id.index())
+            .ok_or(RuntimeError::UnknownReaction(id))?;
+        reaction.pending_scheduled_key = None;
+        reaction.pending_external_token = None;
+        reaction.generation = reaction.generation.saturating_add(1);
+        let generation = reaction.generation;
+
+        if let Some(resolved) = prepared_writes {
+            self.commit_resolved_state_writes(resolved)?;
+            for record in window_records {
+                self.windows[record.history.index()].record(self.now, record.key);
+            }
+        } else if let Some(delay) = transition_after {
+            self.push_event(
+                self.now.saturating_add(delay),
+                EventKind::ReactionTransition {
+                    reaction: id,
+                    generation,
+                    writes,
+                    window_records,
+                },
+            );
         }
         for request in scheduled_reevaluations {
             self.schedule_reaction_once(id, request);
@@ -1488,15 +1532,7 @@ impl Graph {
                     .dependencies,
             ),
         };
-        let removed: Vec<_> = old.difference(&new).copied().collect();
-        let added: Vec<_> = new.difference(&old).copied().collect();
-
-        match dependent {
-            WorkId::Node(id) => self.nodes[id.index()].dependencies = new,
-            WorkId::Reaction(id) => self.reactions[id.index()].dependencies = new,
-        }
-
-        for dep in removed {
+        for dep in old.difference(&new).copied() {
             match dependent {
                 WorkId::Node(id) => {
                     self.nodes[dep.index()].dependents.remove(&id);
@@ -1511,7 +1547,7 @@ impl Graph {
                 }
             }
         }
-        for dep in added {
+        for dep in new.difference(&old).copied() {
             match dependent {
                 WorkId::Node(id) => {
                     self.nodes[dep.index()].dependents.insert(id);
@@ -1521,28 +1557,32 @@ impl Graph {
                 }
             }
         }
+        match dependent {
+            WorkId::Node(id) => self.nodes[id.index()].dependencies = new,
+            WorkId::Reaction(id) => self.reactions[id.index()].dependencies = new,
+        }
         Ok(())
     }
 
-    fn apply_event(&mut self, event: EventKind) -> Result<(), RuntimeError> {
+    fn apply_event(&mut self, event: &EventKind) -> Result<(), RuntimeError> {
         match event {
-            EventKind::SetState { write } => self.apply_state_writes(&[write]),
-            EventKind::SetStateBatch { writes } => self.apply_state_writes(&writes),
+            EventKind::SetState { write } => self.apply_state_writes(&[*write]),
+            EventKind::SetStateBatch { writes } => self.apply_state_writes(writes),
             EventKind::Commit {
                 node,
                 generation,
                 value,
             } => {
-                self.node(node)?;
-                if self.nodes[node.index()].generation == generation {
-                    self.commit(node, value)?;
+                self.node(*node)?;
+                if self.nodes[node.index()].generation == *generation {
+                    self.commit(*node, *value)?;
                 }
                 Ok(())
             }
             EventKind::Reevaluate { node, generation } => {
-                self.node(node)?;
-                if self.nodes[node.index()].generation == generation {
-                    self.mark_dirty(WorkId::Node(node));
+                self.node(*node)?;
+                if self.nodes[node.index()].generation == *generation {
+                    self.mark_dirty(WorkId::Node(*node));
                 }
                 Ok(())
             }
@@ -1550,21 +1590,21 @@ impl Graph {
                 let target = self
                     .reactions
                     .get_mut(reaction.index())
-                    .ok_or(RuntimeError::UnknownReaction(reaction))?;
+                    .ok_or(RuntimeError::UnknownReaction(*reaction))?;
                 target.pending_scheduled_key = None;
-                target.pending_external_token = token;
-                self.mark_dirty(WorkId::Reaction(reaction));
+                target.pending_external_token = *token;
+                self.mark_dirty(WorkId::Reaction(*reaction));
                 Ok(())
             }
             EventKind::ScheduledReaction { reaction, key } => {
-                self.pending_scheduled_reactions.remove(&(reaction, key));
+                self.pending_scheduled_reactions.remove(&(*reaction, *key));
                 let target = self
                     .reactions
                     .get_mut(reaction.index())
-                    .ok_or(RuntimeError::UnknownReaction(reaction))?;
-                target.pending_scheduled_key = Some(key);
+                    .ok_or(RuntimeError::UnknownReaction(*reaction))?;
+                target.pending_scheduled_key = Some(*key);
                 target.pending_external_token = None;
-                self.mark_dirty(WorkId::Reaction(reaction));
+                self.mark_dirty(WorkId::Reaction(*reaction));
                 Ok(())
             }
             EventKind::ReactionTransition {
@@ -1576,11 +1616,11 @@ impl Graph {
                 let current_generation = self
                     .reactions
                     .get(reaction.index())
-                    .ok_or(RuntimeError::UnknownReaction(reaction))?
+                    .ok_or(RuntimeError::UnknownReaction(*reaction))?
                     .generation;
-                if current_generation == generation {
-                    self.apply_reaction_effects(&writes, &window_records)?;
-                    self.mark_dirty(WorkId::Reaction(reaction));
+                if current_generation == *generation {
+                    self.apply_reaction_effects(writes, window_records)?;
+                    self.mark_dirty(WorkId::Reaction(*reaction));
                 }
                 Ok(())
             }
@@ -1605,6 +1645,14 @@ impl Graph {
     }
 
     fn apply_state_writes(&mut self, writes: &[StateWrite]) -> Result<(), RuntimeError> {
+        let resolved = self.resolve_state_writes(writes)?;
+        self.commit_resolved_state_writes(resolved)
+    }
+
+    fn resolve_state_writes(
+        &self,
+        writes: &[StateWrite],
+    ) -> Result<Vec<ResolvedWrite>, RuntimeError> {
         let mut seen = BTreeSet::new();
         let mut resolved = Vec::with_capacity(writes.len());
         for write in writes {
@@ -1637,6 +1685,13 @@ impl Graph {
             };
             resolved.push((node_id, current, next));
         }
+        Ok(resolved)
+    }
+
+    fn commit_resolved_state_writes(
+        &mut self,
+        resolved: Vec<ResolvedWrite>,
+    ) -> Result<(), RuntimeError> {
         for (node, current, next) in resolved {
             if next != current {
                 self.nodes[node.index()].generation =
@@ -1973,6 +2028,204 @@ mod tests {
 
     fn q0() -> Result<Quantization, Box<dyn std::error::Error>> {
         Ok(Quantization::new(0, 0)?)
+    }
+
+    #[test]
+    fn failed_node_evaluation_stays_dirty_until_retry() -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = Graph::new(RuntimeConfig::default());
+        let source = g.add_input("source", q0()?, 1.0)?;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&attempts);
+        let derived = g.add_derived("fallible", q0()?, 0.0, move |context| {
+            let value = context.read_f64(source)?;
+            if count.fetch_add(1, Ordering::Relaxed) == 0 {
+                return Err(EvalError::Message(String::from(
+                    "temporary evaluation error",
+                )));
+            }
+            Ok(EvalOutput::immediate(value))
+        })?;
+        assert!(matches!(g.settle(), Err(RuntimeError::Evaluation { .. })));
+        assert!(!g.is_quiescent());
+        assert_eq!(g.value_bucket(derived)?, Bucket::new(0));
+        g.set_input_now(source, 2.0)?;
+        assert_eq!(g.value_bucket(derived)?, Bucket::new(2));
+        assert!(g.is_quiescent());
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_reaction_keeps_previous_subscriptions_until_success()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = Graph::new(RuntimeConfig::default());
+        let gate = g.add_input("gate", q0()?, 0.0)?;
+        let previous = g.add_input("previous", q0()?, 1.0)?;
+        let replacement = g.add_input("replacement", q0()?, 2.0)?;
+        let retry_allowed = Arc::new(AtomicUsize::new(0));
+        let allow_retry = Arc::clone(&retry_allowed);
+        let reaction = g.add_reaction("dynamic subscriptions", move |context| {
+            if context.read_bool(gate)? {
+                context.read_bucket(replacement)?;
+                if allow_retry.load(Ordering::Relaxed) == 0 {
+                    return Ok(ReactionOutput::schedule_reaction_once_after(
+                        quiescence_core::ReactionId::from_index(u32::MAX),
+                        SimDuration::ZERO,
+                        0,
+                        0,
+                    ));
+                }
+            } else {
+                context.read_bucket(previous)?;
+            }
+            Ok(ReactionOutput::idle())
+        })?;
+        g.settle()?;
+        let before = &g.reactions[reaction.index()].dependencies;
+        assert!(before.contains(&gate));
+        assert!(before.contains(&previous));
+        assert!(!before.contains(&replacement));
+
+        assert!(matches!(
+            g.set_input_now(gate, 1.0),
+            Err(RuntimeError::UnknownReaction(_))
+        ));
+        let still_previous = &g.reactions[reaction.index()].dependencies;
+        assert!(still_previous.contains(&previous));
+        assert!(!still_previous.contains(&replacement));
+        assert!(!g.is_quiescent());
+
+        retry_allowed.store(1, Ordering::Relaxed);
+        g.settle()?;
+        let after = &g.reactions[reaction.index()].dependencies;
+        assert!(after.contains(&gate));
+        assert!(!after.contains(&previous));
+        assert!(after.contains(&replacement));
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_reaction_output_is_retryable_without_partial_effects()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = Graph::new(RuntimeConfig::default());
+        let sink = g.add_input("sink", q0()?, 0.0)?;
+        let _reaction = g.add_reaction("bad callback target", move |_| {
+            Ok(ReactionOutput::immediate(vec![StateWrite::new(sink, 8.0)])
+                .and_schedule_reaction_once_after(
+                    quiescence_core::ReactionId::from_index(u32::MAX),
+                    SimDuration::ZERO,
+                    13,
+                    0,
+                ))
+        })?;
+        for _ in 0..2 {
+            assert!(matches!(g.settle(), Err(RuntimeError::UnknownReaction(_))));
+            assert!(!g.is_quiescent());
+            assert_eq!(g.value_bucket(sink)?, Bucket::new(0));
+            assert_eq!(g.take_transitions().len(), 0);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn event_callback_retry_preserves_external_token() -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = Graph::new(RuntimeConfig::default());
+        let tokens = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&tokens);
+        let callback = g.add_event_callback("temporarily failing event", move |context| {
+            let mut recorded = observed
+                .lock()
+                .map_err(|_| EvalError::Message(String::from("token lock poisoned")))?;
+            recorded.push(context.external_token());
+            if recorded.len() == 1 {
+                return Err(EvalError::Message(String::from("temporary callback error")));
+            }
+            drop(recorded);
+            Ok(ReactionOutput::idle())
+        })?;
+        let at = SimTime::from_millis(12);
+        g.schedule_reaction_event_with_token(callback, at, 0, 0xdead)?;
+        assert!(matches!(
+            g.advance_to(at),
+            Err(RuntimeError::ReactionEvaluation { .. })
+        ));
+        assert!(!g.is_quiescent());
+        g.advance_to(at)?;
+        assert_eq!(
+            *tokens
+                .lock()
+                .map_err(|_| String::from("token lock poisoned"))?,
+            vec![Some(0xdead), Some(0xdead)]
+        );
+        assert!(g.is_quiescent());
+        Ok(())
+    }
+
+    #[test]
+    fn scheduled_callback_retry_preserves_key() -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = Graph::new(RuntimeConfig::default());
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&keys);
+        let callback =
+            g.add_event_callback("temporarily failing scheduled callback", move |c| {
+                let mut recorded = observed
+                    .lock()
+                    .map_err(|_| EvalError::Message(String::from("key lock poisoned")))?;
+                recorded.push(c.scheduled_key());
+                if recorded.len() == 1 {
+                    return Err(EvalError::Message(String::from(
+                        "temporary scheduled error",
+                    )));
+                }
+                drop(recorded);
+                Ok(ReactionOutput::idle())
+            })?;
+        let _scheduler = g.add_reaction("schedule once", move |_| {
+            Ok(ReactionOutput::schedule_reaction_once_after(
+                callback,
+                SimDuration::from_millis(5),
+                71,
+                0,
+            ))
+        })?;
+        g.settle()?;
+        let at = SimTime::from_millis(5);
+        assert!(matches!(
+            g.advance_to(at),
+            Err(RuntimeError::ReactionEvaluation { .. })
+        ));
+        assert!(!g.is_quiescent());
+        g.advance_to(at)?;
+        assert_eq!(
+            *keys.lock().map_err(|_| String::from("key lock poisoned"))?,
+            vec![Some(71), Some(71)]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn failed_scheduled_write_remains_in_causal_queue() -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = Graph::new(RuntimeConfig::default());
+        let node = g.add_input("node", q0()?, 0.0)?;
+        let at = SimTime::from_millis(8);
+        g.schedule_input(node, at, 1e100)?;
+        let original_order = g
+            .events
+            .peek()
+            .map(|event| (event.priority, event.sequence));
+        for _ in 0..2 {
+            assert!(matches!(g.advance_to(at), Err(RuntimeError::Quantize(_))));
+            assert_eq!(g.next_event_time(), Some(at));
+            assert_eq!(
+                g.events
+                    .peek()
+                    .map(|event| (event.priority, event.sequence)),
+                original_order
+            );
+            assert!(!g.is_quiescent());
+            assert_eq!(g.value_bucket(node)?, Bucket::new(0));
+        }
+        Ok(())
     }
 
     #[test]
