@@ -20,6 +20,7 @@ type ReactionFn = Arc<
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RuntimeConfig {
+    /// Maximum total event deliveries and evaluations at one simulation timestamp.
     pub same_time_microstep_budget: usize,
 }
 impl Default for RuntimeConfig {
@@ -581,16 +582,16 @@ impl EventWindow {
         self.events
             .iter()
             .filter(|event| {
-                event.key == key
-                    && now.as_nanos().saturating_sub(event.at.as_nanos())
-                        <= self.duration.as_nanos()
+                let elapsed = i128::from(now.as_nanos()) - i128::from(event.at.as_nanos());
+                event.key == key && (0..=i128::from(self.duration.as_nanos())).contains(&elapsed)
             })
             .count()
     }
 
     fn record(&mut self, now: SimTime, key: u64) {
         while self.events.front().is_some_and(|event| {
-            now.as_nanos().saturating_sub(event.at.as_nanos()) > self.duration.as_nanos()
+            i128::from(now.as_nanos()) - i128::from(event.at.as_nanos())
+                > i128::from(self.duration.as_nanos())
         }) {
             self.events.pop_front();
         }
@@ -1068,8 +1069,15 @@ impl Graph {
                 return Err(RuntimeError::NotAnInput(node_id));
             }
             match (write, &node.state) {
-                (StateWrite::Numeric { .. }, NodeState::Numeric { .. })
-                | (StateWrite::Atom { .. }, NodeState::Atom(_)) => {}
+                (StateWrite::Numeric { value, .. }, NodeState::Numeric { .. }) => {
+                    // Finiteness is independent of the state at delivery time.
+                    // Bucket resolution depends on the then-current hysteresis
+                    // state, so it must remain in apply_state_writes.
+                    if !value.is_finite() {
+                        return Err(QuantizeError::NonFiniteEstimate.into());
+                    }
+                }
+                (StateWrite::Atom { .. }, NodeState::Atom(_)) => {}
                 (StateWrite::Numeric { .. }, NodeState::Atom(_)) => {
                     return Err(RuntimeError::ExpectedNumeric(node_id));
                 }
@@ -1127,7 +1135,7 @@ impl Graph {
         at: SimTime,
         value: f64,
     ) -> Result<(), RuntimeError> {
-        self.node(id)?;
+        self.validate_state_write_batch(&[StateWrite::new(id, value)])?;
         if at < self.now {
             return Err(RuntimeError::EventInPast {
                 now: self.now,
@@ -1151,7 +1159,7 @@ impl Graph {
         at: SimTime,
         value: u64,
     ) -> Result<(), RuntimeError> {
-        self.node(id)?;
+        self.validate_state_write_batch(&[StateWrite::atom(id, value)])?;
         if at < self.now {
             return Err(RuntimeError::EventInPast {
                 now: self.now,
@@ -1239,25 +1247,24 @@ impl Graph {
     /// # Errors
     /// Propagates evaluation, scheduling, quantization, and calculation-instability errors.
     pub fn settle(&mut self) -> Result<(), RuntimeError> {
-        let mut steps = 0_usize;
-        while let Some(work) = self.dirty.pop_front() {
+        let mut steps = 0;
+        self.settle_with_budget(&mut steps)
+    }
+
+    fn settle_with_budget(&mut self, steps: &mut usize) -> Result<(), RuntimeError> {
+        while let Some(&work) = self.dirty.front() {
+            if *steps >= self.config.same_time_microstep_budget {
+                return Err(RuntimeError::CalculationInstability {
+                    at: self.now,
+                    microsteps: *steps,
+                    active_work: self.dirty.iter().copied().collect(),
+                });
+            }
+            *steps += 1;
+            self.dirty.pop_front();
             match work {
                 WorkId::Node(id) => self.node_is_dirty[id.index()] = false,
                 WorkId::Reaction(id) => self.reaction_is_dirty[id.index()] = false,
-            }
-            steps = steps.saturating_add(1);
-            if steps > self.config.same_time_microstep_budget {
-                let active_work = self
-                    .dirty
-                    .iter()
-                    .copied()
-                    .chain(std::iter::once(work))
-                    .collect();
-                return Err(RuntimeError::CalculationInstability {
-                    at: self.now,
-                    microsteps: steps,
-                    active_work,
-                });
             }
             match work {
                 WorkId::Node(id) => {
@@ -1280,12 +1287,29 @@ impl Graph {
                 requested: target,
             });
         }
-        self.settle()?;
+        let mut steps = 0;
+        self.settle_with_budget(&mut steps)?;
         while self.events.peek().is_some_and(|e| e.at <= target) {
+            let event_time = self
+                .events
+                .peek()
+                .ok_or(RuntimeError::CorruptEventQueue)?
+                .at;
+            if event_time > self.now {
+                steps = 0;
+            }
+            if steps >= self.config.same_time_microstep_budget {
+                return Err(RuntimeError::CalculationInstability {
+                    at: event_time,
+                    microsteps: steps,
+                    active_work: self.dirty.iter().copied().collect(),
+                });
+            }
+            steps += 1;
             let event = self.events.pop().ok_or(RuntimeError::CorruptEventQueue)?;
             self.now = event.at;
             self.apply_event(event.kind)?;
-            self.settle()?;
+            self.settle_with_budget(&mut steps)?;
         }
         self.now = target;
         Ok(())
@@ -1400,6 +1424,13 @@ impl Graph {
             scheduled_reevaluations,
             scheduled_callbacks,
         } = output;
+        // Validate all targets before committing effects or accepting any
+        // scheduled work, avoiding partial publication on a bad callback.
+        for callback in &scheduled_callbacks {
+            self.reactions
+                .get(callback.reaction.index())
+                .ok_or(RuntimeError::UnknownReaction(callback.reaction))?;
+        }
         if let Some(delay) = transition_after {
             if delay == SimDuration::ZERO {
                 self.apply_reaction_effects(&writes, &window_records)?;
@@ -1421,9 +1452,6 @@ impl Graph {
             self.schedule_reaction_once(id, request);
         }
         for callback in scheduled_callbacks {
-            self.reactions
-                .get(callback.reaction.index())
-                .ok_or(RuntimeError::UnknownReaction(callback.reaction))?;
             self.schedule_reaction_once(
                 callback.reaction,
                 ScheduledReevaluation {
@@ -1938,13 +1966,121 @@ mod tests {
     use std::{
         sync::{
             Arc, Mutex,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicU64, AtomicUsize, Ordering},
         },
         thread,
     };
 
     fn q0() -> Result<Quantization, Box<dyn std::error::Error>> {
         Ok(Quantization::new(0, 0)?)
+    }
+
+    #[test]
+    fn budget_exhaustion_preserves_pending_work_for_retry() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut g = Graph::new(RuntimeConfig {
+            same_time_microstep_budget: 1,
+        });
+        let first = g.add_derived("first", q0()?, 0.0, |_| Ok(EvalOutput::immediate(1.0)))?;
+        let second = g.add_derived("second", q0()?, 0.0, |_| Ok(EvalOutput::immediate(2.0)))?;
+        assert!(matches!(
+            g.settle(),
+            Err(RuntimeError::CalculationInstability { .. })
+        ));
+        assert!(!g.is_quiescent());
+        g.config.same_time_microstep_budget = 2;
+        g.settle()?;
+        assert!(g.is_quiescent());
+        assert_eq!(g.value_bucket(first)?, Bucket::new(1));
+        assert_eq!(g.value_bucket(second)?, Bucket::new(2));
+        Ok(())
+    }
+
+    #[test]
+    fn zero_delay_scheduled_callbacks_respect_same_time_budget()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = Graph::new(RuntimeConfig {
+            same_time_microstep_budget: 32,
+        });
+        let counter = Arc::new(AtomicU64::new(0));
+        let callback_counter = Arc::clone(&counter);
+        let callback = g.add_event_callback("self-reschedule", move |_| {
+            let key = callback_counter.fetch_add(1, Ordering::Relaxed);
+            Ok(ReactionOutput::schedule_once_after(
+                SimDuration::ZERO,
+                key,
+                0,
+            ))
+        })?;
+        g.schedule_reaction_event(callback, SimTime::ZERO, 0)?;
+        assert!(matches!(
+            g.advance_to(SimTime::ZERO),
+            Err(RuntimeError::CalculationInstability { .. })
+        ));
+        assert!(!g.is_quiescent());
+        assert!(counter.load(Ordering::Relaxed) <= 32);
+        Ok(())
+    }
+
+    #[test]
+    fn scheduled_writes_validate_target_before_entering_queue()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = Graph::new(RuntimeConfig::default());
+        let atom = g.add_atom_input("atom", 5)?;
+        let numeric = g.add_input("numeric", q0()?, 1.0)?;
+        let derived = g.add_derived("derived", q0()?, 1.0, |_| Ok(EvalOutput::immediate(1.0)))?;
+        assert!(matches!(
+            g.schedule_input(atom, SimTime::ZERO, 1.0),
+            Err(RuntimeError::ExpectedNumeric(_))
+        ));
+        assert!(matches!(
+            g.schedule_atom(numeric, SimTime::ZERO, 4),
+            Err(RuntimeError::ExpectedAtom(_))
+        ));
+        assert!(matches!(
+            g.schedule_input(derived, SimTime::ZERO, 1.0),
+            Err(RuntimeError::NotAnInput(_))
+        ));
+        assert!(matches!(
+            g.schedule_input(numeric, SimTime::ZERO, f64::NAN),
+            Err(RuntimeError::Quantize(_))
+        ));
+        assert_eq!(g.next_event_time(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_callback_target_does_not_commit_reaction_writes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = Graph::new(RuntimeConfig::default());
+        let output = g.add_input("output", q0()?, 0.0)?;
+        let _reaction = g.add_reaction("invalid callback target", move |_| {
+            Ok(
+                ReactionOutput::immediate(vec![StateWrite::new(output, 5.0)])
+                    .and_schedule_reaction_once_after(
+                        quiescence_core::ReactionId::from_index(999),
+                        SimDuration::ZERO,
+                        0,
+                        0,
+                    ),
+            )
+        })?;
+        assert!(matches!(g.settle(), Err(RuntimeError::UnknownReaction(_))));
+        assert_eq!(g.value_bucket(output)?, Bucket::new(0));
+        Ok(())
+    }
+
+    #[test]
+    fn event_window_handles_full_i64_time_span() {
+        let mut window = super::EventWindow {
+            name: String::from("extreme time"),
+            duration: SimDuration::from_nanos(i64::MAX),
+            events: std::collections::VecDeque::new(),
+        };
+        window.record(SimTime::from_nanos(i64::MIN), 1);
+        assert_eq!(window.count_at(SimTime::from_nanos(i64::MAX), 1), 0);
+        window.record(SimTime::from_nanos(i64::MAX), 1);
+        assert_eq!(window.events.len(), 1);
     }
 
     #[test]

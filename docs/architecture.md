@@ -107,6 +107,11 @@ This deliberately is not a normal reactive dependency yet. Reading a window does
 
 The generic fallback is bounded same-time microstepping. It exists because failure must be finite and diagnosable.
 
+The budget covers both evaluator work and scheduled-event deliveries cumulatively at each
+simulation timestamp, resetting only when simulated time advances. Exhaustion leaves pending
+work and due events intact, so the graph stays non-quiescent and may be retried with a larger
+budget. Future input events validate their targets on admission and resolve numeric state when applied.
+
 Future SCC strategies can be selected independently:
 
 - repeated-state / finite-cycle detection;

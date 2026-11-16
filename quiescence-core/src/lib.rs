@@ -217,7 +217,9 @@ fn round_i64(value: f64) -> Result<i64, QuantizeError> {
         return Err(QuantizeError::NonFiniteEstimate);
     }
     let rounded = value.round();
-    if rounded < i64::MIN as f64 || rounded > i64::MAX as f64 {
+    // i64::MAX rounds up to 2^63 in f64. The upper bound is exclusive,
+    // otherwise the saturating float-to-integer cast silently accepts 2^63.
+    if rounded < i64::MIN as f64 || rounded >= -(i64::MIN as f64) {
         return Err(QuantizeError::OutOfRange);
     }
     Ok(rounded as i64)
@@ -251,6 +253,21 @@ impl std::error::Error for QuantizeError {}
 #[cfg(test)]
 mod tests {
     use super::{Bucket, Estimate, Quantization};
+
+    #[test]
+    fn quantization_rejects_unrepresentable_float_boundaries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let q = Quantization::new(0, 0)?;
+        assert!(matches!(
+            q.resolve(None, Estimate::point(9_223_372_036_854_775_808.0)),
+            Err(super::QuantizeError::OutOfRange)
+        ));
+        assert_eq!(
+            q.resolve(None, Estimate::point(-9_223_372_036_854_775_808.0))?,
+            Bucket::new(i64::MIN)
+        );
+        Ok(())
+    }
 
     #[test]
     fn decimal_quantization() -> Result<(), Box<dyn std::error::Error>> {
