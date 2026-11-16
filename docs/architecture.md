@@ -97,6 +97,13 @@ Possible replacements include calendar queues, timing wheels, hierarchical queue
 
 A stale prediction may be left in a queue and discarded cheaply when its generation no longer matches.
 
+An evaluator error leaves its work dirty, including the original scheduled key or external
+token for callback retries. Invalid reaction results are rejected before changing dynamic
+subscriptions, generation counters, or canonical state. A scheduled event that fails during
+delivery remains in the causal queue in its original priority/sequence position; callers
+must handle the error rather than treating the graph as quiescent. Evaluators must express
+effects through their return values: retrying an evaluator can execute its body more than once.
+
 ### Lazy temporal windows
 
 Some recovered behavior depends on bounded history rather than a future deadline. An event window stores exact `(time, key)` records and answers keyed counts at the current causal time. Recording history is part of a reaction transition, so it commits alongside ordinary state writes. Expiration is lazy: a record simply stops contributing once its age exceeds the configured duration, and old front entries are physically pruned on later records. No expiry event is created merely to maintain bookkeeping.
