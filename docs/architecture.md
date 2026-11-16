@@ -87,7 +87,17 @@ The invariant is only:
 
 ## Layer 4: temporal scheduling
 
-The prototype uses one binary heap of scheduled events. The API distinguishes two causal meanings:
+The scheduler uses an adaptive event queue. While there are at most 128 distinct
+`(simulation timestamp, priority)` keys, a sorted map holds one FIFO deque per
+key; this avoids one heap sift per callback in a dense same-time batch.
+Once the pending schedule has more distinct keys, it converts to a binary
+heap with a monotonically assigned sequence for FIFO ties. The heap resets to
+grouped mode after it drains. Sequence exhaustion triggers a stable reindexing
+of pending events rather than allowing a wraparound to reorder callbacks.
+On failed event delivery, the event is restored ahead of later events at the
+same key without losing its original priority or insertion order.
+
+The API distinguishes two causal meanings:
 
 - **Forecasts** are generation-stamped predictions derived from current dependencies. If a dependency changes before the forecast fires, the old event becomes stale.
 - **Scheduled callbacks** are keyed schedule-once wakeups. A producer may target itself or a distinct callback reaction. Once accepted they survive dependency changes; another request with the same `(target reaction, key)` is ignored until the callback is dequeued. Same-time callbacks order by lower numeric priority and then insertion sequence. The key is intentionally domain-neutral: a Minecraft adapter can intern `(position, block)` while another domain can choose a different identity. Explicit targets matter when source code schedules a different handler, such as a neighbor-change path enqueueing a later block-update callback.
