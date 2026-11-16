@@ -117,6 +117,17 @@ RUSTC_WRAPPER=/usr/local/bin/sccache cargo run --release -p quiescence-runtime -
 
 This is a smoke test rather than a throughput guarantee; compare runs on the same pinned core and toolchain when changing the ingress path.
 
+### Scheduler-density smoke benchmark
+
+The scheduler-specific benchmark separates scheduling and callback settlement for equal
+timestamp/priority keys, 64 interleaved groups, and fully dispersed timestamps. Run
+the same workloads on the same CPU core and Rust toolchain to detect regressions in
+dense and sparse event queues:
+
+```console
+RUSTC_WRAPPER=/usr/local/bin/sccache cargo run --release -p quiescence-runtime --example scheduler_mix
+```
+
 ## Sparse reactions
 
 Read-tracked reactions can forecast generation-stamped, atomic state transitions. Dependency changes invalidate stale forecasts, allowing tick-shaped source logic to execute at causal boundaries instead of polling. See `quiescence-runtime/examples/vanilla_furnace.rs` for a furnace-shaped deadline example and `quiescence-runtime/examples/vanilla_hopper.rs` for a recovered cooldown shape where inventory snapshot handles are not dependencies during cooldown, become dependencies only once the hopper is ready-but-blocked, and commit atomically with the next deadline after a successful transfer. Dense stochastic selectors can remain adapter-owned and enqueue each selected callback through the external interaction ingress; duplicate selections remain distinct events. `quiescence-runtime/examples/vanilla_redstone_torch.rs` shows a third temporal shape: a lazy keyed event window records callbacks transactionally and evaluates an 8-events-in-60-ticks threshold without scheduling expiry wakeups.
