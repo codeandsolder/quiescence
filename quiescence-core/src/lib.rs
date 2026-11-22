@@ -238,17 +238,13 @@ impl Quantization {
         estimate: Estimate,
     ) -> Result<Bucket, QuantizeError> {
         if estimate.radius == 0.0 {
-            return PointRequest {
-                quantization: self,
-                previous,
-                value: estimate.center,
-            }
-            .resolve();
+            return point::resolve_point(self, previous, estimate.center);
         }
         point::resolve_interval(self, previous, estimate)
             .unwrap_or_else(|| self.resolve_exact(previous, estimate))
     }
 
+    #[cold]
     fn resolve_exact(
         self,
         previous: Option<Bucket>,
