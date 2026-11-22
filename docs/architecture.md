@@ -75,6 +75,8 @@ Internal causal scheduling remains separate. Forecasts and schedule-once callbac
 
 ## Layer 3: dependency storage and propagation
 
+Canonical node states occupy a compact contiguous array indexed by stable public node IDs. Names and reverse links occupy a separate array; evaluator closures, forward subscriptions and forecast generations exist only for derived nodes in a dense derived-owner arena. Forecast queue entries address that arena directly, while commits retain the original public node identity. Reads, snapshots and write validation need only the canonical state array.
+
 The graph owner collects reads in a reusable dense-ID epoch table and observation buffer. Repeated IDs are recorded once; nonmonotonic observations are sorted at the end of evaluation. Forward subscriptions are immutable sorted lists with six inline IDs, spilling to a boxed slice. Reverse edges use three inline work IDs or a B-tree for scalable fan-out and dynamic insertion/removal. Stable subscriptions bypass graph mutations entirely; changed sets use a linear symmetric difference. The graph reuses the same epoch membership array for write validation after evaluator completion. Read observations awaiting publication remain independent of the marks. Immediate write batches stage only changed canonical values in a reusable vector, preserving validation order and all-or-nothing state application without allocating for unchanged batches.
 
 The invariant is only:

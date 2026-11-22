@@ -41,6 +41,7 @@ mod error;
 mod event_queue;
 mod history;
 mod ingress;
+mod node_storage;
 mod output;
 mod read_set;
 mod write_batch;
@@ -56,8 +57,9 @@ pub use output::{
 };
 
 use edge_set::ReverseEdges;
-use event_queue::{EventKind, EventQueue, ScheduledEvent};
+use event_queue::{EventKind, EventQueue, ForecastOwner, ScheduledEvent};
 use history::EventWindow;
+use node_storage::{DerivedId, DerivedNode, NodeLinks, NodeState, NumericCell};
 use read_set::{Dependencies, ReadTracker};
 use write_batch::ResolvedWrite;
 
@@ -109,7 +111,7 @@ pub enum Invocation {
 
 pub struct EvalContext<'a> {
     now: SimTime,
-    nodes: &'a [Node],
+    values: &'a [NodeState],
     windows: &'a [EventWindow],
     reads: Option<RefCell<&'a mut ReadTracker>>,
     invocation: Invocation,
@@ -183,68 +185,14 @@ impl EvalContext<'_> {
 
     fn read_state(&self, id: NodeId) -> Result<&NodeState, EvalError> {
         let node = self
-            .nodes
+            .values
             .get(id.index())
             .ok_or(EvalError::UnknownNode(id))?;
         if let Some(reads) = &self.reads {
             reads.borrow_mut().record(id);
         }
-        Ok(&node.state)
+        Ok(node)
     }
-}
-
-#[derive(Clone, Copy)]
-struct NumericCell {
-    quantization: Quantization,
-    bucket: Bucket,
-}
-
-/// A node's write/evaluation role is immutable from registration onward.
-enum NodeState {
-    Input(NumericCell),
-    Derived {
-        cell: NumericCell,
-        evaluator: Option<EvalFn>,
-    },
-    Atom(u64),
-}
-
-impl NodeState {
-    const fn numeric(&self) -> Option<(Quantization, Bucket)> {
-        match self {
-            Self::Input(cell) | Self::Derived { cell, .. } => {
-                Some((cell.quantization, cell.bucket))
-            }
-            Self::Atom(_) => None,
-        }
-    }
-
-    const fn atom(&self) -> Option<u64> {
-        match self {
-            Self::Atom(value) => Some(*value),
-            Self::Input(_) | Self::Derived { .. } => None,
-        }
-    }
-
-    const fn is_derived(&self) -> bool {
-        matches!(self, Self::Derived { .. })
-    }
-
-    const fn canonical(&self) -> CanonicalValue {
-        match self {
-            Self::Input(cell) | Self::Derived { cell, .. } => CanonicalValue::Numeric(cell.bucket),
-            Self::Atom(value) => CanonicalValue::Atom(*value),
-        }
-    }
-}
-
-struct Node {
-    name: Arc<str>,
-    state: NodeState,
-    dependencies: Dependencies,
-    dependents: ReverseEdges,
-    generation: u64,
-    pending_forecasts: u8,
 }
 
 struct Reaction {
@@ -308,7 +256,9 @@ impl DirtyQueue {
 pub struct Graph {
     config: RuntimeConfig,
     now: SimTime,
-    nodes: Vec<Node>,
+    values: Vec<NodeState>,
+    links: Vec<NodeLinks>,
+    derived: Vec<DerivedNode>,
     reactions: Vec<Reaction>,
     windows: Vec<EventWindow>,
     dirty: DirtyQueue,
@@ -326,7 +276,9 @@ impl Graph {
         Self {
             config,
             now: SimTime::ZERO,
-            nodes: Vec::new(),
+            values: Vec::new(),
+            links: Vec::new(),
+            derived: Vec::new(),
             reactions: Vec::new(),
             windows: Vec::new(),
             dirty: DirtyQueue::new(),
@@ -374,11 +326,7 @@ impl Graph {
         Ok(QuiescentSnapshot {
             at: self.now,
             next_event_time: self.events.peek().map(|event| event.at),
-            values: self
-                .nodes
-                .iter()
-                .map(|node| node.state.canonical())
-                .collect(),
+            values: self.values.iter().map(NodeState::canonical).collect(),
         })
     }
 
@@ -527,14 +475,7 @@ impl Graph {
     where
         F: for<'a> Fn(&EvalContext<'a>) -> Result<EvalOutput, EvalError> + Send + Sync + 'static,
     {
-        let cell = Self::numeric_cell(q, initial)?;
-        self.add_node(
-            name,
-            NodeState::Derived {
-                cell,
-                evaluator: Some(Box::new(evaluator)),
-            },
-        )
+        self.add_derived_node(name, q, initial, Some(Box::new(evaluator)))
     }
 
     /// Reserve a derived node's identity before its evaluator is defined.
@@ -551,14 +492,28 @@ impl Graph {
         q: Quantization,
         initial: f64,
     ) -> Result<NodeId, RuntimeError> {
+        self.add_derived_node(name, q, initial, None)
+    }
+
+    fn add_derived_node(
+        &mut self,
+        name: impl Into<Arc<str>>,
+        q: Quantization,
+        initial: f64,
+        evaluator: Option<EvalFn>,
+    ) -> Result<NodeId, RuntimeError> {
         let cell = Self::numeric_cell(q, initial)?;
-        self.add_node(
-            name,
-            NodeState::Derived {
-                cell,
-                evaluator: None,
-            },
-        )
+        let raw = u32::try_from(self.derived.len()).map_err(|_| RuntimeError::TooManyNodes)?;
+        let owner = DerivedId::new(raw);
+        let node = self.add_node(name, NodeState::Derived { cell, owner })?;
+        self.derived.push(DerivedNode {
+            node,
+            evaluator,
+            dependencies: Dependencies::new(),
+            generation: 0,
+            pending_forecasts: 0,
+        });
+        Ok(node)
     }
 
     fn numeric_cell(q: Quantization, initial: f64) -> Result<NumericCell, RuntimeError> {
@@ -574,16 +529,13 @@ impl Graph {
         name: impl Into<Arc<str>>,
         state: NodeState,
     ) -> Result<NodeId, RuntimeError> {
-        let raw_id = u32::try_from(self.nodes.len()).map_err(|_| RuntimeError::TooManyNodes)?;
+        let raw_id = u32::try_from(self.values.len()).map_err(|_| RuntimeError::TooManyNodes)?;
         let id = NodeId::from_index(raw_id);
         let derived = state.is_derived();
-        self.nodes.push(Node {
+        self.values.push(state);
+        self.links.push(NodeLinks {
             name: name.into(),
-            state,
-            dependencies: Dependencies::new(),
             dependents: ReverseEdges::new(),
-            generation: 0,
-            pending_forecasts: 0,
         });
         self.dirty.nodes.push(false);
         self.reads.register_node();
@@ -606,17 +558,8 @@ impl Graph {
     where
         F: for<'a> Fn(&EvalContext<'a>) -> Result<EvalOutput, EvalError> + Send + Sync + 'static,
     {
-        let node = self
-            .nodes
-            .get_mut(id.index())
-            .ok_or(RuntimeError::UnknownNode(id))?;
-        let NodeState::Derived {
-            evaluator: slot, ..
-        } = &mut node.state
-        else {
-            return Err(RuntimeError::NotDerived(id));
-        };
-        *slot = Some(Box::new(evaluator));
+        let owner = self.derived_owner(id)?;
+        self.derived[owner.index()].evaluator = Some(Box::new(evaluator));
         self.dirty.mark(WorkId::Node(id));
         Ok(())
     }
@@ -717,8 +660,7 @@ impl Graph {
     /// # Errors
     /// Returns an error if the node does not exist or is not numeric.
     pub fn value_bucket(&self, id: NodeId) -> Result<Bucket, RuntimeError> {
-        self.node(id)?
-            .state
+        self.node_state(id)?
             .numeric()
             .map(|(_, bucket)| bucket)
             .ok_or(RuntimeError::ExpectedNumeric(id))
@@ -726,8 +668,7 @@ impl Graph {
     /// # Errors
     /// Returns an error if the node does not exist or is not numeric.
     pub fn value_f64(&self, id: NodeId) -> Result<f64, RuntimeError> {
-        self.node(id)?
-            .state
+        self.node_state(id)?
             .numeric()
             .map(|(quantization, bucket)| quantization.decode(bucket))
             .ok_or(RuntimeError::ExpectedNumeric(id))
@@ -735,8 +676,7 @@ impl Graph {
     /// # Errors
     /// Returns an error if the node does not exist or is not an atom.
     pub fn value_atom(&self, id: NodeId) -> Result<u64, RuntimeError> {
-        self.node(id)?
-            .state
+        self.node_state(id)?
             .atom()
             .ok_or(RuntimeError::ExpectedAtom(id))
     }
@@ -1013,20 +953,21 @@ impl Graph {
     }
 
     fn evaluate(&mut self, id: NodeId) -> Result<(), RuntimeError> {
-        let NodeState::Derived { cell, evaluator } = &self.nodes[id.index()].state else {
+        let NodeState::Derived { cell, owner } = self.values[id.index()] else {
             return Err(RuntimeError::NotDerived(id));
         };
         let NumericCell {
             quantization,
             bucket: current,
-        } = *cell;
-        let evaluator = evaluator
+        } = cell;
+        let evaluator = self.derived[owner.index()]
+            .evaluator
             .as_ref()
             .ok_or(RuntimeError::MissingEvaluator(id))?;
         self.reads.begin();
         let context = EvalContext {
             now: self.now,
-            nodes: &self.nodes,
+            values: &self.values,
             windows: &self.windows,
             reads: Some(RefCell::new(&mut self.reads)),
             invocation: Invocation::Reactive,
@@ -1044,38 +985,32 @@ impl Graph {
         } else {
             None
         };
-        let generation = self.nodes[id.index()]
+        let computation = &mut self.derived[owner.index()];
+        let generation = computation
             .generation
             .checked_add(1)
             .ok_or(RuntimeError::GenerationExhausted(WorkId::Node(id)))?;
         Self::update_dependencies(
-            &mut self.nodes,
-            &mut self.reactions,
+            &mut self.links,
+            &mut computation.dependencies,
             WorkId::Node(id),
             self.reads.finish(),
         );
-        let node = &mut self.nodes[id.index()];
-        self.stale_forecasts += usize::from(node.pending_forecasts);
-        node.pending_forecasts = 0;
-        node.generation = generation;
+        self.stale_forecasts += usize::from(computation.pending_forecasts);
+        computation.pending_forecasts = 0;
+        computation.generation = generation;
 
         if let Some(at) = validity_at {
-            self.push_event(
-                at,
-                EventKind::Reevaluate {
-                    node: id,
-                    generation,
-                },
-            );
+            self.push_event(at, EventKind::Reevaluate { owner, generation });
         }
         if next != current {
             if let Some(at) = commit_at {
                 self.push_event(
                     at,
                     EventKind::Commit {
-                        node: id,
+                        owner,
                         generation,
-                        value: CanonicalValue::Numeric(next),
+                        bucket: next,
                     },
                 );
             } else {
@@ -1103,7 +1038,7 @@ impl Graph {
         });
         let context = EvalContext {
             now: self.now,
-            nodes: &self.nodes,
+            values: &self.values,
             windows: &self.windows,
             reads,
             invocation,
@@ -1129,8 +1064,8 @@ impl Graph {
             .ok_or(RuntimeError::GenerationExhausted(WorkId::Reaction(id)))?;
         if track_dependencies {
             Self::update_dependencies(
-                &mut self.nodes,
-                &mut self.reactions,
+                &mut self.links,
+                &mut self.reactions[id.index()].dependencies,
                 WorkId::Reaction(id),
                 self.reads.finish(),
             );
@@ -1226,23 +1161,19 @@ impl Graph {
     }
 
     fn update_dependencies(
-        nodes: &mut [Node],
-        reactions: &mut [Reaction],
+        links: &mut [NodeLinks],
+        stored: &mut Dependencies,
         dependent: WorkId,
         new: &[NodeId],
     ) {
         // Only existent IDs can be recorded; graph structure is immutable
         // throughout a single evaluator invocation.
-        let stored = match dependent {
-            WorkId::Node(id) => &mut nodes[id.index()].dependencies,
-            WorkId::Reaction(id) => &mut reactions[id.index()].dependencies,
-        };
         if stored.as_slice() == new {
             return;
         }
         let old = std::mem::replace(stored, Dependencies::from_sorted(new));
         read_set::changes(old.as_slice(), new, |id, added| {
-            let reverse = &mut nodes[id.index()].dependents;
+            let reverse = &mut links[id.index()].dependents;
             if added {
                 reverse.insert(dependent);
             } else {
@@ -1256,20 +1187,20 @@ impl Graph {
             EventKind::SetState { write } => self.apply_state_writes(&[*write]),
             EventKind::SetStateBatch { writes } => self.apply_state_writes(writes),
             EventKind::Commit {
-                node,
+                owner,
                 generation,
-                value,
+                bucket,
             } => {
-                self.node(*node)?;
-                if self.nodes[node.index()].generation == *generation {
-                    self.commit(*node, *value)?;
+                let computation = &self.derived[owner.index()];
+                if computation.generation == *generation {
+                    self.commit(computation.node, CanonicalValue::Numeric(*bucket))?;
                 }
                 Ok(())
             }
-            EventKind::Reevaluate { node, generation } => {
-                self.node(*node)?;
-                if self.nodes[node.index()].generation == *generation {
-                    self.dirty.mark(WorkId::Node(*node));
+            EventKind::Reevaluate { owner, generation } => {
+                let computation = &self.derived[owner.index()];
+                if computation.generation == *generation {
+                    self.dirty.mark(WorkId::Node(computation.node));
                 }
                 Ok(())
             }
@@ -1341,12 +1272,12 @@ impl Graph {
     }
 
     fn commit(&mut self, id: NodeId, value: CanonicalValue) -> Result<(), RuntimeError> {
-        let node = &mut self.nodes[id.index()];
-        let old = node.state.canonical();
+        let state = &mut self.values[id.index()];
+        let old = state.canonical();
         if old == value {
             return Ok(());
         }
-        match (&mut node.state, value) {
+        match (state, value) {
             (
                 NodeState::Input(cell) | NodeState::Derived { cell, .. },
                 CanonicalValue::Numeric(next),
@@ -1359,6 +1290,7 @@ impl Graph {
                 return Err(RuntimeError::ExpectedAtom(id));
             }
         }
+        let node = &self.links[id.index()];
         self.transitions.push(TransitionRecord {
             at: self.now,
             node: id,
@@ -1397,10 +1329,10 @@ impl Graph {
         self.push_event_with_priority(at, 0, kind);
     }
 
-    fn pending_forecasts(&mut self, work: WorkId) -> &mut u8 {
-        match work {
-            WorkId::Node(id) => &mut self.nodes[id.index()].pending_forecasts,
-            WorkId::Reaction(id) => &mut self.reactions[id.index()].pending_forecasts,
+    fn pending_forecasts(&mut self, owner: ForecastOwner) -> &mut u8 {
+        match owner {
+            ForecastOwner::Derived(id) => &mut self.derived[id.index()].pending_forecasts,
+            ForecastOwner::Reaction(id) => &mut self.reactions[id.index()].pending_forecasts,
         }
     }
 
@@ -1416,13 +1348,13 @@ impl Graph {
             return;
         }
         let compact = self.should_compact_forecasts();
-        let nodes = &self.nodes;
+        let derived = &self.derived;
         let reactions = &self.reactions;
         let live = |kind: &EventKind| {
             kind.forecast().is_none_or(|(work, generation)| {
                 let current = match work {
-                    WorkId::Node(id) => nodes[id.index()].generation,
-                    WorkId::Reaction(id) => reactions[id.index()].generation,
+                    ForecastOwner::Derived(id) => derived[id.index()].generation,
+                    ForecastOwner::Reaction(id) => reactions[id.index()].generation,
                 };
                 current == generation
             })
@@ -1454,10 +1386,17 @@ impl Graph {
         });
     }
 
-    fn node(&self, id: NodeId) -> Result<&Node, RuntimeError> {
-        self.nodes
+    fn node_state(&self, id: NodeId) -> Result<&NodeState, RuntimeError> {
+        self.values
             .get(id.index())
             .ok_or(RuntimeError::UnknownNode(id))
+    }
+
+    fn derived_owner(&self, id: NodeId) -> Result<DerivedId, RuntimeError> {
+        match self.node_state(id)? {
+            NodeState::Derived { owner, .. } => Ok(*owner),
+            _ => Err(RuntimeError::NotDerived(id)),
+        }
     }
 }
 

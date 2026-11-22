@@ -1,5 +1,6 @@
-use super::{CanonicalValue, StateWrite, WindowRecord, WorkId};
-use quiescence_core::{NodeId, ReactionId, SimTime};
+use super::node_storage::DerivedId;
+use super::{StateWrite, WindowRecord};
+use quiescence_core::{Bucket, ReactionId, SimTime};
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BinaryHeap, VecDeque},
@@ -13,12 +14,12 @@ pub enum EventKind {
         writes: Vec<StateWrite>,
     },
     Commit {
-        node: NodeId,
+        owner: DerivedId,
         generation: u64,
-        value: CanonicalValue,
+        bucket: Bucket,
     },
     Reevaluate {
-        node: NodeId,
+        owner: DerivedId,
         generation: u64,
     },
     ReactionTransition {
@@ -36,18 +37,26 @@ pub enum EventKind {
         key: u64,
     },
 }
+#[derive(Clone, Copy)]
+pub enum ForecastOwner {
+    Derived(DerivedId),
+    Reaction(ReactionId),
+}
+
 impl EventKind {
-    pub(super) const fn forecast(&self) -> Option<(WorkId, u64)> {
+    pub(super) const fn forecast(&self) -> Option<(ForecastOwner, u64)> {
         match self {
             Self::Commit {
-                node, generation, ..
+                owner, generation, ..
             }
-            | Self::Reevaluate { node, generation } => Some((WorkId::Node(*node), *generation)),
+            | Self::Reevaluate { owner, generation } => {
+                Some((ForecastOwner::Derived(*owner), *generation))
+            }
             Self::ReactionTransition {
                 reaction,
                 generation,
                 ..
-            } => Some((WorkId::Reaction(*reaction), *generation)),
+            } => Some((ForecastOwner::Reaction(*reaction), *generation)),
             _ => None,
         }
     }

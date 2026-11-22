@@ -1,6 +1,6 @@
 //! Validation and atomic staging of independent numeric and atom writes.
 use super::read_set::{EpochMarks, ReadTracker};
-use super::{CanonicalValue, Graph, Node, NodeState, RuntimeError, StateWrite};
+use super::{CanonicalValue, Graph, NodeState, RuntimeError, StateWrite};
 use quiescence_core::{Bucket, NodeId, PointRequest, Quantization};
 
 #[derive(Clone, Copy)]
@@ -37,7 +37,7 @@ impl ValidatedWrite {
 
 impl Graph {
     fn validated_writes<'a>(
-        nodes: &'a [Node],
+        nodes: &'a [NodeState],
         seen: &'a mut EpochMarks,
         writes: &'a [StateWrite],
     ) -> impl Iterator<Item = Result<(NodeId, ValidatedWrite), RuntimeError>> + 'a {
@@ -53,11 +53,11 @@ impl Graph {
     }
 
     const fn validate_write(
-        node: &Node,
+        node: &NodeState,
         write: StateWrite,
     ) -> Result<ValidatedWrite, RuntimeError> {
         let id = write.node();
-        let validated = match (write, &node.state) {
+        let validated = match (write, node) {
             (_, NodeState::Derived { .. }) => return Err(RuntimeError::NotAnInput(id)),
             (StateWrite::Numeric { value, .. }, NodeState::Input(cell)) => {
                 ValidatedWrite::Numeric(PointRequest {
@@ -81,7 +81,7 @@ impl Graph {
     }
 
     fn resolve_single_write(
-        nodes: &[Node],
+        nodes: &[NodeState],
         write: StateWrite,
     ) -> Result<Option<ResolvedWrite>, RuntimeError> {
         let id = write.node();
@@ -95,12 +95,12 @@ impl Graph {
     ) -> Result<(), RuntimeError> {
         // Point estimates have state-independent representability. Reject
         // invalid values at admission, but resolve hysteresis again at delivery.
-        Self::visit_resolved_writes(&self.nodes, &mut self.reads, writes, |_| {})
+        Self::visit_resolved_writes(&self.values, &mut self.reads, writes, |_| {})
     }
 
     pub(super) fn apply_state_writes(&mut self, writes: &[StateWrite]) -> Result<(), RuntimeError> {
         if let [write] = writes {
-            if let Some(resolved) = Self::resolve_single_write(&self.nodes, *write)? {
+            if let Some(resolved) = Self::resolve_single_write(&self.values, *write)? {
                 self.commit(resolved.node, resolved.next)?;
             }
             return Ok(());
@@ -117,7 +117,7 @@ impl Graph {
             return Ok(Vec::new());
         }
         let mut resolved = std::mem::take(&mut self.write_scratch);
-        let result = Self::visit_resolved_writes(&self.nodes, &mut self.reads, writes, |write| {
+        let result = Self::visit_resolved_writes(&self.values, &mut self.reads, writes, |write| {
             resolved.push(write);
         });
         if let Err(error) = result {
@@ -131,7 +131,7 @@ impl Graph {
     // Validation and resolution share the same ordered traversal at admission
     // and delivery. Staging keeps graph commits atomic even with mixed writes.
     fn visit_resolved_writes(
-        graph_nodes: &[Node],
+        graph_nodes: &[NodeState],
         tracker: &mut ReadTracker,
         writes: &[StateWrite],
         mut visit: impl FnMut(ResolvedWrite),
