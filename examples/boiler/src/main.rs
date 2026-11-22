@@ -53,9 +53,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             println!(
                 "             @ {:>10} ns  {:<28} {} -> {}",
                 t.at.as_nanos(),
-                t.node_name,
-                t.old,
-                t.new
+                g.node_name(t.node).ok_or("missing transition label")?,
+                t.previous(),
+                t.current()
             );
         }
     }
