@@ -1477,3 +1477,48 @@ fn exhausted_generation_cannot_revalidate_a_stale_forecast()
     assert_eq!(graph.take_transitions(), []);
     Ok(())
 }
+
+#[test]
+fn shared_reverse_edges_preserve_node_before_reaction_order()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut graph = Graph::new(RuntimeConfig::default());
+    let source = graph.add_atom_input("source", 0)?;
+    let q = q0()?;
+    let derived = graph.add_derived("derived", q, 0.0, move |context| {
+        Ok(EvalOutput::immediate(f64::from(
+            context.read_atom(source)? != 0,
+        )))
+    })?;
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let capture = Arc::clone(&observed);
+    graph.add_reaction("observer", move |context| {
+        capture
+            .lock()
+            .map_err(|_| EvalError::Message(String::from("capture poisoned")))?
+            .push((context.read_atom(source)?, context.read_bucket(derived)?));
+        Ok(ReactionOutput::idle())
+    })?;
+    graph.quiesce()?;
+    graph.set_atom_now(source, 1)?;
+    assert_eq!(
+        *observed.lock().map_err(|_| "capture poisoned")?,
+        [(0, Bucket::new(0)), (1, Bucket::new(1)),]
+    );
+    Ok(())
+}
+
+#[test]
+fn transition_records_share_stable_name_storage() -> Result<(), Box<dyn std::error::Error>> {
+    let mut graph = Graph::new(RuntimeConfig::default());
+    let label: Arc<str> = Arc::from("shared name");
+    let node = graph.add_atom_input(Arc::clone(&label), 0)?;
+    graph.set_atom_now(node, 1)?;
+    graph.set_atom_now(node, 2)?;
+    let records = graph.take_transitions();
+    drop(graph);
+    assert_eq!(records.len(), 2);
+    for record in records {
+        assert!(Arc::ptr_eq(&label, &record.node_name));
+    }
+    Ok(())
+}

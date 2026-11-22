@@ -16,10 +16,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // A real adapter interns the source key `(x, y, z)` to a stable canonical handle.
     let torch_position = 0x1234_u64;
-    let callback = graph.add_reaction("redstone torch callback", move |context| {
-        if context.now() == SimTime::ZERO {
-            return Ok(ReactionOutput::idle());
-        }
+    let callback = graph.add_event_callback("redstone torch callback", move |context| {
         let count_after_toggle = context
             .window_count(history, torch_position)?
             .saturating_add(1);

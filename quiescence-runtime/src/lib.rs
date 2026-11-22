@@ -1,3 +1,30 @@
+//! Single-owner temporal incremental computation with quiescent publications.
+//!
+//! Derived nodes subscribe to the state they actually read. Canonically unchanged
+//! values stop propagation, while explicit callback events preserve causal order.
+//! A thread-safe ingress allows producers to submit work without owning the graph.
+//!
+//! ```
+//! use quiescence_core::{Bucket, Quantization};
+//! use quiescence_runtime::{CanonicalValue, EvalOutput, Graph, RuntimeConfig, StateWrite, interaction_channel};
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let mut graph = Graph::new(RuntimeConfig::default());
+//! let integer = Quantization::new(0, 0)?;
+//! let source = graph.add_input("source", integer, 0.0)?;
+//! let doubled = graph.add_derived("doubled", integer, 0.0, move |context| {
+//!     Ok(EvalOutput::immediate(2.0 * context.read_f64(source)?))
+//! })?;
+//! let (sender, inbox) = interaction_channel();
+//! sender.state_now(0, vec![StateWrite::new(source, 3.0)])?;
+//! let (import, publication) = graph.process_interactions_and_publish(&inbox)?;
+//! assert_eq!(import.accepted, 1);
+//! assert_eq!(publication.snapshot.value(doubled),
+//!     Some(CanonicalValue::Numeric(Bucket::new(6))));
+//! # Ok(())
+//! # }
+//! ```
+
 #![forbid(unsafe_code)]
 
 use quiescence_core::{
@@ -7,6 +34,7 @@ use quiescence_core::{
 use std::{
     cell::RefCell,
     collections::{BTreeSet, VecDeque},
+    sync::Arc,
 };
 
 mod error;
@@ -146,24 +174,18 @@ impl EvalContext<'_> {
     /// # Errors
     /// Returns an error if the node does not exist or is not numeric.
     pub fn read_bucket(&self, id: NodeId) -> Result<Bucket, EvalError> {
-        let state = self.read_state(id)?;
-        let NodeState::Numeric { bucket, .. } = *state else {
-            return Err(EvalError::ExpectedNumeric(id));
-        };
-        Ok(bucket)
+        self.read_state(id)?
+            .numeric()
+            .map(|(_, bucket)| bucket)
+            .ok_or(EvalError::ExpectedNumeric(id))
     }
     /// # Errors
     /// Returns an error if the node does not exist or is not numeric.
     pub fn read_f64(&self, id: NodeId) -> Result<f64, EvalError> {
-        let state = self.read_state(id)?;
-        let NodeState::Numeric {
-            quantization,
-            bucket,
-        } = *state
-        else {
-            return Err(EvalError::ExpectedNumeric(id));
-        };
-        Ok(quantization.decode(bucket))
+        self.read_state(id)?
+            .numeric()
+            .map(|(quantization, bucket)| quantization.decode(bucket))
+            .ok_or(EvalError::ExpectedNumeric(id))
     }
     /// # Errors
     /// Returns an error if the node does not exist or is not numeric.
@@ -173,11 +195,9 @@ impl EvalContext<'_> {
     /// # Errors
     /// Returns an error if the node does not exist or is not an atom.
     pub fn read_atom(&self, id: NodeId) -> Result<u64, EvalError> {
-        let state = self.read_state(id)?;
-        let NodeState::Atom(value) = *state else {
-            return Err(EvalError::ExpectedAtom(id));
-        };
-        Ok(value)
+        self.read_state(id)?
+            .atom()
+            .ok_or(EvalError::ExpectedAtom(id))
     }
     /// # Errors
     /// Returns an error if the temporal history does not exist.
@@ -209,14 +229,51 @@ enum NodeState {
     Numeric {
         quantization: Quantization,
         bucket: Bucket,
+        evaluator: Option<EvalFn>,
     },
     Atom(u64),
 }
 
+impl NodeState {
+    const fn numeric(&self) -> Option<(Quantization, Bucket)> {
+        match self {
+            Self::Numeric {
+                quantization,
+                bucket,
+                ..
+            } => Some((*quantization, *bucket)),
+            Self::Atom(_) => None,
+        }
+    }
+
+    const fn atom(&self) -> Option<u64> {
+        match self {
+            Self::Atom(value) => Some(*value),
+            Self::Numeric { .. } => None,
+        }
+    }
+
+    const fn is_derived(&self) -> bool {
+        matches!(
+            self,
+            Self::Numeric {
+                evaluator: Some(_),
+                ..
+            }
+        )
+    }
+
+    const fn canonical(&self) -> CanonicalValue {
+        match self {
+            Self::Numeric { bucket, .. } => CanonicalValue::Numeric(*bucket),
+            Self::Atom(value) => CanonicalValue::Atom(*value),
+        }
+    }
+}
+
 struct Node {
-    name: String,
+    name: Arc<str>,
     state: NodeState,
-    evaluator: Option<EvalFn>,
     dependencies: BTreeSet<NodeId>,
     dependents: BTreeSet<WorkId>,
     generation: u64,
@@ -342,7 +399,11 @@ impl Graph {
         Ok(QuiescentSnapshot {
             at: self.now,
             next_event_time: self.events.peek().map(|event| event.at),
-            values: self.nodes.iter().map(canonical_value).collect(),
+            values: self
+                .nodes
+                .iter()
+                .map(|node| node.state.canonical())
+                .collect(),
         })
     }
 
@@ -461,7 +522,7 @@ impl Graph {
     /// Returns an error if the graph cannot allocate another node or the initial value cannot be quantized.
     pub fn add_input(
         &mut self,
-        name: impl Into<String>,
+        name: impl Into<Arc<str>>,
         q: Quantization,
         initial: f64,
     ) -> Result<NodeId, RuntimeError> {
@@ -472,17 +533,17 @@ impl Graph {
     /// Returns an error if the graph cannot allocate another node identifier.
     pub fn add_atom_input(
         &mut self,
-        name: impl Into<String>,
+        name: impl Into<Arc<str>>,
         initial: u64,
     ) -> Result<NodeId, RuntimeError> {
-        self.add_node(name, NodeState::Atom(initial), None)
+        self.add_node(name, NodeState::Atom(initial))
     }
 
     /// # Errors
     /// Returns an error if the graph cannot allocate another node or the initial value cannot be quantized.
     pub fn add_derived<F>(
         &mut self,
-        name: impl Into<String>,
+        name: impl Into<Arc<str>>,
         q: Quantization,
         initial: f64,
         evaluator: F,
@@ -495,7 +556,7 @@ impl Graph {
 
     fn add_numeric_node(
         &mut self,
-        name: impl Into<String>,
+        name: impl Into<Arc<str>>,
         q: Quantization,
         initial: f64,
         evaluator: Option<EvalFn>,
@@ -506,24 +567,22 @@ impl Graph {
             NodeState::Numeric {
                 quantization: q,
                 bucket,
+                evaluator,
             },
-            evaluator,
         )
     }
 
     fn add_node(
         &mut self,
-        name: impl Into<String>,
+        name: impl Into<Arc<str>>,
         state: NodeState,
-        evaluator: Option<EvalFn>,
     ) -> Result<NodeId, RuntimeError> {
         let raw_id = u32::try_from(self.nodes.len()).map_err(|_| RuntimeError::TooManyNodes)?;
         let id = NodeId::from_index(raw_id);
-        let derived = evaluator.is_some();
+        let derived = state.is_derived();
         self.nodes.push(Node {
             name: name.into(),
             state,
-            evaluator,
             dependencies: BTreeSet::new(),
             dependents: BTreeSet::new(),
             generation: 0,
@@ -545,10 +604,13 @@ impl Graph {
             .nodes
             .get_mut(id.index())
             .ok_or(RuntimeError::UnknownNode(id))?;
-        if !matches!(node.state, NodeState::Numeric { .. }) {
+        let NodeState::Numeric {
+            evaluator: slot, ..
+        } = &mut node.state
+        else {
             return Err(RuntimeError::ExpectedNumeric(id));
-        }
-        node.evaluator = Some(Box::new(evaluator));
+        };
+        *slot = Some(Box::new(evaluator));
         self.dirty.mark(WorkId::Node(id));
         Ok(())
     }
@@ -648,30 +710,28 @@ impl Graph {
     /// # Errors
     /// Returns an error if the node does not exist or is not numeric.
     pub fn value_bucket(&self, id: NodeId) -> Result<Bucket, RuntimeError> {
-        let NodeState::Numeric { bucket, .. } = self.node(id)?.state else {
-            return Err(RuntimeError::ExpectedNumeric(id));
-        };
-        Ok(bucket)
+        self.node(id)?
+            .state
+            .numeric()
+            .map(|(_, bucket)| bucket)
+            .ok_or(RuntimeError::ExpectedNumeric(id))
     }
     /// # Errors
     /// Returns an error if the node does not exist or is not numeric.
     pub fn value_f64(&self, id: NodeId) -> Result<f64, RuntimeError> {
-        let NodeState::Numeric {
-            quantization,
-            bucket,
-        } = self.node(id)?.state
-        else {
-            return Err(RuntimeError::ExpectedNumeric(id));
-        };
-        Ok(quantization.decode(bucket))
+        self.node(id)?
+            .state
+            .numeric()
+            .map(|(quantization, bucket)| quantization.decode(bucket))
+            .ok_or(RuntimeError::ExpectedNumeric(id))
     }
     /// # Errors
     /// Returns an error if the node does not exist or is not an atom.
     pub fn value_atom(&self, id: NodeId) -> Result<u64, RuntimeError> {
-        let NodeState::Atom(value) = self.node(id)?.state else {
-            return Err(RuntimeError::ExpectedAtom(id));
-        };
-        Ok(value)
+        self.node(id)?
+            .state
+            .atom()
+            .ok_or(RuntimeError::ExpectedAtom(id))
     }
 
     fn not_quiescent_error(&self) -> RuntimeError {
@@ -726,7 +786,7 @@ impl Graph {
 
     fn validate_write(node: &Node, write: StateWrite) -> Result<ValidatedWrite, RuntimeError> {
         let id = write.node();
-        if node.evaluator.is_some() {
+        if node.state.is_derived() {
             return Err(RuntimeError::NotAnInput(id));
         }
         let validated = match (write, &node.state) {
@@ -735,6 +795,7 @@ impl Graph {
                 NodeState::Numeric {
                     quantization,
                     bucket,
+                    ..
                 },
             ) => {
                 if !value.is_finite() {
@@ -932,13 +993,7 @@ impl Graph {
             *steps += 1;
             self.dirty.pop();
             let result = match work {
-                WorkId::Node(id) => {
-                    if self.nodes[id.index()].evaluator.is_some() {
-                        self.evaluate(id)
-                    } else {
-                        Ok(())
-                    }
-                }
+                WorkId::Node(id) => self.evaluate(id),
                 WorkId::Reaction(id) => self.evaluate_reaction(id),
             };
             if let Err(error) = result {
@@ -995,8 +1050,16 @@ impl Graph {
     }
 
     fn evaluate(&mut self, id: NodeId) -> Result<(), RuntimeError> {
-        let evaluator = self.nodes[id.index()]
-            .evaluator
+        let NodeState::Numeric {
+            quantization,
+            bucket: current,
+            evaluator,
+        } = &self.nodes[id.index()].state
+        else {
+            return Err(RuntimeError::ExpectedNumeric(id));
+        };
+        let (quantization, current) = (*quantization, *current);
+        let evaluator = evaluator
             .as_ref()
             .ok_or(RuntimeError::MissingEvaluator(id))?;
         let context = EvalContext {
@@ -1010,13 +1073,6 @@ impl Graph {
         let output =
             evaluator(&context).map_err(|source| RuntimeError::Evaluation { node: id, source })?;
 
-        let (quantization, current) = match self.nodes[id.index()].state {
-            NodeState::Numeric {
-                quantization,
-                bucket,
-            } => (quantization, bucket),
-            NodeState::Atom(_) => return Err(RuntimeError::ExpectedNumeric(id)),
-        };
         let next = quantization.resolve(Some(current), output.estimate)?;
         let validity_at = output
             .valid_for
@@ -1356,7 +1412,7 @@ impl Graph {
 
     fn commit(&mut self, id: NodeId, value: CanonicalValue) -> Result<(), RuntimeError> {
         let node = &mut self.nodes[id.index()];
-        let old = canonical_value(node);
+        let old = node.state.canonical();
         if old == value {
             return Ok(());
         }
@@ -1373,7 +1429,7 @@ impl Graph {
         self.transitions.push(TransitionRecord {
             at: self.now,
             node: id,
-            node_name: node.name.clone(),
+            node_name: Arc::clone(&node.name),
             old,
             new: value,
         });
@@ -1425,18 +1481,12 @@ impl Graph {
     }
 }
 
-const fn canonical_value(node: &Node) -> CanonicalValue {
-    match node.state {
-        NodeState::Numeric { bucket, .. } => CanonicalValue::Numeric(bucket),
-        NodeState::Atom(value) => CanonicalValue::Atom(value),
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransitionRecord {
     pub at: SimTime,
     pub node: NodeId,
-    pub node_name: String,
+    /// Shared immutable node label, retained after the graph is dropped.
+    pub node_name: Arc<str>,
     pub old: CanonicalValue,
     pub new: CanonicalValue,
 }

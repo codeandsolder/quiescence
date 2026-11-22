@@ -1,3 +1,20 @@
+//! Canonical numeric buckets, graph-local identifiers, and simulation time.
+//!
+//! Decimal quantization uses the exact real values represented by binary64 inputs.
+//! Nonzero uncertainty radii are never discarded through intermediate rounding.
+//!
+//! ```
+//! use quiescence_core::{Bucket, Estimate, Quantization};
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let quantization = Quantization::new(2, 1)?;
+//! let previous = Bucket::new(1234);
+//! let estimate = Estimate { center: 12.341, radius: 0.002 };
+//! assert_eq!(quantization.resolve(Some(previous), estimate)?, previous);
+//! # Ok(())
+//! # }
+//! ```
+
 #![forbid(unsafe_code)]
 
 use core::fmt;

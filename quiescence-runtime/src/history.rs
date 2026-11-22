@@ -58,4 +58,34 @@ mod tests {
         window.record(SimTime::from_nanos(i64::MAX), 1);
         assert_eq!(window.events.len(), 1);
     }
+
+    #[test]
+    fn binary_window_search_matches_linear_reference_across_expiry() {
+        let duration = 31;
+        let mut window =
+            EventWindow::new(String::from("history"), SimDuration::from_nanos(duration));
+        let mut reference = Vec::new();
+        for at in 0..1024_i64 {
+            let key = at.unsigned_abs() % 7;
+            window.record(SimTime::from_nanos(at), key);
+            reference.push((at, key));
+            for query in [at - 10, at, at + 20, at + 100] {
+                // Queries before the committed current time can only inspect
+                // retained data; the owner never moves time backwards.
+                let cutoff = at - duration;
+                for key in 0..7 {
+                    let expected = reference
+                        .iter()
+                        .filter(|&&(time, observed)| {
+                            time >= cutoff
+                                && time >= query - duration
+                                && time <= query
+                                && observed == key
+                        })
+                        .count();
+                    assert_eq!(window.count_at(SimTime::from_nanos(query), key), expected);
+                }
+            }
+        }
+    }
 }
