@@ -36,6 +36,8 @@ The numerical layer is deliberately replaceable. Point `f64` evaluation is merel
 
 A numeric node declares `decimal_places` and `hysteresis_lsd`. Working arithmetic may use floating point, but floating point is not graph-observable state. Graph equality, serialization and propagation decisions use the canonical integer bucket.
 
+Quantization computes the exact mathematical interval represented by the supplied binary64 center and nonnegative radius. Decimal scaling and half-bucket comparisons do not introduce extra rounding; exact halfway values round away from zero. Decimal-looking floating-point literals can lie on either side of a decimal midpoint. An interval must establish a single bucket (or fit strictly inside the previous bucket’s retention region), otherwise resolution returns an ambiguity error.
+
 A one-LSD hysteresis widens the retention region by one last digit before a node moves into a new bucket. This makes the chosen information resolution part of the model and gives the runtime a natural early-termination boundary.
 
 ## Exact atom semantics
@@ -46,7 +48,7 @@ The graph does not interpret the handle. Equal handles mean equal observable sta
 
 ## Cycles
 
-Cycles are normal. A zero-time cycle is evaluated at one simulation instant until it becomes quiescent. A configurable microstep budget is the generic safety net; exhausting it reports calculation instability. Positive delays naturally break same-time causal cycles.
+Cycles are normal. A zero-time cycle is evaluated at one simulation instant until it becomes quiescent. A configurable microstep budget is the generic safety net; exhausting it reports calculation instability. Positive delays naturally break same-time causal cycles. The budget applies per timestamp within a settlement call; a failed call leaves pending work available for retry, and the owner may change the budget with `set_microstep_budget`. Relative scheduling rejects timestamps beyond the representable nanosecond range before publishing effects. Forecast generation exhaustion is likewise an explicit error, never a reused generation.
 
 Later layers should add SCC classification, repeated-state detection, specialized monotone/fixed-point solvers and stable-region compilation without weakening the bounded generic fallback.
 
@@ -79,7 +81,7 @@ State batches are validated and become one event, so dependants cannot observe a
 
 `QuiescentSnapshot` is deliberately an **observable-state projection**, not a serialized graph/runtime image. It contains canonical node values plus the current and next event times. `QuiescentPublication` pairs that snapshot with transition records drained since the previous publication; `process_interactions_and_publish()` and `advance_to_and_publish()` are convenience operations for a worker loop. Evaluator closures, dependency indexes, histories, interners and the future event queue stay with the graph owner. A UI/game thread can therefore read immutable publications while a worker continues to own and advance the simulation.
 
-The older direct mutation/scheduling methods remain useful as low-level graph controls and tests, but domain adapters should use interaction ingress at external boundaries so moving a graph between foreground and background ownership requires no semantic rewrite.
+The direct mutation/scheduling methods remain useful as low-level graph controls and tests, but domain adapters should use interaction ingress at external boundaries so moving a graph between foreground and background ownership requires no semantic rewrite.
 
 ## Workspace
 
@@ -90,7 +92,7 @@ The older direct mutation/scheduling methods remain useful as low-level graph co
 Run the demo:
 
 ```console
-RUSTC_WRAPPER=/usr/local/bin/sccache cargo run -p quiescence-boiler-demo
+cargo run -p quiescence-boiler-demo
 ```
 
 Near-term targets are interval/refinement evaluators, SCC/repeated-state analysis, a budgeted forecast frontier, stable-region collapse, and explanation tracing (*why did this node wake?*).
@@ -102,7 +104,7 @@ The fast path is not faster arithmetic. It is **proving that no arithmetic needs
 A deliberately simple release-mode smoke test builds a 100,001-node chain, then compares a source change that dies at the first quantized node with one that propagates through the entire chain:
 
 ```console
-RUSTC_WRAPPER=/usr/local/bin/sccache cargo run --release -p quiescence-runtime --example sparse_cutoff
+cargo run --release -p quiescence-runtime --example sparse_cutoff
 ```
 
 This is not yet a stable benchmark suite; it exists to catch catastrophic runtime regressions while the graph representation is still changing rapidly.
@@ -112,7 +114,7 @@ This is not yet a stable benchmark suite; it exists to catch catastrophic runtim
 The ingress benchmark times submission, admission, and same-time callback settlement separately for 8,192 callbacks, with warmups and 21 median samples:
 
 ```console
-RUSTC_WRAPPER=/usr/local/bin/sccache cargo run --release -p quiescence-runtime --example ingress_batch
+cargo run --release -p quiescence-runtime --example ingress_batch
 ```
 
 This is a smoke test rather than a throughput guarantee; compare runs on the same pinned core and toolchain when changing the ingress path.
@@ -125,9 +127,11 @@ the same workloads on the same CPU core and Rust toolchain to detect regressions
 dense and sparse event queues:
 
 ```console
-RUSTC_WRAPPER=/usr/local/bin/sccache cargo run --release -p quiescence-runtime --example scheduler_mix
+cargo run --release -p quiescence-runtime --example scheduler_mix
 ```
 
 ## Sparse reactions
 
 Read-tracked reactions can forecast generation-stamped, atomic state transitions. Dependency changes invalidate stale forecasts, allowing tick-shaped source logic to execute at causal boundaries instead of polling. See `quiescence-runtime/examples/vanilla_furnace.rs` for a furnace-shaped deadline example and `quiescence-runtime/examples/vanilla_hopper.rs` for a recovered cooldown shape where inventory snapshot handles are not dependencies during cooldown, become dependencies only once the hopper is ready-but-blocked, and commit atomically with the next deadline after a successful transfer. Dense stochastic selectors can remain adapter-owned and enqueue each selected callback through the external interaction ingress; duplicate selections remain distinct events. `quiescence-runtime/examples/vanilla_redstone_torch.rs` shows a third temporal shape: a lazy keyed event window records callbacks transactionally and evaluates an 8-events-in-60-ticks threshold without scheduling expiry wakeups.
+
+Keyed callbacks returned by a reaction are admitted in the order returned, independently of whether the destination is the current reaction or another reaction. A reaction may return one optional atomic state/history transition and any number of keyed callbacks. Recording history without a transition creates an immediate history-only transition. Event-only callbacks do not track dependencies; evaluation contexts distinguish reactive, forecast, scheduled and external invocations. Duplicate callback requests are ignored before checking the later deadline, so the first pending request really wins.
