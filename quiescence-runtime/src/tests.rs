@@ -2027,3 +2027,48 @@ fn callback_generation_failure_releases_all_tentative_keys()
     );
     Ok(())
 }
+
+#[test]
+fn admitted_midpoint_writes_resolve_hysteresis_against_delivery_state()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut graph = Graph::new(RuntimeConfig::default());
+    let q = Quantization::new(0, 1)?;
+    let direct = graph.add_input("direct", q, 0.0)?;
+    let ingress = graph.add_input("ingress", q, 0.0)?;
+    let forecast = graph.add_input("forecast", q, 0.0)?;
+    let atom = graph.add_atom_input("atom", 0)?;
+    let at = SimTime::from_nanos(10);
+    graph.schedule_input(direct, at, 0.5)?;
+    let (sender, inbox) = interaction_channel();
+    sender.state_at(
+        at,
+        0,
+        vec![StateWrite::new(ingress, -0.5), StateWrite::atom(atom, 7)],
+    )?;
+    assert_eq!(graph.import_interactions(&inbox)?.accepted, 1);
+    let callback = graph.add_event_callback("delayed", move |ctx| {
+        if ctx.now() == SimTime::ZERO {
+            Ok(ReactionOutput::after(
+                SimDuration::from_nanos(10),
+                vec![StateWrite::new(forecast, 0.5)],
+            ))
+        } else {
+            Ok(ReactionOutput::idle())
+        }
+    })?;
+    graph.schedule_reaction_event(callback, SimTime::ZERO, 0)?;
+    graph.quiesce()?;
+    // A point that would have retained zero at admission must not do so
+    // when delivery starts at the opposite open hysteresis boundary.
+    graph.set_state_now(&[
+        StateWrite::new(direct, 2.0),
+        StateWrite::new(ingress, -2.0),
+        StateWrite::new(forecast, 2.0),
+    ])?;
+    graph.advance_to(at)?;
+    assert_eq!(graph.value_bucket(direct)?, Bucket::new(1));
+    assert_eq!(graph.value_bucket(ingress)?, Bucket::new(-1));
+    assert_eq!(graph.value_bucket(forecast)?, Bucket::new(1));
+    assert_eq!(graph.value_atom(atom)?, 7);
+    Ok(())
+}

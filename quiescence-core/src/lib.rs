@@ -22,7 +22,7 @@ use core::fmt;
 
 mod point;
 mod quantize;
-pub use point::PointRequest;
+pub use point::{PointRequest, PreparedPoint};
 use quantize::HalfBounds;
 
 macro_rules! graph_id {
