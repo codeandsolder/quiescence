@@ -30,12 +30,9 @@
 use quiescence_core::{
     Bucket, Estimate, HistoryId, NodeId, Quantization, ReactionId, SimDuration, SimTime,
 };
-use std::{
-    cell::RefCell,
-    collections::{BTreeSet, VecDeque},
-    sync::Arc,
-};
+use std::{cell::RefCell, collections::VecDeque, sync::Arc};
 
+mod callbacks;
 mod edge_set;
 mod error;
 mod event_queue;
@@ -52,10 +49,12 @@ pub use ingress::{
     RejectedInteraction, interaction_channel,
 };
 pub use output::{
-    CallbackTarget, CanonicalValue, EvalOutput, QuiescentPublication, QuiescentSnapshot,
-    ReactionOutput, ReactionTransition, ScheduledCallback, StateWrite, WindowRecord,
+    CallbackRequests, CallbackTarget, CanonicalValue, EvalOutput, QuiescentPublication,
+    QuiescentSnapshot, ReactionOutput, ReactionTransition, ScheduledCallback, StateWrite,
+    WindowRecord,
 };
 
+use callbacks::PendingCallbacks;
 use edge_set::ReverseEdges;
 use event_queue::{DeferredEffects, EventKind, EventQueue, ForecastOwner, ScheduledEvent};
 use history::EventWindow;
@@ -263,7 +262,8 @@ pub struct Graph {
     write_scratch: Vec<ResolvedWrite>,
     events: EventQueue,
     stale_forecasts: usize,
-    pending_scheduled_reactions: BTreeSet<(ReactionId, u64)>,
+    pending_scheduled_reactions: PendingCallbacks,
+    callback_scratch: Vec<PreparedCallback>,
     transitions: Vec<TransitionRecord>,
 }
 
@@ -283,7 +283,8 @@ impl Graph {
             write_scratch: Vec::new(),
             events: EventQueue::new(),
             stale_forecasts: 0,
-            pending_scheduled_reactions: BTreeSet::new(),
+            pending_scheduled_reactions: PendingCallbacks::new(),
+            callback_scratch: Vec::new(),
             transitions: Vec::new(),
         }
     }
@@ -1047,16 +1048,28 @@ impl Graph {
             callbacks,
         } = output;
 
-        // Prepare every effect before changing subscriptions or publishing state.
-        let callbacks = self.prepare_callbacks(id, callbacks)?;
-        let prepared = transition
-            .map(|transition| self.prepare_transition(transition))
-            .transpose()?;
-
-        let generation = self.reactions[id.index()]
-            .generation
-            .checked_add(1)
-            .ok_or(RuntimeError::GenerationExhausted(WorkId::Reaction(id)))?;
+        // Temporarily reserve callback keys in the authoritative index.
+        // Every fallible preparation step must succeed before publishing any
+        // effect; failure rolls back only keys introduced by this output.
+        let result = self
+            .prepare_callbacks(id, callbacks.as_slice())
+            .and_then(|()| {
+                let prepared = transition
+                    .map(|transition| self.prepare_transition(transition))
+                    .transpose()?;
+                let generation = self.reactions[id.index()]
+                    .generation
+                    .checked_add(1)
+                    .ok_or(RuntimeError::GenerationExhausted(WorkId::Reaction(id)))?;
+                Ok((prepared, generation))
+            });
+        let (prepared, generation) = match result {
+            Ok(result) => result,
+            Err(error) => {
+                self.cancel_prepared_callbacks();
+                return Err(error);
+            }
+        };
         if track_dependencies {
             Self::update_dependencies(
                 &mut self.links,
@@ -1079,7 +1092,10 @@ impl Graph {
                 writes,
                 window_records,
             }) => {
-                self.commit_resolved_state_writes(writes)?;
+                if let Err(error) = self.commit_resolved_state_writes(writes) {
+                    self.cancel_prepared_callbacks();
+                    return Err(error);
+                }
                 self.record_windows(&window_records);
             }
             Some(PreparedTransition::Delayed { at, effects }) => {
@@ -1094,39 +1110,66 @@ impl Graph {
             }
             None => {}
         }
-        for callback in &callbacks {
-            self.schedule_reaction_once(callback);
-        }
+        self.publish_prepared_callbacks();
         Ok(())
     }
 
     fn prepare_callbacks(
-        &self,
+        &mut self,
         current: ReactionId,
-        requests: Vec<ScheduledCallback>,
-    ) -> Result<Vec<PreparedCallback>, RuntimeError> {
-        let mut callbacks = Vec::with_capacity(requests.len());
-        let mut seen = BTreeSet::new();
-        let check_duplicates = requests.len() > 1;
+        requests: &[ScheduledCallback],
+    ) -> Result<(), RuntimeError> {
         for request in requests {
             let reaction = request.target.resolve(current);
             self.reactions
                 .get(reaction.index())
                 .ok_or(RuntimeError::UnknownReaction(reaction))?;
             let key = (reaction, request.key);
-            if self.pending_scheduled_reactions.contains(&key)
-                || (check_duplicates && !seen.insert(key))
-            {
+            if !self.pending_scheduled_reactions.insert(key) {
                 continue;
             }
-            callbacks.push(PreparedCallback {
+            let at = match self.event_time(request.after) {
+                Ok(at) => at,
+                Err(error) => {
+                    self.pending_scheduled_reactions.remove(&key);
+                    return Err(error);
+                }
+            };
+            self.callback_scratch.push(PreparedCallback {
                 reaction,
-                at: self.event_time(request.after)?,
+                at,
                 key: request.key,
                 priority: request.priority,
             });
         }
-        Ok(callbacks)
+        Ok(())
+    }
+
+    fn cancel_prepared_callbacks(&mut self) {
+        for callback in &self.callback_scratch {
+            self.pending_scheduled_reactions
+                .remove(&(callback.reaction, callback.key));
+        }
+        self.callback_scratch.clear();
+    }
+
+    fn publish_prepared_callbacks(&mut self) {
+        if self.callback_scratch.is_empty() {
+            return;
+        }
+        let mut callbacks = std::mem::take(&mut self.callback_scratch);
+        for callback in &callbacks {
+            self.push_event_with_priority(
+                callback.at,
+                callback.priority,
+                EventKind::ScheduledReaction {
+                    reaction: callback.reaction,
+                    key: callback.key,
+                },
+            );
+        }
+        callbacks.clear();
+        self.callback_scratch = callbacks;
     }
 
     fn prepare_transition(
@@ -1290,19 +1333,6 @@ impl Graph {
         node.dependents
             .for_each(|dependent| self.dirty.mark(dependent));
         Ok(())
-    }
-
-    fn schedule_reaction_once(&mut self, callback: &PreparedCallback) {
-        self.pending_scheduled_reactions
-            .insert((callback.reaction, callback.key));
-        self.push_event_with_priority(
-            callback.at,
-            callback.priority,
-            EventKind::ScheduledReaction {
-                reaction: callback.reaction,
-                key: callback.key,
-            },
-        );
     }
 
     fn event_time(&self, duration: SimDuration) -> Result<SimTime, RuntimeError> {

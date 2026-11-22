@@ -1931,3 +1931,99 @@ fn interleaved_node_roles_keep_distinct_forecast_owners() -> Result<(), Box<dyn 
     assert_eq!(graph.value_bucket(second)?, Bucket::new(18));
     Ok(())
 }
+
+#[test]
+fn callback_reservation_rollback_preserves_existing_keys_and_retries_new_ones()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut graph = Graph::new(RuntimeConfig::default());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let target = recording_callback(&mut graph, "target", &seen, |ctx| {
+        (ctx.scheduled_key(), ctx.now())
+    })?;
+    let state = graph.add_atom_input("state", 0)?;
+    let producer = graph.add_event_callback("existing", move |_| {
+        Ok(ReactionOutput::schedule_reaction_once_after(
+            target,
+            SimDuration::from_nanos(10),
+            1,
+            0,
+        ))
+    })?;
+    graph.schedule_reaction_event(producer, SimTime::ZERO, 0)?;
+    graph.quiesce()?;
+    let phase = Arc::new(AtomicUsize::new(0));
+    let control = Arc::clone(&phase);
+    let failing = graph.add_event_callback("failing", move |_| {
+        let mut result =
+            ReactionOutput::schedule_reaction_once_after(target, SimDuration::from_nanos(3), 1, 0)
+                .and_schedule_reaction_once_after(target, SimDuration::from_nanos(5), 2, 0)
+                .and_schedule_once_after(SimDuration::from_nanos(20), 3, 0);
+        match control.load(Ordering::Relaxed) {
+            0 => {
+                result = result.and_schedule_reaction_once_after(
+                    ReactionId::from_index(u32::MAX),
+                    SimDuration::ZERO,
+                    4,
+                    0,
+                );
+            }
+            1 => {
+                result = ReactionOutput::immediate(vec![StateWrite::new(state, 1.0)])
+                    .and_schedule_reaction_once_after(target, SimDuration::from_nanos(5), 2, 0);
+            }
+            _ => {}
+        }
+        Ok(result)
+    })?;
+    graph.schedule_reaction_event(failing, SimTime::ZERO, 0)?;
+    assert!(matches!(
+        graph.quiesce(),
+        Err(RuntimeError::UnknownReaction(_))
+    ));
+    assert_eq!(graph.next_event_time(), Some(SimTime::from_nanos(10)));
+    assert!(graph.callback_scratch.is_empty());
+    phase.store(1, Ordering::Relaxed);
+    assert!(matches!(graph.quiesce(), Err(RuntimeError::ExpectedNumeric(id)) if id == state));
+    assert_eq!(graph.next_event_time(), Some(SimTime::from_nanos(10)));
+    assert!(graph.callback_scratch.is_empty());
+    phase.store(2, Ordering::Relaxed);
+    graph.quiesce()?;
+    graph.advance_to(SimTime::from_nanos(10))?;
+    assert_eq!(
+        *seen.lock().map_err(|_| "capture poisoned")?,
+        [
+            (Some(2), SimTime::from_nanos(5)),
+            (Some(1), SimTime::from_nanos(10))
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn callback_generation_failure_releases_all_tentative_keys()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut graph = Graph::new(RuntimeConfig::default());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let target = recording_callback(&mut graph, "target", &seen, |ctx| {
+        (ctx.scheduled_key(), ctx.now())
+    })?;
+    let producer = graph.add_event_callback("producer", move |_| {
+        Ok(
+            ReactionOutput::schedule_reaction_once_after(target, SimDuration::ZERO, 1, 0)
+                .and_schedule_reaction_once_after(target, SimDuration::ZERO, 2, 0),
+        )
+    })?;
+    graph.reactions[producer.index()].generation = u64::MAX;
+    graph.schedule_reaction_event(producer, SimTime::ZERO, 0)?;
+    assert!(
+        matches!(graph.quiesce(), Err(RuntimeError::GenerationExhausted(super::WorkId::Reaction(id))) if id == producer)
+    );
+    assert_eq!(graph.next_event_time(), None);
+    graph.reactions[producer.index()].generation = 0;
+    graph.quiesce()?;
+    assert_eq!(
+        *seen.lock().map_err(|_| "capture poisoned")?,
+        [(Some(1), SimTime::ZERO), (Some(2), SimTime::ZERO)]
+    );
+    Ok(())
+}
