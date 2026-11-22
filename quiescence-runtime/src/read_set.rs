@@ -50,12 +50,45 @@ impl Dependencies {
     }
 }
 
-/// The owner runs exactly one evaluator at a time. A per-node epoch lets us
-/// deduplicate reads in O(1) without allocating or clearing a set each call.
-/// Only touched IDs are sorted, and already-ordered observations skip sorting.
-pub struct ReadTracker {
-    marks: Vec<u32>,
+/// Reusable membership for graph-local dense identifiers. Each operation
+/// has an independent epoch; a rollover clears the marks before reuse.
+pub struct EpochMarks {
+    slots: Vec<u32>,
     epoch: u32,
+}
+
+impl EpochMarks {
+    const fn new() -> Self {
+        Self {
+            slots: Vec::new(),
+            epoch: 0,
+        }
+    }
+
+    fn begin(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            self.slots.fill(0);
+            self.epoch = 1;
+        }
+    }
+
+    pub(super) fn insert(&mut self, id: NodeId) -> bool {
+        let mark = &mut self.slots[id.index()];
+        if *mark == self.epoch {
+            false
+        } else {
+            *mark = self.epoch;
+            true
+        }
+    }
+}
+
+/// The owner runs exactly one evaluator at a time. Reuse dense-ID marks
+/// for read tracking and independent write-validation operations.
+/// Only touched read IDs are sorted; monotonic observations skip sorting.
+pub struct ReadTracker {
+    marks: EpochMarks,
     observed: Vec<NodeId>,
     ordered: bool,
 }
@@ -63,31 +96,32 @@ pub struct ReadTracker {
 impl ReadTracker {
     pub(super) const fn new() -> Self {
         Self {
-            marks: Vec::new(),
-            epoch: 0,
+            marks: EpochMarks::new(),
             observed: Vec::new(),
             ordered: true,
         }
     }
 
     pub(super) fn register_node(&mut self) {
-        self.marks.push(0);
+        self.marks.slots.push(0);
     }
 
     pub(super) fn begin(&mut self) {
         self.observed.clear();
         self.ordered = true;
-        self.epoch = self.epoch.wrapping_add(1);
-        if self.epoch == 0 {
-            self.marks.fill(0);
-            self.epoch = 1;
-        }
+        self.marks.begin();
+    }
+
+    /// Start a separate membership operation without disturbing the
+    /// completed read observations awaiting publication. This is used
+    /// to validate reaction writes after the evaluator returns.
+    pub(super) fn begin_membership(&mut self) -> &mut EpochMarks {
+        self.marks.begin();
+        &mut self.marks
     }
 
     pub(super) fn record(&mut self, id: NodeId) {
-        let mark = &mut self.marks[id.index()];
-        if *mark != self.epoch {
-            *mark = self.epoch;
+        if self.marks.insert(id) {
             self.ordered &= self.observed.last().is_none_or(|&previous| previous < id);
             self.observed.push(id);
         }
@@ -137,7 +171,7 @@ mod tests {
         for _ in 0..128 {
             tracker.register_node();
         }
-        tracker.epoch = u32::MAX - 4;
+        tracker.marks.epoch = u32::MAX - 4;
         let mut random = 0x9e37_79b9_u32;
         for turn in 0..4096_u32 {
             tracker.begin();
@@ -159,6 +193,39 @@ mod tests {
                 assert_eq!(stored.as_slice(), actual);
             }
         }
+    }
+
+    #[test]
+    fn independent_membership_preserves_completed_reads_across_epoch_wrap() {
+        let mut tracker = ReadTracker::new();
+        for _ in 0..100_001 {
+            tracker.register_node();
+        }
+        tracker.marks.epoch = u32::MAX - 1;
+        let a = NodeId::from_index(100_000);
+        let b = NodeId::from_index(1);
+        let c = NodeId::from_index(200);
+        tracker.begin();
+        tracker.record(a);
+        tracker.record(b);
+        tracker.record(a);
+        let writes = tracker.begin_membership();
+        assert!(writes.insert(a));
+        assert!(writes.insert(c));
+        assert!(!writes.insert(a));
+        assert!(writes.insert(b));
+        assert!(!writes.insert(b));
+        assert_eq!(tracker.finish(), &[b, a]);
+
+        tracker.begin();
+        tracker.record(c);
+        tracker.record(a);
+        tracker.record(c);
+        assert_eq!(tracker.finish(), &[c, a]);
+        let writes = tracker.begin_membership();
+        assert!(writes.insert(c));
+        assert!(!writes.insert(c));
+        assert!(writes.insert(b));
     }
 
     #[test]

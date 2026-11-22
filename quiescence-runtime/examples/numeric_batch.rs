@@ -56,11 +56,16 @@ fn quantization(size: usize, scalar: bool) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn graph_writes(size: usize, mode: &str) -> Result<(), Box<dyn Error>> {
+fn graph_writes(size: usize, mode: &str, stride: usize) -> Result<(), Box<dyn Error>> {
     let mut graph = Graph::new(RuntimeConfig::default());
     let mut first = Vec::with_capacity(size);
     let mut second = Vec::with_capacity(size);
     for (i, request) in requests(size)?.into_iter().enumerate() {
+        if i != 0 {
+            for _ in 1..stride {
+                graph.add_atom_input("unused", 0)?;
+            }
+        }
         if mode.starts_with("mixed") && i.is_multiple_of(5) {
             let node = graph.add_atom_input("atom", 1)?;
             first.push(StateWrite::atom(node, 1));
@@ -104,14 +109,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     let size = args
         .next()
         .map_or(Ok(1_024), |value| value.parse::<usize>())?;
-    if size == 0 || size > SAMPLES || args.next().is_some() {
+    let stride = args.next().map_or(Ok(1), |value| value.parse::<usize>())?;
+    if size == 0 || size > SAMPLES || stride == 0 || args.next().is_some() {
         return Err("expected a nonzero batch size up to 8388608".into());
     }
     match mode.as_str() {
         "scalar" => quantization(size, true),
         "simd" => quantization(size, false),
         "quiet" | "change" | "mixed" | "mixed-change" | "quiet-unsorted"
-        | "mixed-change-unsorted" => graph_writes(size, &mode),
+        | "mixed-change-unsorted" => graph_writes(size, &mode, stride),
         _ => Err("mode must be scalar, simd, quiet, change, mixed, mixed-change, quiet-unsorted or mixed-change-unsorted".into()),
     }
 }

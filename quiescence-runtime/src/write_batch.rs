@@ -1,66 +1,9 @@
 //! Validation and atomic staging of independent numeric and atom writes.
+use super::read_set::{EpochMarks, ReadTracker};
 use super::{CanonicalValue, Graph, Node, NodeState, RuntimeError, StateWrite};
 use quiescence_core::{Bucket, NodeId, PointRequest, Quantization};
-use std::collections::BTreeSet;
 
-/// IDs are dense graph-local indices. Use no storage for strictly ordered
-/// batches; for unordered batches choose a bitmap when its span costs at
-/// most one machine word per write, otherwise use sparse membership.
-enum DuplicateTracker {
-    Ordered,
-    Bitmap { first: usize, words: Vec<u64> },
-    Sparse(BTreeSet<NodeId>),
-}
-
-impl DuplicateTracker {
-    fn new(writes: &[StateWrite], node_count: usize) -> Self {
-        if writes
-            .windows(2)
-            .all(|pair| pair[0].node() < pair[1].node())
-            || writes
-                .windows(2)
-                .all(|pair| pair[0].node() > pair[1].node())
-        {
-            return Self::Ordered;
-        }
-        // Unknown IDs are reported by target validation before insertion,
-        // and must never be allowed to inflate the bitmap allocation.
-        let (first, last) = writes
-            .iter()
-            .map(|write| write.node().index())
-            .filter(|&index| index < node_count)
-            .fold((usize::MAX, 0), |(lo, hi), index| {
-                (lo.min(index), hi.max(index))
-            });
-        if first <= last {
-            let count = (last - first) / 64 + 1;
-            if count <= writes.len() {
-                return Self::Bitmap {
-                    first,
-                    words: vec![0; count],
-                };
-            }
-        }
-        Self::Sparse(BTreeSet::new())
-    }
-
-    /// Returns false exactly when the validated node was already present.
-    fn insert(&mut self, id: NodeId) -> bool {
-        match self {
-            Self::Ordered => true,
-            Self::Sparse(seen) => seen.insert(id),
-            Self::Bitmap { first, words } => {
-                let offset = id.index() - *first;
-                let word = &mut words[offset / 64];
-                let mask = 1 << (offset % 64);
-                let inserted = *word & mask == 0;
-                *word |= mask;
-                inserted
-            }
-        }
-    }
-}
-
+#[derive(Clone, Copy)]
 pub struct ResolvedWrite {
     node: NodeId,
     next: CanonicalValue,
@@ -94,13 +37,14 @@ impl ValidatedWrite {
 
 impl Graph {
     fn validated_writes<'a>(
-        &'a self,
+        nodes: &'a [Node],
+        seen: &'a mut EpochMarks,
         writes: &'a [StateWrite],
     ) -> impl Iterator<Item = Result<(NodeId, ValidatedWrite), RuntimeError>> + 'a {
-        let mut seen = DuplicateTracker::new(writes, self.nodes.len());
         writes.iter().map(move |&write| {
             let id = write.node();
-            let node = self.node(id)?;
+            // Unknown targets must be reported before touching dense marks.
+            let node = nodes.get(id.index()).ok_or(RuntimeError::UnknownNode(id))?;
             if !seen.insert(id) {
                 return Err(RuntimeError::DuplicateStateWrite(id));
             }
@@ -136,19 +80,27 @@ impl Graph {
         Ok(validated)
     }
 
+    fn resolve_single_write(
+        nodes: &[Node],
+        write: StateWrite,
+    ) -> Result<Option<ResolvedWrite>, RuntimeError> {
+        let id = write.node();
+        let node = nodes.get(id.index()).ok_or(RuntimeError::UnknownNode(id))?;
+        Self::validate_write(node, write)?.resolve(id)
+    }
+
     pub(super) fn validate_state_write_batch(
-        &self,
+        &mut self,
         writes: &[StateWrite],
     ) -> Result<(), RuntimeError> {
         // Point estimates have state-independent representability. Reject
         // invalid values at admission, but resolve hysteresis again at delivery.
-        self.visit_resolved_writes(writes, |_| {})
+        Self::visit_resolved_writes(&self.nodes, &mut self.reads, writes, |_| {})
     }
 
     pub(super) fn apply_state_writes(&mut self, writes: &[StateWrite]) -> Result<(), RuntimeError> {
         if let [write] = writes {
-            let id = write.node();
-            if let Some(resolved) = Self::validate_write(self.node(id)?, *write)?.resolve(id)? {
+            if let Some(resolved) = Self::resolve_single_write(&self.nodes, *write)? {
                 self.commit(resolved.node, resolved.next)?;
             }
             return Ok(());
@@ -158,23 +110,43 @@ impl Graph {
     }
 
     pub(super) fn resolve_state_writes(
-        &self,
+        &mut self,
         writes: &[StateWrite],
     ) -> Result<Vec<ResolvedWrite>, RuntimeError> {
-        let mut resolved = Vec::with_capacity(writes.len());
-        self.visit_resolved_writes(writes, |write| resolved.push(write))?;
+        if writes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut resolved = std::mem::take(&mut self.write_scratch);
+        let result = Self::visit_resolved_writes(&self.nodes, &mut self.reads, writes, |write| {
+            resolved.push(write);
+        });
+        if let Err(error) = result {
+            resolved.clear();
+            self.recycle_write_scratch(resolved);
+            return Err(error);
+        }
         Ok(resolved)
     }
 
     // Validation and resolution share the same ordered traversal at admission
     // and delivery. Staging keeps graph commits atomic even with mixed writes.
     fn visit_resolved_writes(
-        &self,
+        graph_nodes: &[Node],
+        tracker: &mut ReadTracker,
         writes: &[StateWrite],
         mut visit: impl FnMut(ResolvedWrite),
     ) -> Result<(), RuntimeError> {
         const BLOCK: usize = 8;
-        let validated = self.validated_writes(writes);
+        if writes.is_empty() {
+            return Ok(());
+        }
+        if let [write] = writes {
+            if let Some(resolved) = Self::resolve_single_write(graph_nodes, *write)? {
+                visit(resolved);
+            }
+            return Ok(());
+        }
+        let validated = Self::validated_writes(graph_nodes, tracker.begin_membership(), writes);
         if writes.len() < BLOCK {
             for write in validated {
                 let (node, write) = write?;
@@ -243,66 +215,27 @@ impl Graph {
 
     pub(super) fn commit_resolved_state_writes(
         &mut self,
-        resolved: Vec<ResolvedWrite>,
+        mut resolved: Vec<ResolvedWrite>,
     ) -> Result<(), RuntimeError> {
-        for ResolvedWrite { node, next } in resolved {
-            self.commit(node, next)?;
+        let result = resolved
+            .iter()
+            .copied()
+            .try_for_each(|ResolvedWrite { node, next }| self.commit(node, next));
+        resolved.clear();
+        self.recycle_write_scratch(resolved);
+        result
+    }
+
+    fn recycle_write_scratch(&mut self, resolved: Vec<ResolvedWrite>) {
+        if resolved.capacity() > self.write_scratch.capacity() {
+            self.write_scratch = resolved;
         }
-        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn adaptive_duplicate_tracking_matches_reference_membership() {
-        let cases: [(usize, &[u32]); 5] = [
-            (10, &[0, 1, 2, 3]),
-            (10, &[3, 2, 1, 0]),
-            (1000, &[63, 3, 64, 127, 3, 64, 63]),
-            (1_000_001, &[1_000_000, 0, 1, 1_000_000, 0]),
-            (128, &[65, u32::MAX, 1, 65, 1, 64]),
-        ];
-        for (count, indices) in cases {
-            let writes: Vec<_> = indices
-                .iter()
-                .map(|&index| StateWrite::atom(NodeId::from_index(index), 1))
-                .collect();
-            let mut tracker = DuplicateTracker::new(&writes, count);
-            let mut reference = BTreeSet::new();
-            for id in writes
-                .iter()
-                .map(|write| write.node())
-                .filter(|id| id.index() < count)
-            {
-                assert_eq!(
-                    tracker.insert(id),
-                    reference.insert(id),
-                    "{indices:?}, {id:?}"
-                );
-            }
-        }
-        let dense = [
-            StateWrite::atom(NodeId::from_index(64), 1),
-            StateWrite::atom(NodeId::from_index(1), 1),
-            StateWrite::atom(NodeId::from_index(64), 1),
-        ];
-        assert!(matches!(
-            DuplicateTracker::new(&dense, 65),
-            DuplicateTracker::Bitmap { .. }
-        ));
-        let sparse = [
-            StateWrite::atom(NodeId::from_index(100_000), 1),
-            StateWrite::atom(NodeId::from_index(1), 1),
-            StateWrite::atom(NodeId::from_index(100_000), 1),
-        ];
-        assert!(matches!(
-            DuplicateTracker::new(&sparse, 100_001),
-            DuplicateTracker::Sparse(_)
-        ));
-    }
 
     #[test]
     fn mixed_batches_preserve_order_and_skip_only_unchanged_values()
@@ -386,6 +319,44 @@ mod tests {
             matches!(graph.set_state_now(&writes), Err(RuntimeError::DuplicateStateWrite(id)) if id == duplicate.node())
         );
         assert_eq!(graph.take_transitions(), []);
+        Ok(())
+    }
+    #[test]
+    fn write_staging_reuses_capacity_and_abandons_partial_failed_batches()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut graph = Graph::new(crate::RuntimeConfig::default());
+        let writes = (0..73)
+            .map(|_| {
+                graph
+                    .add_atom_input("atom", 0)
+                    .map(|id| StateWrite::atom(id, 0))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        graph.set_state_now(&writes)?;
+        assert_eq!(graph.write_scratch.capacity(), 0);
+        let updates: Vec<_> = writes
+            .iter()
+            .map(|write| StateWrite::atom(write.node(), 1))
+            .collect();
+        graph.set_state_now(&updates)?;
+        let capacity = graph.write_scratch.capacity();
+        assert!(capacity >= updates.len());
+        assert!(graph.write_scratch.is_empty());
+        let allocation = graph.write_scratch.as_ptr();
+        let mut bad = writes.clone();
+        bad.push(writes[0]);
+        assert!(matches!(
+            graph.set_state_now(&bad),
+            Err(RuntimeError::DuplicateStateWrite(_))
+        ));
+        assert_eq!(graph.write_scratch.capacity(), capacity);
+        assert!(graph.write_scratch.is_empty());
+        for write in &writes {
+            assert_eq!(graph.value_atom(write.node())?, 1);
+        }
+        graph.set_state_now(&writes)?;
+        assert_eq!(graph.write_scratch.as_ptr(), allocation);
+        assert!(graph.write_scratch.is_empty());
         Ok(())
     }
 }
