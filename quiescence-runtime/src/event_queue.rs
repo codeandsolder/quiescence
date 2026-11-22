@@ -1,4 +1,4 @@
-use super::{CanonicalValue, StateWrite, WindowRecord};
+use super::{CanonicalValue, StateWrite, WindowRecord, WorkId};
 use quiescence_core::{NodeId, ReactionId, SimTime};
 use std::{
     cmp::Ordering,
@@ -36,6 +36,23 @@ pub enum EventKind {
         key: u64,
     },
 }
+impl EventKind {
+    pub(super) const fn forecast(&self) -> Option<(WorkId, u64)> {
+        match self {
+            Self::Commit {
+                node, generation, ..
+            }
+            | Self::Reevaluate { node, generation } => Some((WorkId::Node(*node), *generation)),
+            Self::ReactionTransition {
+                reaction,
+                generation,
+                ..
+            } => Some((WorkId::Reaction(*reaction), *generation)),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScheduledEvent {
     pub(super) at: SimTime,
@@ -84,13 +101,19 @@ enum EventStorage {
 pub struct EventQueue {
     storage: EventStorage,
     next_sequence: u64,
+    len: usize,
 }
 impl EventQueue {
     pub(super) const fn new() -> Self {
         Self {
             storage: EventStorage::Grouped(BTreeMap::new()),
             next_sequence: 0,
+            len: 0,
         }
+    }
+
+    pub(super) const fn len(&self) -> usize {
+        self.len
     }
 
     pub(super) fn peek(&self) -> Option<&ScheduledEvent> {
@@ -106,6 +129,7 @@ impl EventQueue {
         }
         event.sequence = self.next_sequence;
         self.next_sequence += 1;
+        self.len += 1;
         match &mut self.storage {
             EventStorage::Grouped(groups) => {
                 groups
@@ -136,6 +160,7 @@ impl EventQueue {
     }
 
     pub(super) fn restore_front(&mut self, event: ScheduledEvent) {
+        self.len += 1;
         match &mut self.storage {
             EventStorage::Grouped(groups) => groups
                 .entry((event.at, event.priority))
@@ -146,7 +171,7 @@ impl EventQueue {
     }
 
     pub(super) fn pop(&mut self) -> Option<ScheduledEvent> {
-        match &mut self.storage {
+        let event = match &mut self.storage {
             EventStorage::Grouped(groups) => {
                 let mut first = groups.first_entry()?;
                 let event = first.get_mut().pop_front();
@@ -161,6 +186,30 @@ impl EventQueue {
                     self.storage = EventStorage::Grouped(BTreeMap::new());
                 }
                 event
+            }
+        };
+        if event.is_some() {
+            self.len -= 1;
+        }
+        event
+    }
+
+    /// Remove invalidated entries without changing surviving causal keys.
+    pub(super) fn retain(&mut self, mut keep: impl FnMut(&EventKind) -> bool) {
+        match &mut self.storage {
+            EventStorage::Grouped(groups) => {
+                groups.retain(|_, group| {
+                    group.retain(|event| keep(&event.kind));
+                    !group.is_empty()
+                });
+                self.len = groups.values().map(VecDeque::len).sum();
+            }
+            EventStorage::Sparse(heap) => {
+                heap.retain(|event| keep(&event.0.kind));
+                self.len = heap.len();
+                if heap.is_empty() {
+                    self.storage = EventStorage::Grouped(BTreeMap::new());
+                }
             }
         }
     }

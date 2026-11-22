@@ -45,7 +45,7 @@ The canonical-state contract is therefore broader than numeric quantization: a n
 
 A derived-node evaluator reads nodes through an evaluation context and produces a candidate result plus temporal information. Reads form the current dependency set.
 
-A reaction uses the same read-tracking context, but its output is a forecasted state transition: an optional causal delay plus an atomic batch of numeric and/or exact-atom writes to state/input nodes. Reaction dependencies are dynamic just like derived-node dependencies. If any dependency changes before the forecasted transition, the reaction is reevaluated and the old generation-stamped forecast becomes stale.
+A reaction uses the same read-tracking context, but its output is a forecasted state transition: an optional causal delay plus an atomic batch of numeric and/or exact-atom writes to state/input nodes. Reaction dependencies are dynamic just like derived-node dependencies. If any dependency changes before the forecasted transition, the reaction is reevaluated and a successful reevaluation replaces the old forecast.
 
 This keeps evaluation pure while making side effects explicit and inspectable. A reaction does not mutate graph state while deciding what should happen; the runtime applies its write batch only when the causal boundary is reached.
 
@@ -75,11 +75,7 @@ Internal causal scheduling remains separate. Forecasts and schedule-once callbac
 
 ## Layer 3: dependency storage and propagation
 
-The prototype uses per-node `BTreeSet`s because they make correctness easy to inspect. This is intentionally disposable.
-
-The current exact-atom prototype stores node state as a numeric-or-atom enum. In a same-load three-run smoke comparison against `7a45dc9`, the median 100k-node full-propagation path moved from about 21.7 ms to 22.6 ms (roughly 4%); sparse cutoff latency remained dominated by noise. If exact atoms remain sparse, moving their payloads into a side arena is an obvious way to remove that common numeric-node storage/cache tax without changing semantics.
-
-Likely later representations include packed adjacency lists, generation-stamped edge arenas, small-vector fast paths, SCC-local layouts and compiled stable regions.
+The graph owner collects reads in a reusable dense-ID epoch table and observation buffer. Repeated IDs are recorded once; nonmonotonic observations are sorted at the end of evaluation. Forward subscriptions are immutable sorted lists with six inline IDs, spilling to a boxed slice. Reverse edges use three inline work IDs or a B-tree for scalable fan-out and dynamic insertion/removal. Stable subscriptions bypass graph mutations entirely; changed sets use a linear symmetric difference.
 
 The invariant is only:
 
@@ -87,19 +83,18 @@ The invariant is only:
 
 ## Layer 4: temporal scheduling
 
-The scheduler uses an adaptive event queue. While there are at most 128 distinct
+Ordinary events use an adaptive event queue. While there are at most 128 distinct
 `(simulation timestamp, priority)` keys, a sorted map holds one FIFO deque per
 key; this avoids one heap sift per callback in a dense same-time batch.
 Once the pending schedule has more distinct keys, it converts to a binary
 heap with a monotonically assigned sequence for FIFO ties. The heap resets to
 grouped mode after it drains. Sequence exhaustion triggers a stable reindexing
 of pending events rather than allowing a wraparound to reorder callbacks.
-On failed event delivery, the event is restored ahead of later events at the
-same key without losing its original priority or insertion order.
+Forecast events share the ordinary causal queue. A successful reevaluation increments its generation and counts the outstanding predictions it invalidates. Obsolete head entries are discarded before the next public causal deadline is exposed; a linear compaction removes buried stale entries when at least 1,024 are stale and they account for at least half the queue. Failed delivery restores the original event position and does not decrement its owner’s live forecast count.
 
 The API distinguishes two causal meanings:
 
-- **Forecasts** are generation-stamped predictions derived from current dependencies. If a dependency changes before the forecast fires, the old event becomes stale.
+- **Forecasts** are replaceable predictions derived from current dependencies. Successful reevaluation cancels or replaces superseded forecasts.
 - **Scheduled callbacks** are keyed schedule-once wakeups. A producer may target itself or a distinct callback reaction. Once accepted they survive dependency changes; another request with the same `(target reaction, key)` is ignored until the callback is dequeued. Same-time callbacks order by lower numeric priority and then insertion sequence. The key is intentionally domain-neutral: a Minecraft adapter can intern `(position, block)` while another domain can choose a different identity. Explicit targets matter when source code schedules a different handler, such as a neighbor-change path enqueueing a later block-update callback.
 - **External causal events** are unkeyed reaction wakeups injected by a source adapter. They also survive dependency changes, but duplicates are preserved: selecting the same target twice is two callbacks. Event-only callback reactions are the preferred target when the handler must read current state only at invocation time: they are dormant during initial settle and their reads are deliberately not registered as reactive dependencies. When invoked by a keyed scheduled callback, `EvalContext::scheduled_key()` exposes the exact queued key so an adapter can revalidate or dispatch against the source identity that actually fired. Duplicate-preserving external events may instead carry an opaque per-event token through `EvalContext::external_token()`; the token is payload identity, not a deduplication key. This is the right boundary for scheduled game callbacks and dense spatial/random schedulers whose RNG state, iteration order, or selection machinery should remain outside the graph.
 
@@ -107,11 +102,11 @@ This distinction matters because rescheduling a prediction when its assumptions 
 
 Possible replacements include calendar queues, timing wheels, hierarchical queues, per-region queues or specialized indexes for certificate expiry.
 
-A stale prediction may be left in a queue and discarded cheaply when its generation no longer matches.
+Superseded forecasts never consume causal microsteps or determine the next event time. Amortized compaction bounds retained obsolete entries to a constant allowance or a fraction of pending work.
 
 An evaluator error leaves its work dirty, including the original scheduled key or external
 token for callback retries. Invalid reaction results are rejected before changing dynamic
-subscriptions, generation counters, or canonical state. A scheduled event that fails during
+subscriptions, pending forecasts, or canonical state. A scheduled event that fails during
 delivery remains in the causal queue in its original priority/sequence position; callers
 must handle the error rather than treating the graph as quiescent. Evaluators must express
 effects through their return values: retrying an evaluator can execute its body more than once.

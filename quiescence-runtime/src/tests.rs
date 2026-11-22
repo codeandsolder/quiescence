@@ -1601,3 +1601,126 @@ fn dynamic_wide_subscriptions_replace_only_after_success() -> Result<(), Box<dyn
     assert_eq!(calls.load(Ordering::Relaxed), before + 12);
     Ok(())
 }
+
+#[test]
+fn obsolete_forecasts_do_not_accumulate_or_consume_settlement_budget()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut graph = Graph::new(RuntimeConfig {
+        same_time_microstep_budget: 4,
+    });
+    let source = graph.add_input("source", Quantization::INTEGER, 0.0)?;
+    let derived = graph.add_derived("delayed", Quantization::INTEGER, 0.0, move |context| {
+        Ok(EvalOutput::after(
+            context.read_f64(source)?,
+            SimDuration::from_millis(10),
+        ))
+    })?;
+    graph.settle()?;
+    for value in 1..=10_000 {
+        graph.set_input_now(source, f64::from(value))?;
+        assert_eq!(graph.next_event_time(), Some(SimTime::from_millis(10)));
+    }
+    graph.advance_to(SimTime::from_millis(10))?;
+    assert_eq!(graph.value_bucket(derived)?, Bucket::new(10_000));
+    assert_eq!(graph.next_event_time(), None);
+    Ok(())
+}
+
+#[test]
+fn failed_evaluation_retains_previous_forecasts_and_retry_removes_them()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut graph = Graph::new(RuntimeConfig::default());
+    let source = graph.add_atom_input("mode", 0)?;
+    let ready = Arc::new(AtomicUsize::new(0));
+    let gate = Arc::clone(&ready);
+    let node = graph.add_derived("forecast", Quantization::INTEGER, 0.0, move |context| {
+        if context.read_atom(source)? == 0 {
+            return Ok(EvalOutput::after(1.0, SimDuration::from_millis(20))
+                .with_valid_for(SimDuration::from_millis(10)));
+        }
+        if gate.load(Ordering::Relaxed) == 0 {
+            return Err(EvalError::Message(String::from("retry")));
+        }
+        Ok(EvalOutput::immediate(0.0))
+    })?;
+    graph.settle()?;
+    assert_eq!(graph.next_event_time(), Some(SimTime::from_millis(10)));
+    assert!(matches!(
+        graph.set_atom_now(source, 1),
+        Err(RuntimeError::Evaluation { .. })
+    ));
+    assert_eq!(graph.next_event_time(), Some(SimTime::from_millis(10)));
+    ready.store(1, Ordering::Relaxed);
+    graph.settle()?;
+    assert_eq!(graph.next_event_time(), None);
+    graph.advance_to(SimTime::from_millis(20))?;
+    assert_eq!(graph.value_bucket(node)?, Bucket::new(0));
+    Ok(())
+}
+
+#[test]
+fn cancelling_validity_and_commit_preserves_explicit_callbacks_and_writes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut graph = Graph::new(RuntimeConfig::default());
+    let source = graph.add_atom_input("source", 0)?;
+    let callback_calls = Arc::new(AtomicUsize::new(0));
+    let captured = Arc::clone(&callback_calls);
+    let callback = graph.add_event_callback("external", move |_| {
+        captured.fetch_add(1, Ordering::Relaxed);
+        Ok(ReactionOutput::idle())
+    })?;
+    let node = graph.add_derived("forecast", Quantization::INTEGER, 0.0, move |context| {
+        if context.read_atom(source)? == 0 {
+            Ok(EvalOutput::after(1.0, SimDuration::from_millis(30))
+                .with_valid_for(SimDuration::from_millis(10)))
+        } else {
+            Ok(EvalOutput::immediate(9.0))
+        }
+    })?;
+    graph.settle()?;
+    graph.schedule_reaction_event(callback, SimTime::from_millis(20), 0)?;
+    graph.schedule_atom(source, SimTime::from_millis(5), 1)?;
+    graph.advance_to(SimTime::from_millis(5))?;
+    assert_eq!(graph.next_event_time(), Some(SimTime::from_millis(20)));
+    assert_eq!(graph.value_bucket(node)?, Bucket::new(9));
+    graph.advance_to(SimTime::from_millis(30))?;
+    assert_eq!(callback_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(graph.value_bucket(node)?, Bucket::new(9));
+    assert_eq!(graph.next_event_time(), None);
+    Ok(())
+}
+
+#[test]
+fn buried_obsolete_forecasts_are_bounded_in_grouped_and_sparse_queues()
+-> Result<(), Box<dyn std::error::Error>> {
+    for ordinary in [1_i64, 160] {
+        let mut graph = Graph::new(RuntimeConfig {
+            same_time_microstep_budget: 8,
+        });
+        let source = graph.add_input("source", Quantization::INTEGER, 0.0)?;
+        let marker = graph.add_atom_input("marker", 0)?;
+        let derived = graph.add_derived("delayed", Quantization::INTEGER, 0.0, move |context| {
+            Ok(EvalOutput::after(
+                context.read_f64(source)?,
+                SimDuration::from_millis(10),
+            ))
+        })?;
+        graph.settle()?;
+        for at in 1..=ordinary {
+            graph.schedule_atom(marker, SimTime::from_nanos(at), at.unsigned_abs())?;
+        }
+        for value in 1..=5000 {
+            graph.set_input_now(source, f64::from(value))?;
+            assert!(graph.stale_forecasts < 1024);
+            assert!(graph.events.len() <= usize::try_from(ordinary)? + 1024);
+            assert_eq!(graph.next_event_time(), Some(SimTime::from_nanos(1)));
+        }
+        graph.advance_to(SimTime::from_millis(10))?;
+        assert_eq!(graph.stale_forecasts, 0);
+        assert_eq!(graph.events.len(), 0);
+        assert_eq!(graph.value_bucket(derived)?, Bucket::new(5000));
+        assert_eq!(graph.value_atom(marker)?, ordinary.unsigned_abs());
+        assert_eq!(graph.nodes[derived.index()].pending_forecasts, 0);
+    }
+    Ok(())
+}
