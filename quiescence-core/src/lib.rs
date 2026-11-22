@@ -234,7 +234,8 @@ impl Quantization {
             }
             .resolve();
         }
-        self.resolve_exact(previous, estimate)
+        point::resolve_interval(self, previous, estimate)
+            .unwrap_or_else(|| self.resolve_exact(previous, estimate))
     }
 
     fn resolve_exact(

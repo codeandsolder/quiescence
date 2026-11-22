@@ -1,11 +1,12 @@
-//! Certified fast paths for exact point quantization.
+//! Certified floating-point fast paths for exact quantization.
 //!
 //! For |scaled| < 2^51, every half-integer boundary is representable in
 //! binary64. Correct rounding of the floating-point multiply cannot cross
 //! such a boundary without landing exactly on it. If the product is not a
 //! half-integer, nearest-integer rounding and open hysteresis retention are
 //! therefore exact. At a boundary (or outside this range) use integer dyadic
-//! arithmetic instead.
+//! arithmetic instead. Nonzero-radius intervals use an explicit absolute
+//! endpoint error bound and two-lane certification.
 
 use super::{Bucket, Estimate, Quantization, QuantizeError};
 use core::simd::{
@@ -86,6 +87,59 @@ impl PointRequest {
     }
 }
 
+/// Certify the exact scaled center ± radius without constructing dyadic
+/// fractions in the common case. Uncertain boundary decisions fall back.
+#[inline]
+pub fn resolve_interval(
+    quantization: Quantization,
+    previous: Option<Bucket>,
+    estimate: Estimate,
+) -> Option<Result<Bucket, QuantizeError>> {
+    let scale = quantization.scale();
+    let center = estimate.center * scale;
+    let radius = estimate.radius * scale;
+    let magnitude = center.abs() + radius;
+    // This also excludes NaN/infinite input and overflow, and ensures both
+    // exact rounded endpoints are well inside the representable i64 range.
+    let certified_domain = estimate.radius > 0.0 && magnitude < LIMIT;
+    if !certified_domain {
+        return None;
+    }
+
+    // For a finite rounded result x, the absolute rounding error is at most
+    // epsilon*|x| + min_subnormal. The two scaled products together have
+    // error <= epsilon*(|center| + radius) + 2*min_subnormal. Their exact
+    // sum of magnitudes differs from the rounded magnitude by at most
+    // epsilon*magnitude + min_subnormal. The final addition/subtraction
+    // has result magnitude <= magnitude (monotonic rounding). Thus total
+    // endpoint error <= (2+epsilon)*epsilon*magnitude + (3+epsilon)*min_subnormal.
+    // The factor 4 is a conservative power of two. Taking the maximum
+    // with MIN_POSITIVE covers underflow and subnormals: above that floor
+    // the margin from 2+epsilon to 4 dominates (3+epsilon)*min_subnormal;
+    // below it, the total error is less than MIN_POSITIVE.
+    let error = (magnitude * (4.0 * f64::EPSILON)).max(f64::MIN_POSITIVE);
+    let endpoints = Simd::splat(center) + Simd::from_array([-radius, radius]);
+    let (rounded, certified) = round_block(endpoints, Some(error));
+    if !certified.all() {
+        return None;
+    }
+    let [lo, hi] = rounded.to_array();
+    // Certified endpoints never touch half-integer boundaries. Hence the
+    // exact open hysteresis interval contains both iff their rounded
+    // buckets are within its integer width of the previous bucket.
+    if let Some(old) = previous {
+        let width = u64::from(quantization.hysteresis_lsd());
+        if lo.abs_diff(old.raw()) <= width && hi.abs_diff(old.raw()) <= width {
+            return Some(Ok(old));
+        }
+    }
+    Some(if lo == hi {
+        Ok(Bucket::new(lo))
+    } else {
+        Err(QuantizeError::Ambiguous { estimate })
+    })
+}
+
 #[inline]
 const fn signed_magnitude(magnitude: u64, negative: bool) -> i64 {
     // The mantissa is at most 2^52 - 1, always a representable i64.
@@ -104,7 +158,7 @@ fn resolve_block(
         Simd::from_array(requests.map(|request| request.previous.map_or(i64::MIN, Bucket::raw)));
     let widths =
         Simd::from_array(requests.map(|request| i64::from(request.quantization.hysteresis_lsd())));
-    let (rounded, certified) = round_block(values * scales);
+    let (rounded, certified) = round_block(values * scales, None);
     // Translate the signed retention interval to an unsigned interval.
     // SIMD integer operations wrap. For certified lanes the rounded bucket
     // is bounded by 2^51, so an arbitrary i64 previous bucket cannot wrap
@@ -126,12 +180,16 @@ fn resolve_block(
 }
 
 #[inline]
-fn round_block(scaled: Simd<f64, LANES>) -> (Simd<i64, LANES>, core::simd::Mask<i64, LANES>) {
+fn round_block<const N: usize>(
+    scaled: Simd<f64, N>,
+    error: Option<f64>,
+) -> (Simd<i64, N>, core::simd::Mask<i64, N>) {
     let magnitude = scaled.abs();
     let encoded = magnitude + Simd::splat(MAGIC);
     let rounded = encoded - Simd::splat(MAGIC);
-    let certified = magnitude.simd_lt(Simd::splat(LIMIT))
-        & (magnitude - rounded).abs().simd_lt(Simd::splat(0.5));
+    let distance = (magnitude - rounded).abs();
+    let bounded = error.map_or(distance, |error| distance + Simd::splat(error));
+    let certified = magnitude.simd_lt(Simd::splat(LIMIT)) & bounded.simd_lt(Simd::splat(0.5));
     let unsigned = encoded.to_bits() & Simd::splat(MANTISSA);
     let signed = unsigned.cast::<i64>();
     (
@@ -247,5 +305,101 @@ mod tests {
             assert_eq!(buckets[..len], [Bucket::new(100); 3][..len]);
         }
         Ok(())
+    }
+    #[test]
+    fn certified_intervals_match_exact_dyadic_oracle() -> Result<(), Box<dyn std::error::Error>> {
+        let mut random = 0x7d3c_28a1_9e37_79b9;
+        let mut certified = 0_usize;
+        for places in 0..=Quantization::MAX_DECIMAL_PLACES {
+            let q = Quantization::new(places, 0)?;
+            for round in 0..16_384_u32 {
+                let r = next(&mut random);
+                let q = Quantization::new(places, u32::try_from((r >> 32) & 15)?)?;
+                let integer = f64::from(i32::try_from(r & 0x7fff_ffff)?)
+                    * if r & 16 == 0 { 1.0 } else { -1.0 };
+                let scale = q.scale();
+                let boundary = (integer + 0.5) / scale;
+                let center = match round % 9 {
+                    0 => f64::from_bits(r),
+                    1 => boundary,
+                    2 => boundary.next_up(),
+                    3 => boundary.next_down(),
+                    4 => (integer + 0.25) / scale,
+                    5 => (integer + 0.125) / scale,
+                    6 => LIMIT / scale,
+                    7 => -LIMIT / scale,
+                    _ => f64::MIN_POSITIVE,
+                };
+                let radius = match (round / 9) % 10 {
+                    0 => f64::from_bits(next(&mut random)),
+                    1 => f64::from_bits(1),
+                    2 => f64::EPSILON / scale,
+                    3 => 0.25 / scale,
+                    4 => 0.125 / scale,
+                    5 => 1.0 / scale,
+                    6 => f64::from(u32::try_from(r >> 32)?) / scale,
+                    7 => LIMIT / scale,
+                    8 => center.abs() / 2.0,
+                    _ => -0.25 / scale,
+                };
+                let previous = match round % 5 {
+                    0 => None,
+                    1 => Some(Bucket::new(i64::MIN)),
+                    2 => Some(Bucket::new(i64::MAX)),
+                    3 => Some(Bucket::new(i64::from(i32::try_from(r & 0x7fff_ffff)?))),
+                    _ => q.resolve_exact(None, Estimate::point(center)).ok(),
+                };
+                let estimate = Estimate { center, radius };
+                let expected = q.resolve_exact(previous, estimate);
+                if let Some(actual) = resolve_interval(q, previous, estimate) {
+                    certified += 1;
+                    assert_eq!(actual, expected, "{q:?} {previous:?} {estimate:?}");
+                }
+                assert_eq!(
+                    q.resolve(previous, estimate),
+                    expected,
+                    "{q:?} {previous:?} {estimate:?}"
+                );
+            }
+            // The fast path is exercised at every supported scale.
+            assert!(
+                resolve_interval(
+                    q,
+                    None,
+                    Estimate {
+                        center: 3.125 / q.scale(),
+                        radius: 0.125 / q.scale()
+                    }
+                )
+                .is_some()
+            );
+        }
+        assert!(certified > 10_000, "only {certified} certified intervals");
+        Ok(())
+    }
+
+    #[test]
+    fn interval_certificate_rejects_uncertain_ties_and_invalid_values() {
+        let q = Quantization::INTEGER;
+        for center in [0.5, -0.5, LIMIT, -LIMIT, f64::INFINITY, f64::NAN] {
+            let estimate = Estimate {
+                center,
+                radius: f64::from_bits(1),
+            };
+            assert!(resolve_interval(q, None, estimate).is_none());
+        }
+        for radius in [-1.0, f64::NAN, f64::INFINITY] {
+            assert!(
+                resolve_interval(
+                    q,
+                    None,
+                    Estimate {
+                        center: 0.0,
+                        radius
+                    }
+                )
+                .is_none()
+            );
+        }
     }
 }
