@@ -8,7 +8,7 @@
 //! arithmetic instead. Nonzero-radius intervals use an explicit absolute
 //! endpoint error bound and two-lane certification.
 
-use super::{Bucket, Estimate, Quantization, QuantizeError};
+use super::{Bucket, Estimate, HalfBounds, Quantization, QuantizeError};
 use core::simd::{
     Select, Simd,
     cmp::SimdPartialOrd,
@@ -19,6 +19,43 @@ const MAGIC: f64 = 4_503_599_627_370_496.0; // 2^52: spacing = 1
 const LIMIT: f64 = MAGIC / 2.0;
 const MANTISSA: u64 = (1 << 52) - 1;
 const LANES: usize = 8;
+
+/// Exact, state-independent rounding of a point. The midpoint class
+/// preserves the open hysteresis boundary for any later previous bucket.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreparedPoint {
+    /// The exact point lies strictly inside its nearest bucket's half-grid.
+    Interior(Bucket),
+    /// The exact point is at a half-grid boundary, rounded away from zero.
+    Midpoint(Bucket),
+}
+
+impl PreparedPoint {
+    #[must_use = "the canonical bucket must be used"]
+    #[inline]
+    pub fn resolve(self, previous: Bucket, hysteresis_lsd: u32) -> Bucket {
+        let (rounded, midpoint) = match self {
+            Self::Interior(bucket) => (bucket, false),
+            Self::Midpoint(bucket) => (bucket, true),
+        };
+        let width = u64::from(hysteresis_lsd);
+        let distance = rounded.raw().abs_diff(previous.raw());
+        // Positive ties lie half a unit below their rounded bucket; negative
+        // ties lie half a unit above. The outer boundary on that far side
+        // must be excluded (the hysteresis interval is open).
+        let excluded_edge = midpoint
+            && if rounded.raw() > 0 {
+                previous.raw() >= rounded.raw()
+            } else {
+                previous.raw() <= rounded.raw()
+            };
+        if distance < width || (distance == width && !excluded_edge) {
+            previous
+        } else {
+            rounded
+        }
+    }
+}
 
 /// One independent point estimate, with its own decimal and hysteresis policy.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -35,17 +72,52 @@ impl PointRequest {
     /// Rejects nonfinite or unrepresentable values.
     #[inline]
     pub fn resolve(self) -> Result<Bucket, QuantizeError> {
+        self.certified_bucket()
+            .map_or_else(|| self.resolve_exact(), |bucket| Ok(self.retain(bucket)))
+    }
+
+    /// Compile point rounding independently of the current previous bucket.
+    /// The result can be reused when delivering an already-admitted write.
+    ///
+    /// # Errors
+    /// Rejects nonfinite or unrepresentable values.
+    #[inline]
+    pub fn prepare(self) -> Result<PreparedPoint, QuantizeError> {
+        self.certified_bucket().map_or_else(
+            || self.prepare_exact(),
+            |raw| Ok(PreparedPoint::Interior(Bucket::new(raw))),
+        )
+    }
+
+    #[inline]
+    fn certified_bucket(self) -> Option<i64> {
         let scaled = self.value * self.quantization.scale();
         let magnitude = scaled.abs();
         let encoded = magnitude + MAGIC;
         let rounded = encoded - MAGIC;
         if magnitude < LIMIT && (magnitude - rounded).abs() < 0.5 {
             let unsigned = encoded.to_bits() & MANTISSA;
-            let bucket = signed_magnitude(unsigned, scaled.is_sign_negative());
-            Ok(self.retain(bucket))
+            Some(signed_magnitude(unsigned, scaled.is_sign_negative()))
         } else {
-            self.resolve_exact()
+            None
         }
+    }
+
+    #[cold]
+    fn prepare_exact(self) -> Result<PreparedPoint, QuantizeError> {
+        if !self.value.is_finite() {
+            return Err(QuantizeError::NonFiniteEstimate);
+        }
+        let (bounds, _) = HalfBounds::estimate(
+            Estimate::point(self.value),
+            u128::from(self.quantization.scale_integer()),
+        )?;
+        let bucket = bounds.round_bucket()?;
+        Ok(if bounds.floor == bounds.ceil && bounds.floor % 2 != 0 {
+            PreparedPoint::Midpoint(bucket)
+        } else {
+            PreparedPoint::Interior(bucket)
+        })
     }
 
     /// Resolve independent requests into a caller-owned output buffer.
@@ -56,18 +128,20 @@ impl PointRequest {
     /// Returns the first numeric error, or a length mismatch before writing.
     #[inline]
     pub fn resolve_batch(requests: &[Self], output: &mut [Bucket]) -> Result<(), QuantizeError> {
-        if requests.len() != output.len() {
-            return Err(QuantizeError::BatchLengthMismatch);
-        }
-        let (blocks, remainder) = requests.as_chunks::<LANES>();
-        let (outputs, tail) = output.as_chunks_mut::<LANES>();
-        for (block, out) in blocks.iter().zip(outputs) {
-            resolve_block(block, out)?;
-        }
-        for (&request, out) in remainder.iter().zip(tail) {
-            *out = request.resolve()?;
-        }
-        Ok(())
+        transform_batch(requests, output, resolve_block, Self::resolve)
+    }
+
+    /// Compile independent points without applying their previous buckets.
+    /// On error, earlier blocks may have been written.
+    ///
+    /// # Errors
+    /// Returns the first numeric error, or a length mismatch before writing.
+    #[inline]
+    pub fn prepare_batch(
+        requests: &[Self],
+        output: &mut [PreparedPoint],
+    ) -> Result<(), QuantizeError> {
+        transform_batch(requests, output, prepare_block, Self::prepare)
     }
 
     #[inline]
@@ -85,6 +159,27 @@ impl PointRequest {
         self.quantization
             .resolve_exact(self.previous, Estimate::point(self.value))
     }
+}
+
+#[inline]
+fn transform_batch<T>(
+    requests: &[PointRequest],
+    output: &mut [T],
+    block: impl Fn(&[PointRequest; LANES], &mut [T; LANES]) -> Result<(), QuantizeError>,
+    scalar: impl Fn(PointRequest) -> Result<T, QuantizeError>,
+) -> Result<(), QuantizeError> {
+    if requests.len() != output.len() {
+        return Err(QuantizeError::BatchLengthMismatch);
+    }
+    let (blocks, remainder) = requests.as_chunks::<LANES>();
+    let (outputs, tail) = output.as_chunks_mut::<LANES>();
+    for (requests, out) in blocks.iter().zip(outputs) {
+        block(requests, out)?;
+    }
+    for (&request, out) in remainder.iter().zip(tail) {
+        *out = scalar(request)?;
+    }
+    Ok(())
 }
 
 /// Certify the exact scaled center ± radius without constructing dyadic
@@ -152,13 +247,11 @@ fn resolve_block(
     requests: &[PointRequest; LANES],
     output: &mut [Bucket; LANES],
 ) -> Result<(), QuantizeError> {
-    let values = Simd::from_array(requests.map(|request| request.value));
-    let scales = Simd::from_array(requests.map(|request| request.quantization.scale()));
     let previous =
         Simd::from_array(requests.map(|request| request.previous.map_or(i64::MIN, Bucket::raw)));
     let widths =
         Simd::from_array(requests.map(|request| i64::from(request.quantization.hysteresis_lsd())));
-    let (rounded, certified) = round_block(values * scales, None);
+    let (rounded, certified) = round_requests(requests);
     // Translate the signed retention interval to an unsigned interval.
     // SIMD integer operations wrap. For certified lanes the rounded bucket
     // is bounded by 2^51, so an arbitrary i64 previous bucket cannot wrap
@@ -166,16 +259,60 @@ fn resolve_block(
     let distance = (rounded - previous + widths).cast::<u64>();
     let retain = distance.simd_le((widths + widths).cast::<u64>());
     let mut buckets = retain.select(previous, rounded).to_array().map(Bucket::new);
+    patch_uncertified(
+        requests,
+        certified,
+        &mut buckets,
+        PointRequest::resolve_exact,
+    )?;
+    *output = buckets;
+    Ok(())
+}
+
+#[inline]
+fn prepare_block(
+    requests: &[PointRequest; LANES],
+    output: &mut [PreparedPoint; LANES],
+) -> Result<(), QuantizeError> {
+    let (rounded, certified) = round_requests(requests);
+    let mut prepared = rounded
+        .to_array()
+        .map(|raw| PreparedPoint::Interior(Bucket::new(raw)));
+    patch_uncertified(
+        requests,
+        certified,
+        &mut prepared,
+        PointRequest::prepare_exact,
+    )?;
+    *output = prepared;
+    Ok(())
+}
+
+#[inline]
+fn round_requests(
+    requests: &[PointRequest; LANES],
+) -> (Simd<i64, LANES>, core::simd::Mask<i64, LANES>) {
+    let values = Simd::from_array(requests.map(|request| request.value));
+    let scales = Simd::from_array(requests.map(|request| request.quantization.scale()));
+    round_block(values * scales, None)
+}
+
+#[inline]
+fn patch_uncertified<T>(
+    requests: &[PointRequest; LANES],
+    certified: core::simd::Mask<i64, LANES>,
+    out: &mut [T; LANES],
+    exact: impl Fn(PointRequest) -> Result<T, QuantizeError>,
+) -> Result<(), QuantizeError> {
     let failures = !certified;
     if failures.any() {
         let mut mask = failures.to_bitmask();
         while mask != 0 {
             let i = mask.trailing_zeros() as usize;
-            buckets[i] = requests[i].resolve_exact()?;
+            out[i] = exact(requests[i])?;
             mask &= mask - 1;
         }
     }
-    *output = buckets;
     Ok(())
 }
 
@@ -281,6 +418,93 @@ mod tests {
                     result?;
                 }
                 assert_eq!(actual, expected, "{requests:?}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn compiled_points_preserve_exact_hysteresis_at_all_delivery_buckets()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut random = 0x18c3_569f_ab37_854d;
+        for places in 0..=Quantization::MAX_DECIMAL_PLACES {
+            for width in [0, 1, 2, 1024, u32::MAX] {
+                let q = Quantization::new(places, width)?;
+                for round in 0..256_u32 {
+                    let r = next(&mut random);
+                    let integer = i32::try_from(r & 0x7fff_ffff)?;
+                    let center = f64::from(integer) * if round & 1 == 0 { 1.0 } else { -1.0 };
+                    let boundary = (center + 0.5) / q.scale();
+                    let values = [
+                        0.5,
+                        -0.5,
+                        boundary,
+                        boundary.next_up(),
+                        boundary.next_down(),
+                        f64::from_bits(r),
+                        f64::from_bits(1),
+                        LIMIT / q.scale(),
+                        -9_223_372_036_854_775_808.0 / q.scale(),
+                    ];
+                    let mut requests = values.map(|value| PointRequest {
+                        quantization: q,
+                        previous: None,
+                        value,
+                    });
+                    let mut first_error = None;
+                    for request in &requests {
+                        let exact = request.resolve_exact();
+                        let prepared = request.prepare();
+                        match exact {
+                            Ok(bucket) => {
+                                let prepared = prepared?;
+                                let raw = bucket.raw();
+                                let w = i64::from(width);
+                                for previous in [
+                                    i64::MIN,
+                                    i64::MAX,
+                                    raw,
+                                    raw.saturating_sub(w),
+                                    raw.saturating_add(w),
+                                    raw.saturating_sub(w).saturating_sub(1),
+                                    raw.saturating_add(w).saturating_add(1),
+                                ]
+                                .map(Bucket::new)
+                                {
+                                    let reference = q.resolve_exact(
+                                        Some(previous),
+                                        Estimate::point(request.value),
+                                    )?;
+                                    assert_eq!(
+                                        prepared.resolve(previous, width),
+                                        reference,
+                                        "{q:?} {previous:?} {request:?}"
+                                    );
+                                }
+                            }
+                            Err(error) => {
+                                assert_eq!(prepared, Err(error.clone()));
+                                first_error.get_or_insert(error);
+                            }
+                        }
+                    }
+                    let mut output = [PreparedPoint::Interior(Bucket::new(0)); 9];
+                    let result = PointRequest::prepare_batch(&requests, &mut output);
+                    if let Some(error) = first_error {
+                        assert_eq!(result, Err(error));
+                        for request in &mut requests {
+                            if request.prepare().is_err() {
+                                request.value = 0.0;
+                            }
+                        }
+                        PointRequest::prepare_batch(&requests, &mut output)?;
+                    } else {
+                        result?;
+                    }
+                    for (&request, prepared) in requests.iter().zip(output) {
+                        assert_eq!(prepared, request.prepare()?);
+                    }
+                }
             }
         }
         Ok(())

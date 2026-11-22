@@ -1,12 +1,43 @@
 //! Validation and atomic staging of independent numeric and atom writes.
 use super::read_set::{EpochMarks, ReadTracker};
 use super::{CanonicalValue, Graph, NodeState, RuntimeError, StateWrite};
-use quiescence_core::{Bucket, NodeId, PointRequest, Quantization};
+use quiescence_core::{Bucket, NodeId, PointRequest, PreparedPoint, Quantization};
 
 #[derive(Clone, Copy)]
 pub struct ResolvedWrite {
     node: NodeId,
     next: CanonicalValue,
+}
+
+/// A validated write whose point rounding is independent of delivery time.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdmittedWrite {
+    Interior { node: NodeId, bucket: Bucket },
+    Midpoint { node: NodeId, bucket: Bucket },
+    Atom { node: NodeId, next: u64 },
+}
+
+impl AdmittedWrite {
+    const fn numeric(node: NodeId, point: PreparedPoint) -> Self {
+        match point {
+            PreparedPoint::Interior(bucket) => Self::Interior { node, bucket },
+            PreparedPoint::Midpoint(bucket) => Self::Midpoint { node, bucket },
+        }
+    }
+
+    fn deliver(self, graph: &mut Graph) -> Result<(), RuntimeError> {
+        let (node, point) = match self {
+            Self::Atom { node, next } => return graph.commit(node, CanonicalValue::Atom(next)),
+            Self::Interior { node, bucket } => (node, PreparedPoint::Interior(bucket)),
+            Self::Midpoint { node, bucket } => (node, PreparedPoint::Midpoint(bucket)),
+        };
+        // The target's existence, write role and policy are fixed since admission.
+        let NodeState::Input(cell) = graph.values[node.index()] else {
+            return Err(RuntimeError::NotAnInput(node));
+        };
+        let bucket = point.resolve(cell.bucket, cell.quantization.hysteresis_lsd());
+        graph.commit(node, CanonicalValue::Numeric(bucket))
+    }
 }
 
 enum ValidatedWrite {
@@ -32,6 +63,20 @@ impl ValidatedWrite {
             }
         };
         Ok(Some(ResolvedWrite { node, next }))
+    }
+}
+
+enum WriteRun<'a> {
+    Single(NodeId, ValidatedWrite),
+    Points(&'a [NodeId], &'a [PointRequest]),
+}
+
+impl ValidatedWrite {
+    fn admit(self, node: NodeId) -> Result<AdmittedWrite, RuntimeError> {
+        Ok(match self {
+            Self::Numeric(request) => AdmittedWrite::numeric(node, request.prepare()?),
+            Self::Atom { next, .. } => AdmittedWrite::Atom { node, next },
+        })
     }
 }
 
@@ -80,22 +125,64 @@ impl Graph {
         Ok(validated)
     }
 
+    fn validate_single_write(
+        nodes: &[NodeState],
+        write: StateWrite,
+    ) -> Result<(NodeId, ValidatedWrite), RuntimeError> {
+        let id = write.node();
+        let node = nodes.get(id.index()).ok_or(RuntimeError::UnknownNode(id))?;
+        Ok((id, Self::validate_write(node, write)?))
+    }
+
     fn resolve_single_write(
         nodes: &[NodeState],
         write: StateWrite,
     ) -> Result<Option<ResolvedWrite>, RuntimeError> {
-        let id = write.node();
-        let node = nodes.get(id.index()).ok_or(RuntimeError::UnknownNode(id))?;
-        Self::validate_write(node, write)?.resolve(id)
+        let (node, validated) = Self::validate_single_write(nodes, write)?;
+        validated.resolve(node)
     }
 
-    pub(super) fn validate_state_write_batch(
+    pub(super) fn admit_state_write(
+        &self,
+        write: StateWrite,
+    ) -> Result<AdmittedWrite, RuntimeError> {
+        let (node, validated) = Self::validate_single_write(&self.values, write)?;
+        validated.admit(node)
+    }
+
+    pub(super) fn admit_state_batch(
         &mut self,
         writes: &[StateWrite],
+    ) -> Result<Vec<AdmittedWrite>, RuntimeError> {
+        let mut admitted = Vec::with_capacity(writes.len());
+        Self::visit_validated_writes(&self.values, &mut self.reads, writes, |run| {
+            match run {
+                WriteRun::Single(node, write) => admitted.push(write.admit(node)?),
+                WriteRun::Points(nodes, requests) => {
+                    let mut points = [PreparedPoint::Interior(Bucket::new(0)); 8];
+                    let output = &mut points[..requests.len()];
+                    PointRequest::prepare_batch(requests, output)?;
+                    admitted.extend(
+                        nodes
+                            .iter()
+                            .copied()
+                            .zip(output.iter().copied())
+                            .map(|(node, point)| AdmittedWrite::numeric(node, point)),
+                    );
+                }
+            }
+            Ok(())
+        })?;
+        Ok(admitted)
+    }
+
+    pub(super) fn deliver_admitted_writes(
+        &mut self,
+        writes: &[AdmittedWrite],
     ) -> Result<(), RuntimeError> {
-        // Point estimates have state-independent representability. Reject
-        // invalid values at admission, but resolve hysteresis again at delivery.
-        Self::visit_resolved_writes(&self.values, &mut self.reads, writes, |_| {})
+        // Admission proved every target and value valid, with no duplicates.
+        // Apply independent writes in original order; evaluators run afterward.
+        writes.iter().try_for_each(|write| write.deliver(self))
     }
 
     pub(super) fn apply_state_writes(&mut self, writes: &[StateWrite]) -> Result<(), RuntimeError> {
@@ -128,31 +215,48 @@ impl Graph {
         Ok(resolved)
     }
 
-    // Validation and resolution share the same ordered traversal at admission
-    // and delivery. Staging keeps graph commits atomic even with mixed writes.
     fn visit_resolved_writes(
         graph_nodes: &[NodeState],
         tracker: &mut ReadTracker,
         writes: &[StateWrite],
         mut visit: impl FnMut(ResolvedWrite),
     ) -> Result<(), RuntimeError> {
+        Self::visit_validated_writes(graph_nodes, tracker, writes, |run| {
+            match run {
+                WriteRun::Single(node, write) => {
+                    if let Some(resolved) = write.resolve(node)? {
+                        visit(resolved);
+                    }
+                }
+                WriteRun::Points(nodes, requests) => {
+                    Self::visit_point_run(requests, nodes, &mut visit)?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    // Admission and immediate resolution share the same ordered validation.
+    // A numeric run is flushed before a later validation error or an atom.
+    fn visit_validated_writes(
+        graph_nodes: &[NodeState],
+        tracker: &mut ReadTracker,
+        writes: &[StateWrite],
+        mut visit: impl FnMut(WriteRun<'_>) -> Result<(), RuntimeError>,
+    ) -> Result<(), RuntimeError> {
         const BLOCK: usize = 8;
         if writes.is_empty() {
             return Ok(());
         }
         if let [write] = writes {
-            if let Some(resolved) = Self::resolve_single_write(graph_nodes, *write)? {
-                visit(resolved);
-            }
-            return Ok(());
+            let (node, write) = Self::validate_single_write(graph_nodes, *write)?;
+            return visit(WriteRun::Single(node, write));
         }
         let validated = Self::validated_writes(graph_nodes, tracker.begin_membership(), writes);
         if writes.len() < BLOCK {
             for write in validated {
                 let (node, write) = write?;
-                if let Some(write) = write.resolve(node)? {
-                    visit(write);
-                }
+                visit(WriteRun::Single(node, write))?;
             }
             return Ok(());
         }
@@ -167,7 +271,7 @@ impl Graph {
             let (node, write) = match write {
                 Ok(write) => write,
                 Err(error) => {
-                    Self::visit_point_run(&points[..count], &nodes[..count], &mut visit)?;
+                    visit(WriteRun::Points(&nodes[..count], &points[..count]))?;
                     return Err(error);
                 }
             };
@@ -177,20 +281,18 @@ impl Graph {
                     nodes[count] = node;
                     count += 1;
                     if count == BLOCK {
-                        Self::visit_point_run(&points, &nodes, &mut visit)?;
+                        visit(WriteRun::Points(&nodes, &points))?;
                         count = 0;
                     }
                 }
                 atom @ ValidatedWrite::Atom { .. } => {
-                    Self::visit_point_run(&points[..count], &nodes[..count], &mut visit)?;
+                    visit(WriteRun::Points(&nodes[..count], &points[..count]))?;
                     count = 0;
-                    if let Some(write) = atom.resolve(node)? {
-                        visit(write);
-                    }
+                    visit(WriteRun::Single(node, atom))?;
                 }
             }
         }
-        Self::visit_point_run(&points[..count], &nodes[..count], &mut visit)
+        visit(WriteRun::Points(&nodes[..count], &points[..count]))
     }
 
     #[inline]

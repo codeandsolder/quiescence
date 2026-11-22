@@ -1,5 +1,5 @@
 use super::node_storage::DerivedId;
-use super::{StateWrite, WindowRecord};
+use super::{AdmittedWrite, WindowRecord};
 use quiescence_core::{Bucket, ReactionId, SimTime};
 use std::{
     cmp::Ordering,
@@ -7,25 +7,25 @@ use std::{
 };
 /// Most events carry only a small payload. Keep empty and singleton
 /// reaction forecasts inline; variable-sized effects own their storage.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DeferredEffects {
     None,
-    Write(StateWrite),
+    Write(AdmittedWrite),
     Record(WindowRecord),
-    Writes(Box<[StateWrite]>),
+    Writes(Box<[AdmittedWrite]>),
     Records(Box<[WindowRecord]>),
-    Pair(Box<(StateWrite, WindowRecord)>),
+    Pair(Box<(AdmittedWrite, WindowRecord)>),
     Both(Box<CombinedEffects>),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CombinedEffects {
-    writes: Vec<StateWrite>,
+    writes: Vec<AdmittedWrite>,
     records: Vec<WindowRecord>,
 }
 
 impl DeferredEffects {
-    pub(super) fn new(writes: Vec<StateWrite>, records: Vec<WindowRecord>) -> Self {
+    pub(super) fn new(writes: Vec<AdmittedWrite>, records: Vec<WindowRecord>) -> Self {
         match (writes.as_slice(), records.as_slice()) {
             ([], []) => Self::None,
             ([write], []) => Self::Write(*write),
@@ -37,7 +37,7 @@ impl DeferredEffects {
         }
     }
 
-    pub(super) fn parts(&self) -> (&[StateWrite], &[WindowRecord]) {
+    pub(super) fn parts(&self) -> (&[AdmittedWrite], &[WindowRecord]) {
         match self {
             Self::None => (&[], &[]),
             Self::Write(write) => (std::slice::from_ref(write), &[]),
@@ -50,13 +50,13 @@ impl DeferredEffects {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EventKind {
     SetState {
-        write: StateWrite,
+        write: AdmittedWrite,
     },
     SetStateBatch {
-        writes: Vec<StateWrite>,
+        writes: Vec<AdmittedWrite>,
     },
     Commit {
         owner: DerivedId,
@@ -106,7 +106,7 @@ impl EventKind {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScheduledEvent {
     pub(super) at: SimTime,
     pub(super) priority: i32,
@@ -119,7 +119,7 @@ impl ScheduledEvent {
     }
 }
 
-/// Ordering ignores payloads, including NaN numeric writes; equality
+/// Ordering ignores payloads; equality
 /// remains reflexive because heap identity is its assigned scheduling key.
 #[derive(Debug)]
 struct HeapEvent(ScheduledEvent);
@@ -338,7 +338,6 @@ impl EventQueue {
 
 #[cfg(test)]
 mod tests {
-    use crate::StateWrite;
     use quiescence_core::SimTime;
     fn token_event(at: SimTime, priority: i32, token: u64) -> super::ScheduledEvent {
         super::ScheduledEvent {
@@ -497,14 +496,17 @@ mod tests {
     }
 
     #[test]
-    fn sparse_heap_ordering_is_reflexive_for_nan_payloads() {
+    fn sparse_heap_ordering_is_reflexive_for_admitted_payloads() {
         let node = quiescence_core::NodeId::from_index(0);
         let event = super::HeapEvent(super::ScheduledEvent {
             at: SimTime::ZERO,
             priority: 0,
             sequence: 0,
             kind: super::EventKind::SetState {
-                write: StateWrite::new(node, f64::NAN),
+                write: super::AdmittedWrite::Atom {
+                    node,
+                    next: u64::MAX,
+                },
             },
         });
         assert_eq!(event, event);
@@ -563,7 +565,10 @@ mod effect_tests {
         for write_count in 0..=5_u32 {
             for record_count in 0..=5_u32 {
                 let writes: Vec<_> = (0..write_count)
-                    .map(|id| StateWrite::atom(NodeId::from_index(id), u64::from(id) * 2))
+                    .map(|id| AdmittedWrite::Atom {
+                        node: NodeId::from_index(id),
+                        next: u64::from(id) * 2,
+                    })
                     .collect();
                 let records: Vec<_> = (0..record_count)
                     .map(|id| WindowRecord::new(HistoryId::from_index(id % 2), u64::from(id % 3)))

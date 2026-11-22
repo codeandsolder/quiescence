@@ -60,7 +60,7 @@ use event_queue::{DeferredEffects, EventKind, EventQueue, ForecastOwner, Schedul
 use history::EventWindow;
 use node_storage::{DerivedId, DerivedNode, NodeLinks, NodeState, NumericCell};
 use read_set::{Dependencies, ReadTracker};
-use write_batch::ResolvedWrite;
+use write_batch::{AdmittedWrite, ResolvedWrite};
 
 type EvalFn =
     Box<dyn for<'a> Fn(&EvalContext<'a>) -> Result<EvalOutput, EvalError> + Send + Sync + 'static>;
@@ -352,11 +352,8 @@ impl Graph {
 
         let mut result = InteractionImport::default();
         for interaction in interactions {
-            match self.validate_external_interaction(&interaction) {
-                Ok(()) => {
-                    self.enqueue_external_interaction(interaction);
-                    result.accepted += 1;
-                }
+            match self.admit_external_interaction(&interaction) {
+                Ok(()) => result.accepted += 1,
                 Err(error) => result
                     .rejected
                     .push(RejectedInteraction { interaction, error }),
@@ -689,7 +686,7 @@ impl Graph {
         }
     }
 
-    fn validate_external_interaction(
+    fn admit_external_interaction(
         &mut self,
         interaction: &ExternalInteraction,
     ) -> Result<(), RuntimeError> {
@@ -699,41 +696,41 @@ impl Graph {
         };
         let at = moment.resolve(self.now);
         self.validate_time(at)?;
-        match interaction {
-            ExternalInteraction::StateBatch { writes, .. } => {
-                self.validate_state_write_batch(writes)
-            }
-            ExternalInteraction::Callback { reaction, .. } => {
-                self.reactions
-                    .get(reaction.index())
-                    .ok_or(RuntimeError::UnknownReaction(*reaction))?;
-                Ok(())
-            }
-        }
-    }
-
-    fn enqueue_external_interaction(&mut self, interaction: ExternalInteraction) {
-        match interaction {
+        let (priority, kind) = match interaction {
             ExternalInteraction::StateBatch {
-                moment,
-                priority,
-                writes,
-            } => self.push_event_with_priority(
-                moment.resolve(self.now),
-                priority,
-                EventKind::SetStateBatch { writes },
-            ),
+                priority, writes, ..
+            } => {
+                let kind = if let [write] = writes.as_slice() {
+                    EventKind::SetState {
+                        write: self.admit_state_write(*write)?,
+                    }
+                } else {
+                    EventKind::SetStateBatch {
+                        writes: self.admit_state_batch(writes)?,
+                    }
+                };
+                (*priority, kind)
+            }
             ExternalInteraction::Callback {
-                moment,
                 priority,
                 reaction,
                 token,
-            } => self.push_event_with_priority(
-                moment.resolve(self.now),
-                priority,
-                EventKind::ExternalReaction { reaction, token },
-            ),
-        }
+                ..
+            } => {
+                self.reactions
+                    .get(reaction.index())
+                    .ok_or(RuntimeError::UnknownReaction(*reaction))?;
+                (
+                    *priority,
+                    EventKind::ExternalReaction {
+                        reaction: *reaction,
+                        token: *token,
+                    },
+                )
+            }
+        };
+        self.push_event_with_priority(at, priority, kind);
+        Ok(())
     }
 
     /// # Errors
@@ -789,7 +786,7 @@ impl Graph {
     /// # Errors
     /// Rejects invalid input targets, non-finite numeric values, and past timestamps.
     pub fn schedule_write(&mut self, at: SimTime, write: StateWrite) -> Result<(), RuntimeError> {
-        self.validate_state_write_batch(&[write])?;
+        let write = self.admit_state_write(write)?;
         self.validate_time(at)?;
         self.push_event(at, EventKind::SetState { write });
         Ok(())
@@ -1183,11 +1180,11 @@ impl Graph {
                 window_records: transition.window_records,
             })
         } else {
-            // Delayed writes resolve against canonical state at delivery.
-            self.validate_state_write_batch(&transition.writes)?;
+            // Compile exact point rounding now; hysteresis uses the later state.
+            let writes = self.admit_state_batch(&transition.writes)?;
             Ok(PreparedTransition::Delayed {
                 at: self.event_time(transition.after)?,
-                effects: DeferredEffects::new(transition.writes, transition.window_records),
+                effects: DeferredEffects::new(writes, transition.window_records),
             })
         }
     }
@@ -1216,8 +1213,8 @@ impl Graph {
 
     fn apply_event(&mut self, event: &EventKind) -> Result<(), RuntimeError> {
         match event {
-            EventKind::SetState { write } => self.apply_state_writes(&[*write]),
-            EventKind::SetStateBatch { writes } => self.apply_state_writes(writes),
+            EventKind::SetState { write } => self.deliver_admitted_writes(&[*write]),
+            EventKind::SetStateBatch { writes } => self.deliver_admitted_writes(writes),
             EventKind::Commit {
                 owner,
                 generation,
@@ -1279,11 +1276,11 @@ impl Graph {
 
     fn apply_reaction_effects(
         &mut self,
-        writes: &[StateWrite],
+        writes: &[AdmittedWrite],
         window_records: &[WindowRecord],
     ) -> Result<(), RuntimeError> {
-        self.validate_window_records(window_records)?;
-        self.apply_state_writes(writes)?;
+        // History identities and state-write policies cannot change after admission.
+        self.deliver_admitted_writes(writes)?;
         self.record_windows(window_records);
         Ok(())
     }
