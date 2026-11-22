@@ -167,7 +167,7 @@ impl From<QuantizeError> for RuntimeError {
 // Commit paths have already validated identifiers and values. Keep their
 // remaining invariant errors small and allocation-free inside batch loops.
 #[derive(Clone, Copy, Debug)]
-pub(super) enum CommitError {
+pub enum CommitError {
     ExpectedNumeric(NodeId),
     ExpectedAtom(NodeId),
     NotAnInput(NodeId),
