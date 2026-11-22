@@ -42,6 +42,7 @@ mod event_queue;
 mod history;
 mod ingress;
 mod output;
+mod read_set;
 mod write_batch;
 
 pub use error::{EvalError, InteractionIngressError, RuntimeError};
@@ -57,9 +58,9 @@ pub use output::{
 use edge_set::EdgeSet;
 use event_queue::{EventKind, EventQueue, ScheduledEvent};
 use history::EventWindow;
+use read_set::{Dependencies, ReadTracker};
 use write_batch::ResolvedWrite;
 
-type Dependencies = EdgeSet<NodeId, 4>;
 type Dependents = EdgeSet<WorkId, 3>;
 
 type EvalFn =
@@ -112,8 +113,7 @@ pub struct EvalContext<'a> {
     now: SimTime,
     nodes: &'a [Node],
     windows: &'a [EventWindow],
-    reads: RefCell<Dependencies>,
-    track_dependencies: bool,
+    reads: Option<RefCell<&'a mut ReadTracker>>,
     invocation: Invocation,
 }
 impl EvalContext<'_> {
@@ -188,14 +188,10 @@ impl EvalContext<'_> {
             .nodes
             .get(id.index())
             .ok_or(EvalError::UnknownNode(id))?;
-        if self.track_dependencies {
-            self.reads.borrow_mut().insert(id);
+        if let Some(reads) = &self.reads {
+            reads.borrow_mut().record(id);
         }
         Ok(&node.state)
-    }
-
-    fn into_dependencies(self) -> Dependencies {
-        self.reads.into_inner()
     }
 }
 
@@ -317,6 +313,7 @@ pub struct Graph {
     reactions: Vec<Reaction>,
     windows: Vec<EventWindow>,
     dirty: DirtyQueue,
+    reads: ReadTracker,
     events: EventQueue,
     pending_scheduled_reactions: BTreeSet<(ReactionId, u64)>,
     transitions: Vec<TransitionRecord>,
@@ -332,6 +329,7 @@ impl Graph {
             reactions: Vec::new(),
             windows: Vec::new(),
             dirty: DirtyQueue::new(),
+            reads: ReadTracker::new(),
             events: EventQueue::new(),
             pending_scheduled_reactions: BTreeSet::new(),
             transitions: Vec::new(),
@@ -562,6 +560,7 @@ impl Graph {
             generation: 0,
         });
         self.dirty.nodes.push(false);
+        self.reads.register_node();
         if derived {
             self.dirty.mark(WorkId::Node(id));
         }
@@ -980,12 +979,12 @@ impl Graph {
         let evaluator = evaluator
             .as_ref()
             .ok_or(RuntimeError::MissingEvaluator(id))?;
+        self.reads.begin();
         let context = EvalContext {
             now: self.now,
             nodes: &self.nodes,
             windows: &self.windows,
-            reads: RefCell::new(Dependencies::new()),
-            track_dependencies: true,
+            reads: Some(RefCell::new(&mut self.reads)),
             invocation: Invocation::Reactive,
         };
         let output =
@@ -1005,8 +1004,12 @@ impl Graph {
             .generation
             .checked_add(1)
             .ok_or(RuntimeError::GenerationExhausted(WorkId::Node(id)))?;
-        let deps = context.into_dependencies();
-        self.update_dependencies(WorkId::Node(id), deps);
+        Self::update_dependencies(
+            &mut self.nodes,
+            &mut self.reactions,
+            WorkId::Node(id),
+            self.reads.finish(),
+        );
         self.nodes[id.index()].generation = generation;
 
         if let Some(at) = validity_at {
@@ -1047,23 +1050,21 @@ impl Graph {
                 reaction.pending_invocation,
             )
         };
+        let reads = track_dependencies.then(|| {
+            self.reads.begin();
+            RefCell::new(&mut self.reads)
+        });
         let context = EvalContext {
             now: self.now,
             nodes: &self.nodes,
             windows: &self.windows,
-            reads: RefCell::new(Dependencies::new()),
-            track_dependencies,
+            reads,
             invocation,
         };
         let output = evaluator(&context).map_err(|source| RuntimeError::ReactionEvaluation {
             reaction: id,
             source,
         })?;
-        let dependencies = if track_dependencies {
-            Some(context.into_dependencies())
-        } else {
-            None
-        };
         let ReactionOutput {
             transition,
             callbacks,
@@ -1079,8 +1080,13 @@ impl Graph {
             .generation
             .checked_add(1)
             .ok_or(RuntimeError::GenerationExhausted(WorkId::Reaction(id)))?;
-        if let Some(deps) = dependencies {
-            self.update_dependencies(WorkId::Reaction(id), deps);
+        if track_dependencies {
+            Self::update_dependencies(
+                &mut self.nodes,
+                &mut self.reactions,
+                WorkId::Reaction(id),
+                self.reads.finish(),
+            );
         }
         let reaction = self
             .reactions
@@ -1170,29 +1176,30 @@ impl Graph {
         }
     }
 
-    fn update_dependencies(&mut self, dependent: WorkId, new: Dependencies) {
-        // EvalContext records IDs only after checking them against this graph.
-        // Nodes cannot be removed or replaced while an evaluator is running.
+    fn update_dependencies(
+        nodes: &mut [Node],
+        reactions: &mut [Reaction],
+        dependent: WorkId,
+        new: &[NodeId],
+    ) {
+        // Only existent IDs can be recorded; graph structure is immutable
+        // throughout a single evaluator invocation.
         let stored = match dependent {
-            WorkId::Node(id) => &mut self.nodes[id.index()].dependencies,
-            WorkId::Reaction(id) => &mut self.reactions[id.index()].dependencies,
+            WorkId::Node(id) => &mut nodes[id.index()].dependencies,
+            WorkId::Reaction(id) => &mut reactions[id.index()].dependencies,
         };
-        if stored.same_members(&new) {
+        if stored.as_slice() == new {
             return;
         }
-        let old = std::mem::take(stored);
-        old.changes(&new, |id, added| {
-            let reverse = &mut self.nodes[id.index()].dependents;
+        let old = std::mem::replace(stored, Dependencies::from_sorted(new));
+        read_set::changes(old.as_slice(), new, |id, added| {
+            let reverse = &mut nodes[id.index()].dependents;
             if added {
                 reverse.insert(dependent);
             } else {
                 reverse.remove(&dependent);
             }
         });
-        match dependent {
-            WorkId::Node(id) => self.nodes[id.index()].dependencies = new,
-            WorkId::Reaction(id) => self.reactions[id.index()].dependencies = new,
-        }
     }
 
     fn apply_event(&mut self, event: &EventKind) -> Result<(), RuntimeError> {

@@ -83,25 +83,25 @@ fn failed_reaction_keeps_previous_subscriptions_until_success()
     })?;
     g.settle()?;
     let before = &g.reactions[reaction.index()].dependencies;
-    assert!(before.contains(&gate));
-    assert!(before.contains(&previous));
-    assert!(!before.contains(&replacement));
+    assert!(before.contains(gate));
+    assert!(before.contains(previous));
+    assert!(!before.contains(replacement));
 
     assert!(matches!(
         g.set_input_now(gate, 1.0),
         Err(RuntimeError::UnknownReaction(_))
     ));
     let still_previous = &g.reactions[reaction.index()].dependencies;
-    assert!(still_previous.contains(&previous));
-    assert!(!still_previous.contains(&replacement));
+    assert!(still_previous.contains(previous));
+    assert!(!still_previous.contains(replacement));
     assert!(!g.is_quiescent());
 
     retry_allowed.store(1, Ordering::Relaxed);
     g.settle()?;
     let after = &g.reactions[reaction.index()].dependencies;
-    assert!(after.contains(&gate));
-    assert!(!after.contains(&previous));
-    assert!(after.contains(&replacement));
+    assert!(after.contains(gate));
+    assert!(!after.contains(previous));
+    assert!(after.contains(replacement));
     Ok(())
 }
 

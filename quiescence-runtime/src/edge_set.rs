@@ -102,51 +102,6 @@ impl<T: Copy + Ord, const N: usize> EdgeSet<T, N> {
             }
         }
     }
-
-    // Report symmetric changes in sorted order without allocating or
-    // repeatedly searching one set for each member of the other.
-    pub(super) fn changes(&self, new: &Self, mut changed: impl FnMut(T, bool)) {
-        use std::cmp::Ordering;
-        let mut old = self.iter().peekable();
-        let mut new = new.iter().peekable();
-        loop {
-            match (old.peek(), new.peek()) {
-                (Some(&&a), Some(&&b)) => match a.cmp(&b) {
-                    Ordering::Less => {
-                        changed(a, false);
-                        old.next();
-                    }
-                    Ordering::Greater => {
-                        changed(b, true);
-                        new.next();
-                    }
-                    Ordering::Equal => {
-                        old.next();
-                        new.next();
-                    }
-                },
-                (None, _) => {
-                    new.for_each(|&value| changed(value, true));
-                    break;
-                }
-                (_, None) => {
-                    old.for_each(|&value| changed(value, false));
-                    break;
-                }
-            }
-        }
-    }
-
-    pub(super) fn same_members(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Empty, Self::Empty) => true,
-            (Self::Inline { len: a, items: x }, Self::Inline { len: b, items: y }) => {
-                x[..*a] == y[..*b]
-            }
-            (Self::Tree(a), Self::Tree(b)) => a == b,
-            _ => self.iter().eq(other.iter()),
-        }
-    }
 }
 
 pub enum Iter<'a, T> {
@@ -203,32 +158,5 @@ mod tests {
             set.remove(&key);
         }
         assert!(matches!(set, EdgeSet::Empty));
-    }
-
-    #[test]
-    fn differences_match_two_reference_sets() {
-        for old_size in 0..12 {
-            for new_size in 0..12 {
-                let mut old = EdgeSet::<u32, 4>::new();
-                let mut new = EdgeSet::<u32, 4>::new();
-                let a: BTreeSet<_> = (0..old_size).map(|i| i * 2).collect();
-                let b: BTreeSet<_> = (0..new_size).map(|i| i * 3).collect();
-                for &value in &a {
-                    old.insert(value);
-                }
-                for &value in &b {
-                    new.insert(value);
-                }
-                let mut actual = Vec::new();
-                old.changes(&new, |value, add| actual.push((value, add)));
-                let mut expected: Vec<_> = a
-                    .symmetric_difference(&b)
-                    .map(|&value| (value, b.contains(&value)))
-                    .collect();
-                expected.sort_unstable();
-                assert_eq!(actual, expected);
-                assert_eq!(old.same_members(&new), a == b);
-            }
-        }
     }
 }
