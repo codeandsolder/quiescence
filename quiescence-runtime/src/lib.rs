@@ -245,6 +245,7 @@ struct Node {
     dependencies: Dependencies,
     dependents: ReverseEdges,
     generation: u64,
+    pending_forecasts: u8,
 }
 
 struct Reaction {
@@ -252,6 +253,7 @@ struct Reaction {
     evaluator: ReactionFn,
     dependencies: Dependencies,
     generation: u64,
+    pending_forecasts: u8,
     track_dependencies: bool,
     pending_invocation: Invocation,
 }
@@ -313,6 +315,7 @@ pub struct Graph {
     dirty: DirtyQueue,
     reads: ReadTracker,
     events: EventQueue,
+    stale_forecasts: usize,
     pending_scheduled_reactions: BTreeSet<(ReactionId, u64)>,
     transitions: Vec<TransitionRecord>,
 }
@@ -329,6 +332,7 @@ impl Graph {
             dirty: DirtyQueue::new(),
             reads: ReadTracker::new(),
             events: EventQueue::new(),
+            stale_forecasts: 0,
             pending_scheduled_reactions: BTreeSet::new(),
             transitions: Vec::new(),
         }
@@ -556,6 +560,7 @@ impl Graph {
             dependencies: Dependencies::new(),
             dependents: ReverseEdges::new(),
             generation: 0,
+            pending_forecasts: 0,
         });
         self.dirty.nodes.push(false);
         self.reads.register_node();
@@ -638,6 +643,7 @@ impl Graph {
             evaluator,
             dependencies: Dependencies::new(),
             generation: 0,
+            pending_forecasts: 0,
             track_dependencies,
             pending_invocation: Invocation::Reactive,
         });
@@ -897,6 +903,12 @@ impl Graph {
     }
 
     fn settle_with_budget(&mut self, steps: &mut usize) -> Result<(), RuntimeError> {
+        let result = self.settle_dirty(steps);
+        self.prune_forecasts();
+        result
+    }
+
+    fn settle_dirty(&mut self, steps: &mut usize) -> Result<(), RuntimeError> {
         while let Some(&work) = self.dirty.pending.front() {
             if *steps >= self.config.same_time_microstep_budget {
                 return Err(RuntimeError::CalculationInstability {
@@ -915,6 +927,9 @@ impl Graph {
                 self.dirty.retry(work);
                 return Err(error);
             }
+            if self.should_compact_forecasts() {
+                self.prune_forecasts();
+            }
         }
         Ok(())
     }
@@ -925,12 +940,12 @@ impl Graph {
         self.validate_time(target)?;
         let mut steps = 0;
         self.settle_with_budget(&mut steps)?;
-        while self.events.peek().is_some_and(|e| e.at <= target) {
-            let event_time = self
-                .events
-                .peek()
-                .ok_or(RuntimeError::CorruptEventQueue)?
-                .at;
+        while let Some(event_time) = self
+            .events
+            .peek()
+            .map(|event| event.at)
+            .filter(|&at| at <= target)
+        {
             if event_time > self.now {
                 steps = 0;
             }
@@ -947,6 +962,9 @@ impl Graph {
             if let Err(error) = self.apply_event(&event.kind) {
                 self.events.restore_front(event);
                 return Err(error);
+            }
+            if let Some((work, _)) = event.kind.forecast() {
+                *self.pending_forecasts(work) -= 1;
             }
             self.settle_with_budget(&mut steps)?;
         }
@@ -1008,7 +1026,10 @@ impl Graph {
             WorkId::Node(id),
             self.reads.finish(),
         );
-        self.nodes[id.index()].generation = generation;
+        let node = &mut self.nodes[id.index()];
+        self.stale_forecasts += usize::from(node.pending_forecasts);
+        node.pending_forecasts = 0;
+        node.generation = generation;
 
         if let Some(at) = validity_at {
             self.push_event(
@@ -1091,6 +1112,8 @@ impl Graph {
             .get_mut(id.index())
             .ok_or(RuntimeError::UnknownReaction(id))?;
         reaction.pending_invocation = Invocation::Reactive;
+        self.stale_forecasts += usize::from(reaction.pending_forecasts);
+        reaction.pending_forecasts = 0;
         reaction.generation = generation;
 
         match prepared {
@@ -1343,7 +1366,55 @@ impl Graph {
         self.push_event_with_priority(at, 0, kind);
     }
 
+    fn pending_forecasts(&mut self, work: WorkId) -> &mut u8 {
+        match work {
+            WorkId::Node(id) => &mut self.nodes[id.index()].pending_forecasts,
+            WorkId::Reaction(id) => &mut self.reactions[id.index()].pending_forecasts,
+        }
+    }
+
+    /// Permit a bounded amount of obsolete work before a linear sweep. The
+    /// threshold amortizes the scan against the invalidations it removes.
+    const fn should_compact_forecasts(&self) -> bool {
+        const MIN_STALE: usize = 1024;
+        self.stale_forecasts >= MIN_STALE && self.stale_forecasts >= self.events.len() / 2
+    }
+
+    fn prune_forecasts(&mut self) {
+        if self.stale_forecasts == 0 {
+            return;
+        }
+        let compact = self.should_compact_forecasts();
+        let nodes = &self.nodes;
+        let reactions = &self.reactions;
+        let live = |kind: &EventKind| {
+            kind.forecast().is_none_or(|(work, generation)| {
+                let current = match work {
+                    WorkId::Node(id) => nodes[id.index()].generation,
+                    WorkId::Reaction(id) => reactions[id.index()].generation,
+                };
+                current == generation
+            })
+        };
+        if compact {
+            // A linear retain is cheaper than individually popping a large
+            // stale prefix, especially in dispersed heap mode.
+            self.events.retain(live);
+            self.stale_forecasts = 0;
+            return;
+        }
+        // Prune at exposed causal boundaries, so obsolete events never
+        // determine next_event_time or spend settlement microsteps.
+        while self.events.peek().is_some_and(|event| !live(&event.kind)) {
+            self.events.pop();
+            self.stale_forecasts -= 1;
+        }
+    }
+
     fn push_event_with_priority(&mut self, at: SimTime, priority: i32, kind: EventKind) {
+        if let Some((work, _)) = kind.forecast() {
+            *self.pending_forecasts(work) += 1;
+        }
         self.events.push(ScheduledEvent {
             at,
             priority,
