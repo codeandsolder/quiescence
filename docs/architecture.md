@@ -83,12 +83,12 @@ The invariant is only:
 
 ## Layer 4: temporal scheduling
 
-Ordinary events use an adaptive event queue. While there are at most 128 distinct
+Ordinary events use an adaptive event queue. Single-key workloads use a FIFO directly, reusing small buffers across drain cycles and releasing larger empty buffers. With two to 128 distinct
 `(simulation timestamp, priority)` keys, a sorted map holds one FIFO deque per
 key; this avoids one heap sift per callback in a dense same-time batch.
 Once the pending schedule has more distinct keys, it converts to a binary
-heap with a monotonically assigned sequence for FIFO ties. The heap resets to
-grouped mode after it drains. Sequence exhaustion triggers a stable reindexing
+heap with a monotonically assigned sequence for FIFO ties. The queue resets to
+single-key mode after it drains. Sequence exhaustion triggers a stable reindexing
 of pending events rather than allowing a wraparound to reorder callbacks.
 Forecast events share the ordinary causal queue. A successful reevaluation increments its generation and counts the outstanding predictions it invalidates. Obsolete head entries are discarded before the next public causal deadline is exposed; a linear compaction removes buried stale entries when at least 1,024 are stale and they account for at least half the queue. Failed delivery restores the original event position and does not decrement its owner’s live forecast count.
 
