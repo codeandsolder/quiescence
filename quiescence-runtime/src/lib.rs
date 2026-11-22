@@ -36,6 +36,7 @@ use std::{
     sync::Arc,
 };
 
+mod edge_set;
 mod error;
 mod event_queue;
 mod history;
@@ -53,9 +54,13 @@ pub use output::{
     ReactionOutput, ReactionTransition, ScheduledCallback, StateWrite, WindowRecord,
 };
 
+use edge_set::EdgeSet;
 use event_queue::{EventKind, EventQueue, ScheduledEvent};
 use history::EventWindow;
 use write_batch::ResolvedWrite;
+
+type Dependencies = EdgeSet<NodeId, 4>;
+type Dependents = EdgeSet<WorkId, 3>;
 
 type EvalFn =
     Box<dyn for<'a> Fn(&EvalContext<'a>) -> Result<EvalOutput, EvalError> + Send + Sync + 'static>;
@@ -107,7 +112,7 @@ pub struct EvalContext<'a> {
     now: SimTime,
     nodes: &'a [Node],
     windows: &'a [EventWindow],
-    reads: RefCell<BTreeSet<NodeId>>,
+    reads: RefCell<Dependencies>,
     track_dependencies: bool,
     invocation: Invocation,
 }
@@ -189,7 +194,7 @@ impl EvalContext<'_> {
         Ok(&node.state)
     }
 
-    fn into_dependencies(self) -> BTreeSet<NodeId> {
+    fn into_dependencies(self) -> Dependencies {
         self.reads.into_inner()
     }
 }
@@ -243,15 +248,15 @@ impl NodeState {
 struct Node {
     name: Arc<str>,
     state: NodeState,
-    dependencies: BTreeSet<NodeId>,
-    dependents: BTreeSet<WorkId>,
+    dependencies: Dependencies,
+    dependents: Dependents,
     generation: u64,
 }
 
 struct Reaction {
     name: String,
     evaluator: ReactionFn,
-    dependencies: BTreeSet<NodeId>,
+    dependencies: Dependencies,
     generation: u64,
     track_dependencies: bool,
     pending_invocation: Invocation,
@@ -552,8 +557,8 @@ impl Graph {
         self.nodes.push(Node {
             name: name.into(),
             state,
-            dependencies: BTreeSet::new(),
-            dependents: BTreeSet::new(),
+            dependencies: Dependencies::new(),
+            dependents: Dependents::new(),
             generation: 0,
         });
         self.dirty.nodes.push(false);
@@ -634,7 +639,7 @@ impl Graph {
         self.reactions.push(Reaction {
             name,
             evaluator,
-            dependencies: BTreeSet::new(),
+            dependencies: Dependencies::new(),
             generation: 0,
             track_dependencies,
             pending_invocation: Invocation::Reactive,
@@ -979,7 +984,7 @@ impl Graph {
             now: self.now,
             nodes: &self.nodes,
             windows: &self.windows,
-            reads: RefCell::new(BTreeSet::new()),
+            reads: RefCell::new(Dependencies::new()),
             track_dependencies: true,
             invocation: Invocation::Reactive,
         };
@@ -1001,7 +1006,7 @@ impl Graph {
             .checked_add(1)
             .ok_or(RuntimeError::GenerationExhausted(WorkId::Node(id)))?;
         let deps = context.into_dependencies();
-        self.update_dependencies(WorkId::Node(id), deps)?;
+        self.update_dependencies(WorkId::Node(id), deps);
         self.nodes[id.index()].generation = generation;
 
         if let Some(at) = validity_at {
@@ -1046,7 +1051,7 @@ impl Graph {
             now: self.now,
             nodes: &self.nodes,
             windows: &self.windows,
-            reads: RefCell::new(BTreeSet::new()),
+            reads: RefCell::new(Dependencies::new()),
             track_dependencies,
             invocation,
         };
@@ -1075,7 +1080,7 @@ impl Graph {
             .checked_add(1)
             .ok_or(RuntimeError::GenerationExhausted(WorkId::Reaction(id)))?;
         if let Some(deps) = dependencies {
-            self.update_dependencies(WorkId::Reaction(id), deps)?;
+            self.update_dependencies(WorkId::Reaction(id), deps);
         }
         let reaction = self
             .reactions
@@ -1165,41 +1170,29 @@ impl Graph {
         }
     }
 
-    fn update_dependencies(
-        &mut self,
-        dependent: WorkId,
-        new: BTreeSet<NodeId>,
-    ) -> Result<(), RuntimeError> {
-        for dep in &new {
-            self.node(*dep)?;
-        }
-        let old = match dependent {
-            WorkId::Node(id) => std::mem::take(
-                &mut self
-                    .nodes
-                    .get_mut(id.index())
-                    .ok_or(RuntimeError::UnknownNode(id))?
-                    .dependencies,
-            ),
-            WorkId::Reaction(id) => std::mem::take(
-                &mut self
-                    .reactions
-                    .get_mut(id.index())
-                    .ok_or(RuntimeError::UnknownReaction(id))?
-                    .dependencies,
-            ),
+    fn update_dependencies(&mut self, dependent: WorkId, new: Dependencies) {
+        // EvalContext records IDs only after checking them against this graph.
+        // Nodes cannot be removed or replaced while an evaluator is running.
+        let stored = match dependent {
+            WorkId::Node(id) => &mut self.nodes[id.index()].dependencies,
+            WorkId::Reaction(id) => &mut self.reactions[id.index()].dependencies,
         };
-        for dep in old.difference(&new).copied() {
-            self.nodes[dep.index()].dependents.remove(&dependent);
+        if stored.same_members(&new) {
+            return;
         }
-        for dep in new.difference(&old).copied() {
-            self.nodes[dep.index()].dependents.insert(dependent);
-        }
+        let old = std::mem::take(stored);
+        old.changes(&new, |id, added| {
+            let reverse = &mut self.nodes[id.index()].dependents;
+            if added {
+                reverse.insert(dependent);
+            } else {
+                reverse.remove(&dependent);
+            }
+        });
         match dependent {
             WorkId::Node(id) => self.nodes[id.index()].dependencies = new,
             WorkId::Reaction(id) => self.reactions[id.index()].dependencies = new,
         }
-        Ok(())
     }
 
     fn apply_event(&mut self, event: &EventKind) -> Result<(), RuntimeError> {
@@ -1314,7 +1307,7 @@ impl Graph {
             old,
             new: value,
         });
-        for &dependent in &node.dependents {
+        for &dependent in node.dependents.iter() {
             self.dirty.mark(dependent);
         }
         Ok(())
