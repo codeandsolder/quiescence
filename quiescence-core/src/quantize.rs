@@ -158,11 +158,7 @@ impl HalfBounds {
         }
     }
 
-    pub(super) fn estimate(
-        estimate: Estimate,
-        decimal_places: u8,
-    ) -> Result<(Self, Self), QuantizeError> {
-        let scale = 10_u128.pow(u32::from(decimal_places));
+    pub(super) fn estimate(estimate: Estimate, scale: u128) -> Result<(Self, Self), QuantizeError> {
         let center = Magnitude::scaled(estimate.center, scale)?;
         if estimate.radius == 0.0 {
             let bounds = if estimate.center.is_sign_negative() {

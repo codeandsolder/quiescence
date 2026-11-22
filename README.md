@@ -38,6 +38,18 @@ A numeric node declares `decimal_places` and `hysteresis_lsd`. Working arithmeti
 
 Quantization computes the exact mathematical interval represented by the supplied binary64 center and nonnegative radius. Decimal scaling and half-bucket comparisons do not introduce extra rounding; exact halfway values round away from zero. Decimal-looking floating-point literals can lie on either side of a decimal midpoint. An interval must establish a single bucket (or fit strictly inside the previous bucket’s retention region), otherwise resolution returns an ambiguity error.
 
+Point estimates use a certified floating-point fast path when the scaled product lies strictly away from a representable half-bucket boundary. Boundary cases, large magnitudes, and nonzero-radius intervals retain the exact dyadic resolver; optimization does not relax any canonicalization rule. `PointRequest::resolve_batch` processes independent heterogeneous point estimates with portable SIMD and a scalar tail. The runtime stages contiguous numeric runs in mixed state batches, resolves hysteresis at delivery, and commits changed values in original write order only after the entire batch validates. Ordered IDs need no duplicate tracker; unordered IDs use a bounded dense bitmap or sparse membership.
+
+Numeric batching smoke benchmark (same inputs for scalar and SIMD):
+
+```sh
+cargo run --release -p quiescence-runtime --example numeric_batch -- scalar 1024
+cargo run --release -p quiescence-runtime --example numeric_batch -- simd 1024
+cargo run --release -p quiescence-runtime --example numeric_batch -- quiet-unsorted 1024
+```
+
+Other graph modes are `quiet`, `change`, `mixed`, `mixed-change`, and `mixed-change-unsorted`. Use the same compiler, target and CPU for comparisons. The benchmark reports per-item wall time; CPU counters are useful when other build jobs contend for the host.
+
 A one-LSD hysteresis widens the retention region by one last digit before a node moves into a new bucket. This makes the chosen information resolution part of the model and gives the runtime a natural early-termination boundary.
 
 ## Exact atom semantics

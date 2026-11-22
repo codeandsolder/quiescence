@@ -16,10 +16,13 @@
 //! ```
 
 #![forbid(unsafe_code)]
+#![feature(portable_simd)]
 
 use core::fmt;
 
+mod point;
 mod quantize;
+pub use point::PointRequest;
 use quantize::HalfBounds;
 
 macro_rules! graph_id {
@@ -144,6 +147,11 @@ pub struct Quantization {
 
 impl Quantization {
     pub const MAX_DECIMAL_PLACES: u8 = 15;
+    /// Integer buckets without hysteresis.
+    pub const INTEGER: Self = Self {
+        decimal_places: 0,
+        hysteresis_lsd: 0,
+    };
 
     /// # Errors
     /// Returns [`QuantizeError::TooManyDecimalPlaces`] when the requested precision exceeds the supported bound.
@@ -165,10 +173,39 @@ impl Quantization {
     pub const fn hysteresis_lsd(self) -> u32 {
         self.hysteresis_lsd
     }
+    const INTEGER_SCALES: [u64; 16] = {
+        let mut scales = [1; 16];
+        let mut i = 1;
+        while i < scales.len() {
+            scales[i] = scales[i - 1] * 10;
+            i += 1;
+        }
+        scales
+    };
+
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "all supported integer powers of ten are exactly representable in binary64"
+    )]
+    const FLOAT_SCALES: [f64; 16] = {
+        let mut scales = [0.0; 16];
+        let mut i = 0;
+        while i < scales.len() {
+            scales[i] = Self::INTEGER_SCALES[i] as f64;
+            i += 1;
+        }
+        scales
+    };
+
     #[must_use = "the calculated quantization scale must be used"]
-    pub fn scale(self) -> f64 {
-        10_f64.powi(i32::from(self.decimal_places))
+    pub const fn scale(self) -> f64 {
+        Self::FLOAT_SCALES[self.decimal_places as usize]
     }
+
+    const fn scale_integer(self) -> u64 {
+        Self::INTEGER_SCALES[self.decimal_places as usize]
+    }
+
     #[must_use = "the decoded working value must be used"]
     #[expect(
         clippy::cast_precision_loss,
@@ -189,10 +226,26 @@ impl Quantization {
         previous: Option<Bucket>,
         estimate: Estimate,
     ) -> Result<Bucket, QuantizeError> {
+        if estimate.radius == 0.0 {
+            return PointRequest {
+                quantization: self,
+                previous,
+                value: estimate.center,
+            }
+            .resolve();
+        }
+        self.resolve_exact(previous, estimate)
+    }
+
+    fn resolve_exact(
+        self,
+        previous: Option<Bucket>,
+        estimate: Estimate,
+    ) -> Result<Bucket, QuantizeError> {
         if !estimate.center.is_finite() || !estimate.radius.is_finite() || estimate.radius < 0.0 {
             return Err(QuantizeError::NonFiniteEstimate);
         }
-        let (lower, upper) = HalfBounds::estimate(estimate, self.decimal_places)?;
+        let (lower, upper) = HalfBounds::estimate(estimate, u128::from(self.scale_integer()))?;
         let lo = lower.round_bucket()?;
         let hi = upper.round_bucket()?;
 
@@ -213,6 +266,7 @@ impl Quantization {
 #[derive(Clone, Debug, PartialEq)]
 pub enum QuantizeError {
     TooManyDecimalPlaces(u8),
+    BatchLengthMismatch,
     NonFiniteEstimate,
     OutOfRange,
     Ambiguous { estimate: Estimate },
@@ -221,6 +275,7 @@ pub enum QuantizeError {
 impl fmt::Display for QuantizeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::BatchLengthMismatch => f.write_str("point request and output lengths differ"),
             Self::TooManyDecimalPlaces(v) => {
                 write!(f, "decimal precision {v} exceeds supported maximum")
             }
