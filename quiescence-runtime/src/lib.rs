@@ -819,10 +819,12 @@ impl Graph {
     }
 
     fn validate_state_write_batch(&self, writes: &[StateWrite]) -> Result<(), RuntimeError> {
-        // Quantization depends on the then-current hysteresis state and must
-        // remain at delivery time.
-        self.validated_writes(writes)
-            .try_for_each(|write| write.map(|_| ()))
+        // Point estimates have state-independent representability. Reject
+        // invalid values at admission, but resolve hysteresis again at delivery.
+        self.validated_writes(writes).try_for_each(|write| {
+            let (id, validated) = write?;
+            validated.resolve(id).map(|_| ())
+        })
     }
 
     fn enqueue_external_interaction(&mut self, interaction: ExternalInteraction) {

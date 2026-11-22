@@ -2,7 +2,7 @@ use super::{
     CanonicalValue, EvalContext, EvalError, EvalOutput, Graph, InteractionIngressError,
     ReactionOutput, RuntimeConfig, RuntimeError, StateWrite, interaction_channel,
 };
-use quiescence_core::{Bucket, Quantization, ReactionId, SimDuration, SimTime};
+use quiescence_core::{Bucket, Quantization, QuantizeError, ReactionId, SimDuration, SimTime};
 use std::{
     sync::{
         Arc, Mutex,
@@ -232,19 +232,45 @@ fn newly_scheduled_higher_priority_callback_preempts_existing_event()
 }
 
 #[test]
-fn failed_scheduled_write_remains_in_causal_queue() -> Result<(), Box<dyn std::error::Error>> {
+fn out_of_range_scheduled_write_is_rejected_before_admission()
+-> Result<(), Box<dyn std::error::Error>> {
     let mut g = Graph::new(RuntimeConfig::default());
     let node = g.add_input("node", q0()?, 0.0)?;
     let at = SimTime::from_millis(8);
-    g.schedule_input(node, at, 1e100)?;
-    let original_event = g.events.peek().cloned();
-    for _ in 0..2 {
-        assert!(matches!(g.advance_to(at), Err(RuntimeError::Quantize(_))));
-        assert_eq!(g.next_event_time(), Some(at));
-        assert_eq!(g.events.peek().cloned(), original_event);
-        assert!(!g.is_quiescent());
-        assert_eq!(g.value_bucket(node)?, Bucket::new(0));
-    }
+    assert!(matches!(
+        g.schedule_input(node, at, 1e100),
+        Err(RuntimeError::Quantize(QuantizeError::OutOfRange))
+    ));
+    assert_eq!(g.next_event_time(), None);
+    g.schedule_input(node, at, 2.0)?;
+    g.advance_to(at)?;
+    assert_eq!(g.value_bucket(node)?, Bucket::new(2));
+    assert!(g.is_quiescent());
+    Ok(())
+}
+
+#[test]
+fn out_of_range_ingress_batch_does_not_block_valid_work() -> Result<(), Box<dyn std::error::Error>>
+{
+    let mut g = Graph::new(RuntimeConfig::default());
+    let node = g.add_input("node", q0()?, 0.0)?;
+    let atom = g.add_atom_input("atom", 0)?;
+    let (sender, inbox) = interaction_channel();
+    sender.state_now(
+        0,
+        vec![StateWrite::atom(atom, 1), StateWrite::new(node, 1e100)],
+    )?;
+    sender.state_now(0, vec![StateWrite::new(node, 2.0)])?;
+    let result = g.process_interactions(&inbox)?;
+    assert_eq!(result.accepted, 1);
+    assert_eq!(result.rejected.len(), 1);
+    assert!(matches!(
+        result.rejected[0].error,
+        RuntimeError::Quantize(QuantizeError::OutOfRange)
+    ));
+    assert_eq!(g.value_atom(atom)?, 0);
+    assert_eq!(g.value_bucket(node)?, Bucket::new(2));
+    assert!(g.is_quiescent());
     Ok(())
 }
 
