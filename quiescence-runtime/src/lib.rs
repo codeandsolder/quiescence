@@ -55,13 +55,11 @@ pub use output::{
     ReactionOutput, ReactionTransition, ScheduledCallback, StateWrite, WindowRecord,
 };
 
-use edge_set::EdgeSet;
+use edge_set::ReverseEdges;
 use event_queue::{EventKind, EventQueue, ScheduledEvent};
 use history::EventWindow;
 use read_set::{Dependencies, ReadTracker};
 use write_batch::ResolvedWrite;
-
-type Dependents = EdgeSet<WorkId, 3>;
 
 type EvalFn =
     Box<dyn for<'a> Fn(&EvalContext<'a>) -> Result<EvalOutput, EvalError> + Send + Sync + 'static>;
@@ -245,7 +243,7 @@ struct Node {
     name: Arc<str>,
     state: NodeState,
     dependencies: Dependencies,
-    dependents: Dependents,
+    dependents: ReverseEdges,
     generation: u64,
 }
 
@@ -556,7 +554,7 @@ impl Graph {
             name: name.into(),
             state,
             dependencies: Dependencies::new(),
-            dependents: Dependents::new(),
+            dependents: ReverseEdges::new(),
             generation: 0,
         });
         self.dirty.nodes.push(false);
@@ -1197,7 +1195,7 @@ impl Graph {
             if added {
                 reverse.insert(dependent);
             } else {
-                reverse.remove(&dependent);
+                reverse.remove(dependent);
             }
         });
     }
@@ -1314,9 +1312,8 @@ impl Graph {
             old,
             new: value,
         });
-        for &dependent in node.dependents.iter() {
-            self.dirty.mark(dependent);
-        }
+        node.dependents
+            .for_each(|dependent| self.dirty.mark(dependent));
         Ok(())
     }
 

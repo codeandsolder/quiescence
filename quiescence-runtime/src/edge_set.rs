@@ -1,99 +1,66 @@
-//! Ordered dependency sets with allocation-free small degrees.
+//! Ordered reverse edges with allocation-free small fan-out.
 //!
-//! Graph edges tend to be sparse. Store the first few sorted unique edges
-//! inline, but retain logarithmic insertion/removal for arbitrary fan-out.
+//! Large reverse sets retain logarithmic insertion/removal, independently
+//! of evaluator read order. Small fan-out uses compact inline storage.
+use super::WorkId;
+use quiescence_core::NodeId;
+use std::collections::BTreeSet;
 
-use std::collections::{BTreeSet, btree_set};
+const INLINE: usize = 3;
+const PLACEHOLDER: WorkId = WorkId::Node(NodeId::from_index(0));
 
-pub enum EdgeSet<T, const N: usize> {
-    Empty,
-    Inline { len: usize, items: [T; N] },
-    Tree(BTreeSet<T>),
+pub enum ReverseEdges {
+    Inline { len: u8, items: [WorkId; INLINE] },
+    Tree(BTreeSet<WorkId>),
 }
 
-impl<T, const N: usize> Default for EdgeSet<T, N> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<T, const N: usize> EdgeSet<T, N> {
+impl ReverseEdges {
     pub(super) const fn new() -> Self {
-        Self::Empty
-    }
-
-    pub(super) fn iter(&self) -> Iter<'_, T> {
-        match self {
-            Self::Empty => Iter::Inline([].iter()),
-            Self::Inline { len, items } => Iter::Inline(items[..*len].iter()),
-            Self::Tree(tree) => Iter::Tree(tree.iter()),
-        }
-    }
-}
-
-impl<T: Copy + Ord, const N: usize> EdgeSet<T, N> {
-    #[cfg(test)]
-    pub(super) fn contains(&self, value: &T) -> bool {
-        match self {
-            Self::Empty => false,
-            Self::Inline { len, items } => items[..*len].binary_search(value).is_ok(),
-            Self::Tree(tree) => tree.contains(value),
+        Self::Inline {
+            len: 0,
+            items: [PLACEHOLDER; INLINE],
         }
     }
 
-    pub(super) fn insert(&mut self, value: T) {
+    pub(super) fn insert(&mut self, work: WorkId) {
         match self {
-            Self::Empty if N > 0 => {
-                *self = Self::Inline {
-                    len: 1,
-                    items: [value; N],
-                };
-            }
             Self::Inline { len, items } => {
-                let Err(index) = items[..*len].binary_search(&value) else {
+                let count = usize::from(*len);
+                let Err(index) = items[..count].binary_search(&work) else {
                     return;
                 };
-                if *len < N {
-                    items.copy_within(index..*len, index + 1);
-                    items[index] = value;
+                if count < INLINE {
+                    items.copy_within(index..count, index + 1);
+                    items[index] = work;
                     *len += 1;
                 } else {
                     let mut tree: BTreeSet<_> = items.iter().copied().collect();
-                    tree.insert(value);
+                    tree.insert(work);
                     *self = Self::Tree(tree);
                 }
             }
             Self::Tree(tree) => {
-                tree.insert(value);
-            }
-            Self::Empty => {
-                *self = Self::Tree(BTreeSet::from([value]));
+                tree.insert(work);
             }
         }
     }
 
-    pub(super) fn remove(&mut self, value: &T) {
+    pub(super) fn remove(&mut self, work: WorkId) {
         match self {
-            Self::Empty => {}
             Self::Inline { len, items } => {
-                if let Ok(index) = items[..*len].binary_search(value) {
-                    items.copy_within(index + 1..*len, index);
+                let count = usize::from(*len);
+                if let Ok(index) = items[..count].binary_search(&work) {
+                    items.copy_within(index + 1..count, index);
                     *len -= 1;
-                    if *len == 0 {
-                        *self = Self::Empty;
-                    }
                 }
             }
             Self::Tree(tree) => {
-                tree.remove(value);
-                // Hysteresis avoids continual promotion/demotion around N.
-                if tree.is_empty() {
-                    *self = Self::Empty;
-                } else if tree.len() <= N / 2
-                    && let Some(&first) = tree.first()
+                tree.remove(&work);
+                // Hysteresis avoids continual promotion/demotion around INLINE.
+                if tree.len() <= INLINE / 2
+                    && let Ok(len) = u8::try_from(tree.len())
                 {
-                    let mut items = [first; N];
-                    let len = tree.len();
+                    let mut items = [PLACEHOLDER; INLINE];
                     for (slot, &edge) in items.iter_mut().zip(tree.iter()) {
                         *slot = edge;
                     }
@@ -102,61 +69,58 @@ impl<T: Copy + Ord, const N: usize> EdgeSet<T, N> {
             }
         }
     }
-}
 
-pub enum Iter<'a, T> {
-    Inline(std::slice::Iter<'a, T>),
-    Tree(btree_set::Iter<'a, T>),
-}
-
-impl<'a, T> Iterator for Iter<'a, T> {
-    type Item = &'a T;
-
-    fn next(&mut self) -> Option<Self::Item> {
+    pub(super) fn for_each(&self, mut visit: impl FnMut(WorkId)) {
         match self {
-            Self::Inline(iter) => iter.next(),
-            Self::Tree(iter) => iter.next(),
-        }
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        match self {
-            Self::Inline(iter) => iter.size_hint(),
-            Self::Tree(iter) => iter.size_hint(),
+            Self::Inline { len, items } => {
+                for &work in &items[..usize::from(*len)] {
+                    visit(work);
+                }
+            }
+            Self::Tree(tree) => {
+                for &work in tree {
+                    visit(work);
+                }
+            }
         }
     }
 }
-
-impl<T> ExactSizeIterator for Iter<'_, T> {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use quiescence_core::ReactionId;
 
     #[test]
     fn adaptive_storage_matches_ordered_reference() {
-        let mut set = EdgeSet::<u32, 4>::new();
+        let mut set = ReverseEdges::new();
         let mut reference = BTreeSet::new();
         let mut random = 0x9e37_79b9_u32;
+        let mut observed = Vec::new();
         for turn in 0..16_384 {
             random ^= random << 13;
             random ^= random >> 17;
             random ^= random << 5;
             let key = random % if turn % 128 < 64 { 8 } else { 64 };
-            if random & 0x100 == 0 {
-                set.insert(key);
-                reference.insert(key);
+            let work = if random & 0x200 == 0 {
+                WorkId::Node(NodeId::from_index(key))
             } else {
-                set.remove(&key);
-                reference.remove(&key);
+                WorkId::Reaction(ReactionId::from_index(key))
+            };
+            if random & 0x100 == 0 {
+                set.insert(work);
+                reference.insert(work);
+            } else {
+                set.remove(work);
+                reference.remove(&work);
             }
-            assert!(set.iter().eq(reference.iter()));
-            assert_eq!(set.contains(&key), reference.contains(&key));
+            observed.clear();
+            set.for_each(|edge| observed.push(edge));
+            assert!(observed.iter().eq(reference.iter()));
         }
-        let keys: Vec<_> = reference.iter().copied().collect();
-        for key in keys {
-            set.remove(&key);
+        for work in reference {
+            set.remove(work);
         }
-        assert!(matches!(set, EdgeSet::Empty));
+        assert!(matches!(set, ReverseEdges::Inline { len: 0, .. }));
     }
 }
