@@ -7,7 +7,7 @@ const INLINE: usize = 3;
 const PLACEHOLDER: WorkId = WorkId::Node(NodeId::from_index(0));
 const REACTION_WORD: u32 = 1 << 26;
 
-fn word_and_mask(work: WorkId) -> (u32, u64) {
+const fn word_and_mask(work: WorkId) -> (u32, u64) {
     let (raw, kind) = match work {
         WorkId::Node(id) => (id.raw(), 0),
         WorkId::Reaction(id) => (id.raw(), REACTION_WORD),
@@ -36,8 +36,8 @@ struct Chunks {
 
 impl Chunks {
     fn insert(&mut self, work: WorkId) {
-        let (word, mask) = word_and_mask(work);
-        let bits = self.masks.entry(word).or_default();
+        let (block, mask) = word_and_mask(work);
+        let bits = self.masks.entry(block).or_default();
         if *bits & mask == 0 {
             *bits |= mask;
             self.count += 1;
@@ -45,8 +45,8 @@ impl Chunks {
     }
 
     fn remove(&mut self, work: WorkId) {
-        let (word, mask) = word_and_mask(work);
-        if let Entry::Occupied(mut entry) = self.masks.entry(word)
+        let (block, mask) = word_and_mask(work);
+        if let Entry::Occupied(mut entry) = self.masks.entry(block)
             && *entry.get() & mask != 0
         {
             *entry.get_mut() &= !mask;
@@ -134,7 +134,7 @@ impl LargeEdges {
 
     fn maybe_sparsify(&mut self) {
         if let LargeStorage::Chunks(chunks) = &self.0
-            && chunks.count >= INLINE + 1
+            && chunks.count > INLINE
             && chunks.masks.len() > chunks.count - chunks.count / 4
         {
             let mut members = BTreeSet::new();
