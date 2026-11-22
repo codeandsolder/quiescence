@@ -1495,7 +1495,8 @@ fn exhausted_generation_cannot_revalidate_a_stale_forecast()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut graph = Graph::new(RuntimeConfig::default());
     let node = graph.add_derived("generation", q0()?, 0.0, |_| Ok(EvalOutput::immediate(1.0)))?;
-    graph.nodes[node.index()].generation = u64::MAX;
+    let owner = graph.derived_owner(node)?;
+    graph.derived[owner.index()].generation = u64::MAX;
     assert!(
         matches!(graph.settle(), Err(RuntimeError::GenerationExhausted(super::WorkId::Node(id))) if id == node)
     );
@@ -1577,7 +1578,8 @@ fn dynamic_wide_subscriptions_replace_only_after_success() -> Result<(), Box<dyn
         Ok(EvalOutput::immediate(0.0))
     })?;
     graph.settle()?;
-    let dependencies = &graph.nodes[derived.index()].dependencies;
+    let owner = graph.derived_owner(derived)?;
+    let dependencies = &graph.derived[owner.index()].dependencies;
     assert!(dependencies.contains(sources[0]));
     assert!(!dependencies.contains(sources[1]));
     can_run.store(0, Ordering::Relaxed);
@@ -1585,7 +1587,7 @@ fn dynamic_wide_subscriptions_replace_only_after_success() -> Result<(), Box<dyn
         graph.set_atom_now(gate, 1),
         Err(RuntimeError::Evaluation { .. })
     ));
-    let dependencies = &graph.nodes[derived.index()].dependencies;
+    let dependencies = &graph.derived[owner.index()].dependencies;
     assert!(dependencies.contains(sources[0]));
     assert!(!dependencies.contains(sources[1]));
     can_run.store(1, Ordering::Relaxed);
@@ -1720,7 +1722,8 @@ fn buried_obsolete_forecasts_are_bounded_in_grouped_and_sparse_queues()
         assert_eq!(graph.events.len(), 0);
         assert_eq!(graph.value_bucket(derived)?, Bucket::new(5000));
         assert_eq!(graph.value_atom(marker)?, ordinary.unsigned_abs());
-        assert_eq!(graph.nodes[derived.index()].pending_forecasts, 0);
+        let owner = graph.derived_owner(derived)?;
+        assert_eq!(graph.derived[owner.index()].pending_forecasts, 0);
     }
     Ok(())
 }
@@ -1870,5 +1873,61 @@ fn reaction_write_validation_does_not_discard_its_read_dependencies()
             .dependencies
             .contains(input)
     );
+    Ok(())
+}
+
+#[test]
+fn interleaved_node_roles_keep_distinct_forecast_owners() -> Result<(), Box<dyn std::error::Error>>
+{
+    let mut graph = Graph::new(RuntimeConfig::default());
+    let source = graph.add_input("source", Quantization::INTEGER, 2.0)?;
+    let first = graph.add_derived("first", Quantization::INTEGER, 0.0, move |ctx| {
+        Ok(EvalOutput::after(
+            ctx.read_f64(source)?,
+            SimDuration::from_millis(5),
+        ))
+    })?;
+    let atom = graph.add_atom_input("mode", 0)?;
+    let second = graph.add_derived("second", Quantization::INTEGER, 0.0, move |ctx| {
+        if ctx.read_atom(atom)? == 0 {
+            Ok(
+                EvalOutput::after(ctx.read_f64(first)?, SimDuration::from_millis(10))
+                    .with_valid_for(SimDuration::from_millis(7)),
+            )
+        } else {
+            Ok(EvalOutput::immediate(ctx.read_f64(first)? * 2.0))
+        }
+    })?;
+    let tail = graph.add_input("tail", Quantization::INTEGER, 19.0)?;
+    graph.settle()?;
+    assert_eq!(graph.derived.len(), 2);
+    graph.advance_to(SimTime::from_millis(5))?;
+    assert_eq!(graph.value_bucket(first)?, Bucket::new(2));
+    assert_eq!(graph.value_bucket(second)?, Bucket::new(0));
+    graph.schedule_atom(atom, SimTime::from_millis(6), 1)?;
+    graph.advance_to(SimTime::from_millis(20))?;
+    let snapshot = graph.quiescent_snapshot()?;
+    assert_eq!(
+        snapshot.value(source),
+        Some(CanonicalValue::Numeric(Bucket::new(2)))
+    );
+    assert_eq!(
+        snapshot.value(first),
+        Some(CanonicalValue::Numeric(Bucket::new(2)))
+    );
+    assert_eq!(snapshot.value(atom), Some(CanonicalValue::Atom(1)));
+    assert_eq!(
+        snapshot.value(second),
+        Some(CanonicalValue::Numeric(Bucket::new(4)))
+    );
+    assert_eq!(
+        snapshot.value(tail),
+        Some(CanonicalValue::Numeric(Bucket::new(19)))
+    );
+    assert_eq!(snapshot.next_event_time, None);
+    graph.set_input_now(source, 9.0)?;
+    graph.advance_to(SimTime::from_millis(25))?;
+    assert_eq!(graph.value_bucket(first)?, Bucket::new(9));
+    assert_eq!(graph.value_bucket(second)?, Bucket::new(18));
     Ok(())
 }
