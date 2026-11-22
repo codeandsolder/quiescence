@@ -6,18 +6,75 @@ use quiescence_core::{
 };
 use std::{
     cell::RefCell,
-    cmp::Ordering,
-    collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque},
-    fmt,
-    sync::{Arc, Condvar, Mutex},
+    collections::{BTreeSet, VecDeque},
 };
+
+mod error;
+mod event_queue;
+mod history;
+mod ingress;
+mod output;
+
+pub use error::{EvalError, InteractionIngressError, RuntimeError};
+pub use ingress::{
+    ExternalInteraction, InteractionImport, InteractionInbox, InteractionMoment, InteractionSender,
+    RejectedInteraction, interaction_channel,
+};
+pub use output::{
+    CanonicalValue, EvalOutput, QuiescentPublication, QuiescentSnapshot, ReactionOutput,
+    ScheduledReactionCallback, ScheduledReevaluation, StateWrite, WindowRecord,
+};
+
+use event_queue::{EventKind, EventQueue, ScheduledEvent};
+use history::EventWindow;
 
 type EvalFn =
     Box<dyn for<'a> Fn(&EvalContext<'a>) -> Result<EvalOutput, EvalError> + Send + Sync + 'static>;
 type ReactionFn = Box<
     dyn for<'a> Fn(&EvalContext<'a>) -> Result<ReactionOutput, EvalError> + Send + Sync + 'static,
 >;
-type ResolvedWrite = (NodeId, CanonicalValue, CanonicalValue);
+struct ResolvedWrite {
+    node: NodeId,
+    current: CanonicalValue,
+    next: CanonicalValue,
+}
+
+enum ValidatedWrite {
+    Numeric {
+        quantization: Quantization,
+        bucket: Bucket,
+        value: f64,
+    },
+    Atom {
+        current: u64,
+        value: u64,
+    },
+}
+
+impl ValidatedWrite {
+    fn resolve(self, node: NodeId) -> Result<ResolvedWrite, RuntimeError> {
+        let (current, next) = match self {
+            Self::Numeric {
+                quantization,
+                bucket,
+                value,
+            } => (
+                CanonicalValue::Numeric(bucket),
+                CanonicalValue::Numeric(
+                    quantization.resolve(Some(bucket), Estimate::point(value))?,
+                ),
+            ),
+            Self::Atom { current, value } => {
+                (CanonicalValue::Atom(current), CanonicalValue::Atom(value))
+            }
+        };
+        Ok(ResolvedWrite {
+            node,
+            current,
+            next,
+        })
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RuntimeConfig {
@@ -29,532 +86,6 @@ impl Default for RuntimeConfig {
         Self {
             same_time_microstep_budget: 4_096,
         }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct EvalOutput {
-    pub estimate: Estimate,
-    pub delay: SimDuration,
-    pub valid_for: Option<SimDuration>,
-}
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CanonicalValue {
-    Numeric(Bucket),
-    Atom(u64),
-}
-
-impl fmt::Display for CanonicalValue {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Numeric(bucket) => write!(f, "{}", bucket.raw()),
-            Self::Atom(value) => write!(f, "atom:{value}"),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum StateWrite {
-    Numeric { node: NodeId, value: f64 },
-    Atom { node: NodeId, value: u64 },
-}
-impl StateWrite {
-    #[must_use = "the constructed value must be used"]
-    pub const fn new(node: NodeId, value: f64) -> Self {
-        Self::Numeric { node, value }
-    }
-
-    #[must_use = "the constructed state write must be applied or scheduled"]
-    pub const fn atom(node: NodeId, value: u64) -> Self {
-        Self::Atom { node, value }
-    }
-
-    #[must_use = "the target node identifier must be used"]
-    pub const fn node(self) -> NodeId {
-        match self {
-            Self::Numeric { node, .. } | Self::Atom { node, .. } => node,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum InteractionMoment {
-    /// Resolve to the graph owner's simulation time when the interaction is imported.
-    QuiescentNow,
-    /// Preserve an explicit simulation timestamp supplied by the producer.
-    At(SimTime),
-}
-
-impl InteractionMoment {
-    const fn resolve(self, now: SimTime) -> SimTime {
-        match self {
-            Self::QuiescentNow => now,
-            Self::At(at) => at,
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum ExternalInteraction {
-    StateBatch {
-        moment: InteractionMoment,
-        priority: i32,
-        writes: Vec<StateWrite>,
-    },
-    Callback {
-        moment: InteractionMoment,
-        priority: i32,
-        reaction: ReactionId,
-        token: Option<u64>,
-    },
-}
-
-/// An ingress item that could not be admitted to this graph at its import boundary.
-#[derive(Debug)]
-pub struct RejectedInteraction {
-    pub interaction: ExternalInteraction,
-    pub error: RuntimeError,
-}
-
-/// Admission results for a finite prefix of the producer queue. Rejected items
-/// remain owned by the caller for inspection, correction, or dead-letter handling.
-#[derive(Debug, Default)]
-pub struct InteractionImport {
-    pub accepted: usize,
-    pub rejected: Vec<RejectedInteraction>,
-}
-
-struct InteractionQueue {
-    pending: VecDeque<ExternalInteraction>,
-    senders: usize,
-    receiver_alive: bool,
-}
-
-impl Default for InteractionQueue {
-    fn default() -> Self {
-        Self {
-            pending: VecDeque::new(),
-            senders: 1,
-            receiver_alive: true,
-        }
-    }
-}
-
-#[derive(Default)]
-struct InteractionShared {
-    queue: Mutex<InteractionQueue>,
-    ready: Condvar,
-}
-
-pub struct InteractionSender {
-    shared: Arc<InteractionShared>,
-}
-
-pub struct InteractionInbox {
-    shared: Arc<InteractionShared>,
-}
-
-#[must_use = "both endpoints are required to submit and consume interactions"]
-pub fn interaction_channel() -> (InteractionSender, InteractionInbox) {
-    let shared = Arc::new(InteractionShared::default());
-    (
-        InteractionSender {
-            shared: Arc::clone(&shared),
-        },
-        InteractionInbox { shared },
-    )
-}
-
-impl Clone for InteractionSender {
-    fn clone(&self) -> Self {
-        // Clone cannot fail; recover a poisoned mutex solely to keep the
-        // sender count consistent. All fallible queue operations still report
-        // QueuePoisoned to the caller.
-        let mut queue = self
-            .shared
-            .queue
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        queue.senders += 1;
-        drop(queue);
-        Self {
-            shared: Arc::clone(&self.shared),
-        }
-    }
-}
-
-impl Drop for InteractionSender {
-    fn drop(&mut self) {
-        let mut queue = self
-            .shared
-            .queue
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        queue.senders -= 1;
-        let last_sender = queue.senders == 0;
-        drop(queue);
-        if last_sender {
-            self.shared.ready.notify_all();
-        }
-    }
-}
-
-impl Drop for InteractionInbox {
-    fn drop(&mut self) {
-        let mut queue = self
-            .shared
-            .queue
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        queue.receiver_alive = false;
-        queue.pending.clear();
-    }
-}
-
-impl InteractionSender {
-    /// # Errors
-    /// Returns an error if the inbox has been dropped or the shared queue
-    /// lock was poisoned.
-    pub fn submit(&self, interaction: ExternalInteraction) -> Result<(), InteractionIngressError> {
-        {
-            let mut queue = self
-                .shared
-                .queue
-                .lock()
-                .map_err(|_| InteractionIngressError::QueuePoisoned)?;
-            if !queue.receiver_alive {
-                return Err(InteractionIngressError::Disconnected);
-            }
-            queue.pending.push_back(interaction);
-        }
-        self.shared.ready.notify_one();
-        Ok(())
-    }
-
-    /// # Errors
-    /// Returns an error if the shared ingress queue lock is poisoned.
-    pub fn state_now(
-        &self,
-        priority: i32,
-        writes: Vec<StateWrite>,
-    ) -> Result<(), InteractionIngressError> {
-        self.submit(ExternalInteraction::StateBatch {
-            moment: InteractionMoment::QuiescentNow,
-            priority,
-            writes,
-        })
-    }
-
-    /// # Errors
-    /// Returns an error if the shared ingress queue lock is poisoned.
-    pub fn state_at(
-        &self,
-        at: SimTime,
-        priority: i32,
-        writes: Vec<StateWrite>,
-    ) -> Result<(), InteractionIngressError> {
-        self.submit(ExternalInteraction::StateBatch {
-            moment: InteractionMoment::At(at),
-            priority,
-            writes,
-        })
-    }
-
-    /// # Errors
-    /// Returns an error if the shared ingress queue lock is poisoned.
-    pub fn callback_now(
-        &self,
-        reaction: ReactionId,
-        priority: i32,
-    ) -> Result<(), InteractionIngressError> {
-        self.submit(ExternalInteraction::Callback {
-            moment: InteractionMoment::QuiescentNow,
-            priority,
-            reaction,
-            token: None,
-        })
-    }
-
-    /// # Errors
-    /// Returns an error if the shared ingress queue lock is poisoned.
-    pub fn callback_now_with_token(
-        &self,
-        reaction: ReactionId,
-        priority: i32,
-        token: u64,
-    ) -> Result<(), InteractionIngressError> {
-        self.submit(ExternalInteraction::Callback {
-            moment: InteractionMoment::QuiescentNow,
-            priority,
-            reaction,
-            token: Some(token),
-        })
-    }
-
-    /// # Errors
-    /// Returns an error if the shared ingress queue lock is poisoned.
-    pub fn callback_at(
-        &self,
-        reaction: ReactionId,
-        at: SimTime,
-        priority: i32,
-    ) -> Result<(), InteractionIngressError> {
-        self.submit(ExternalInteraction::Callback {
-            moment: InteractionMoment::At(at),
-            priority,
-            reaction,
-            token: None,
-        })
-    }
-
-    /// # Errors
-    /// Returns an error if the shared ingress queue lock is poisoned.
-    pub fn callback_at_with_token(
-        &self,
-        reaction: ReactionId,
-        at: SimTime,
-        priority: i32,
-        token: u64,
-    ) -> Result<(), InteractionIngressError> {
-        self.submit(ExternalInteraction::Callback {
-            moment: InteractionMoment::At(at),
-            priority,
-            reaction,
-            token: Some(token),
-        })
-    }
-}
-
-impl InteractionInbox {
-    /// # Errors
-    /// Returns an error if the shared ingress queue lock is poisoned.
-    pub fn pending_count(&self) -> Result<usize, InteractionIngressError> {
-        Ok(self
-            .shared
-            .queue
-            .lock()
-            .map_err(|_| InteractionIngressError::QueuePoisoned)?
-            .pending
-            .len())
-    }
-
-    /// Block until a queued interaction is available or the final producer
-    /// is dropped. Already queued interactions are delivered before shutdown.
-    /// The caller still owns the policy for advancing simulation time.
-    ///
-    /// # Errors
-    /// Returns `Disconnected` when no senders remain and the queue is empty,
-    /// or `QueuePoisoned` if the shared mutex was poisoned.
-    pub fn wait_for_pending(&self) -> Result<usize, InteractionIngressError> {
-        let queue = self
-            .shared
-            .queue
-            .lock()
-            .map_err(|_| InteractionIngressError::QueuePoisoned)?;
-        let queue = self
-            .shared
-            .ready
-            .wait_while(queue, |queue| {
-                queue.pending.is_empty() && queue.senders != 0
-            })
-            .map_err(|_| InteractionIngressError::QueuePoisoned)?;
-        if queue.pending.is_empty() {
-            Err(InteractionIngressError::Disconnected)
-        } else {
-            Ok(queue.pending.len())
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct QuiescentSnapshot {
-    pub at: SimTime,
-    pub next_event_time: Option<SimTime>,
-    values: Vec<CanonicalValue>,
-}
-
-impl QuiescentSnapshot {
-    #[must_use = "the observed canonical value must be used"]
-    pub fn value(&self, node: NodeId) -> Option<CanonicalValue> {
-        self.values.get(node.index()).copied()
-    }
-
-    #[must_use = "the snapshot node count must be used"]
-    pub const fn node_count(&self) -> usize {
-        self.values.len()
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct QuiescentPublication {
-    pub snapshot: QuiescentSnapshot,
-    pub transitions: Vec<TransitionRecord>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct WindowRecord {
-    pub history: HistoryId,
-    pub key: u64,
-}
-
-impl WindowRecord {
-    #[must_use = "the constructed value must be used"]
-    pub const fn new(history: HistoryId, key: u64) -> Self {
-        Self { history, key }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ScheduledReevaluation {
-    pub key: u64,
-    pub after: SimDuration,
-    pub priority: i32,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ScheduledReactionCallback {
-    pub reaction: ReactionId,
-    pub key: u64,
-    pub after: SimDuration,
-    pub priority: i32,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct ReactionOutput {
-    pub transition_after: Option<SimDuration>,
-    pub writes: Vec<StateWrite>,
-    pub window_records: Vec<WindowRecord>,
-    pub scheduled_reevaluations: Vec<ScheduledReevaluation>,
-    pub scheduled_callbacks: Vec<ScheduledReactionCallback>,
-}
-impl ReactionOutput {
-    #[must_use = "the reaction result must be returned to the scheduler"]
-    pub const fn idle() -> Self {
-        Self {
-            transition_after: None,
-            writes: Vec::new(),
-            window_records: Vec::new(),
-            scheduled_reevaluations: Vec::new(),
-            scheduled_callbacks: Vec::new(),
-        }
-    }
-
-    #[must_use = "the constructed evaluation or reaction result must be used"]
-    pub const fn after(delay: SimDuration, writes: Vec<StateWrite>) -> Self {
-        Self {
-            transition_after: Some(delay),
-            writes,
-            window_records: Vec::new(),
-            scheduled_reevaluations: Vec::new(),
-            scheduled_callbacks: Vec::new(),
-        }
-    }
-
-    #[must_use = "the constructed evaluation or reaction result must be used"]
-    pub const fn immediate(writes: Vec<StateWrite>) -> Self {
-        Self::after(SimDuration::ZERO, writes)
-    }
-
-    #[must_use = "the reevaluation request must be returned to the scheduler"]
-    pub const fn reevaluate_after(delay: SimDuration) -> Self {
-        Self::after(delay, Vec::new())
-    }
-
-    #[must_use = "the scheduling request must be returned to the scheduler"]
-    pub fn schedule_once_after(delay: SimDuration, key: u64, priority: i32) -> Self {
-        Self {
-            transition_after: None,
-            writes: Vec::new(),
-            window_records: Vec::new(),
-            scheduled_reevaluations: vec![ScheduledReevaluation {
-                key,
-                after: delay,
-                priority,
-            }],
-            scheduled_callbacks: Vec::new(),
-        }
-    }
-
-    #[must_use = "the updated reaction result contains the new scheduling request"]
-    pub fn and_schedule_once_after(mut self, delay: SimDuration, key: u64, priority: i32) -> Self {
-        self.scheduled_reevaluations.push(ScheduledReevaluation {
-            key,
-            after: delay,
-            priority,
-        });
-        self
-    }
-
-    #[must_use = "the callback request must be returned to the scheduler"]
-    pub fn schedule_reaction_once_after(
-        reaction: ReactionId,
-        delay: SimDuration,
-        key: u64,
-        priority: i32,
-    ) -> Self {
-        let mut output = Self::idle();
-        output.scheduled_callbacks.push(ScheduledReactionCallback {
-            reaction,
-            key,
-            after: delay,
-            priority,
-        });
-        output
-    }
-
-    #[must_use = "the updated reaction result contains the callback request"]
-    pub fn and_schedule_reaction_once_after(
-        mut self,
-        reaction: ReactionId,
-        delay: SimDuration,
-        key: u64,
-        priority: i32,
-    ) -> Self {
-        self.scheduled_callbacks.push(ScheduledReactionCallback {
-            reaction,
-            key,
-            after: delay,
-            priority,
-        });
-        self
-    }
-
-    #[must_use = "the updated reaction result contains the history record"]
-    pub fn and_record_window(mut self, history: HistoryId, key: u64) -> Self {
-        self.window_records.push(WindowRecord::new(history, key));
-        self
-    }
-}
-
-impl EvalOutput {
-    #[must_use = "the constructed evaluation or reaction result must be used"]
-    pub const fn immediate(value: f64) -> Self {
-        Self {
-            estimate: Estimate::point(value),
-            delay: SimDuration::ZERO,
-            valid_for: None,
-        }
-    }
-    #[must_use = "the constructed evaluation or reaction result must be used"]
-    pub const fn after(value: f64, delay: SimDuration) -> Self {
-        Self {
-            estimate: Estimate::point(value),
-            delay,
-            valid_for: None,
-        }
-    }
-    #[must_use = "the constructed evaluation result must be used"]
-    pub const fn estimate(estimate: Estimate) -> Self {
-        Self {
-            estimate,
-            delay: SimDuration::ZERO,
-            valid_for: None,
-        }
-    }
-    #[must_use = "the returned evaluation result contains the validity interval"]
-    pub const fn with_valid_for(mut self, duration: SimDuration) -> Self {
-        self.valid_for = Some(duration);
-        self
     }
 }
 
@@ -586,12 +117,8 @@ impl EvalContext<'_> {
     /// # Errors
     /// Returns an error if the node does not exist or is not numeric.
     pub fn read_bucket(&self, id: NodeId) -> Result<Bucket, EvalError> {
-        let node = self
-            .nodes
-            .get(id.index())
-            .ok_or(EvalError::UnknownNode(id))?;
-        self.reads.borrow_mut().insert(id);
-        let NodeState::Numeric { bucket, .. } = node.state else {
+        let state = self.read_state(id)?;
+        let NodeState::Numeric { bucket, .. } = *state else {
             return Err(EvalError::ExpectedNumeric(id));
         };
         Ok(bucket)
@@ -599,15 +126,11 @@ impl EvalContext<'_> {
     /// # Errors
     /// Returns an error if the node does not exist or is not numeric.
     pub fn read_f64(&self, id: NodeId) -> Result<f64, EvalError> {
-        let node = self
-            .nodes
-            .get(id.index())
-            .ok_or(EvalError::UnknownNode(id))?;
-        self.reads.borrow_mut().insert(id);
+        let state = self.read_state(id)?;
         let NodeState::Numeric {
             quantization,
             bucket,
-        } = node.state
+        } = *state
         else {
             return Err(EvalError::ExpectedNumeric(id));
         };
@@ -621,12 +144,8 @@ impl EvalContext<'_> {
     /// # Errors
     /// Returns an error if the node does not exist or is not an atom.
     pub fn read_atom(&self, id: NodeId) -> Result<u64, EvalError> {
-        let node = self
-            .nodes
-            .get(id.index())
-            .ok_or(EvalError::UnknownNode(id))?;
-        self.reads.borrow_mut().insert(id);
-        let NodeState::Atom(value) = node.state else {
+        let state = self.read_state(id)?;
+        let NodeState::Atom(value) = *state else {
             return Err(EvalError::ExpectedAtom(id));
         };
         Ok(value)
@@ -641,42 +160,17 @@ impl EvalContext<'_> {
         Ok(window.count_at(self.now, key))
     }
 
+    fn read_state(&self, id: NodeId) -> Result<&NodeState, EvalError> {
+        let node = self
+            .nodes
+            .get(id.index())
+            .ok_or(EvalError::UnknownNode(id))?;
+        self.reads.borrow_mut().insert(id);
+        Ok(&node.state)
+    }
+
     fn into_dependencies(self) -> BTreeSet<NodeId> {
         self.reads.into_inner()
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct WindowEvent {
-    at: SimTime,
-    key: u64,
-}
-
-struct EventWindow {
-    name: String,
-    duration: SimDuration,
-    events: VecDeque<WindowEvent>,
-}
-
-impl EventWindow {
-    fn count_at(&self, now: SimTime, key: u64) -> usize {
-        self.events
-            .iter()
-            .filter(|event| {
-                let elapsed = i128::from(now.as_nanos()) - i128::from(event.at.as_nanos());
-                event.key == key && (0..=i128::from(self.duration.as_nanos())).contains(&elapsed)
-            })
-            .count()
-    }
-
-    fn record(&mut self, now: SimTime, key: u64) {
-        while self.events.front().is_some_and(|event| {
-            i128::from(now.as_nanos()) - i128::from(event.at.as_nanos())
-                > i128::from(self.duration.as_nanos())
-        }) {
-            self.events.pop_front();
-        }
-        self.events.push_back(WindowEvent { at: now, key });
     }
 }
 
@@ -693,7 +187,7 @@ struct Node {
     state: NodeState,
     evaluator: Option<EvalFn>,
     dependencies: BTreeSet<NodeId>,
-    dependents: BTreeSet<NodeId>,
+    dependents: BTreeSet<WorkId>,
     generation: u64,
 }
 
@@ -713,16 +207,55 @@ pub enum WorkId {
     Reaction(ReactionId),
 }
 
+/// FIFO work queue with one membership bit per registered graph item.
+struct DirtyQueue {
+    pending: VecDeque<WorkId>,
+    nodes: Vec<bool>,
+    reactions: Vec<bool>,
+}
+
+impl DirtyQueue {
+    const fn new() -> Self {
+        Self {
+            pending: VecDeque::new(),
+            nodes: Vec::new(),
+            reactions: Vec::new(),
+        }
+    }
+
+    fn membership(&mut self, work: WorkId) -> &mut bool {
+        match work {
+            WorkId::Node(id) => &mut self.nodes[id.index()],
+            WorkId::Reaction(id) => &mut self.reactions[id.index()],
+        }
+    }
+
+    fn mark(&mut self, work: WorkId) {
+        if !std::mem::replace(self.membership(work), true) {
+            self.pending.push_back(work);
+        }
+    }
+
+    fn pop(&mut self) -> Option<WorkId> {
+        let work = self.pending.pop_front()?;
+        *self.membership(work) = false;
+        Some(work)
+    }
+
+    fn retry(&mut self, work: WorkId) {
+        if !std::mem::replace(self.membership(work), true) {
+            self.pending.push_front(work);
+        }
+    }
+}
+
 pub struct Graph {
     config: RuntimeConfig,
     now: SimTime,
     nodes: Vec<Node>,
     reactions: Vec<Reaction>,
     windows: Vec<EventWindow>,
-    reaction_dependents: BTreeMap<NodeId, BTreeSet<ReactionId>>,
-    dirty: VecDeque<WorkId>,
-    node_is_dirty: Vec<bool>,
-    reaction_is_dirty: Vec<bool>,
+    dirty: DirtyQueue,
     events: EventQueue,
     pending_scheduled_reactions: BTreeSet<(ReactionId, u64)>,
     transitions: Vec<TransitionRecord>,
@@ -737,10 +270,7 @@ impl Graph {
             nodes: Vec::new(),
             reactions: Vec::new(),
             windows: Vec::new(),
-            reaction_dependents: BTreeMap::new(),
-            dirty: VecDeque::new(),
-            node_is_dirty: Vec::new(),
-            reaction_is_dirty: Vec::new(),
+            dirty: DirtyQueue::new(),
             events: EventQueue::new(),
             pending_scheduled_reactions: BTreeSet::new(),
             transitions: Vec::new(),
@@ -755,7 +285,7 @@ impl Graph {
     /// the current simulation time. Future events do not prevent quiescence.
     #[must_use = "the quiescence result must be checked"]
     pub fn is_quiescent(&self) -> bool {
-        self.dirty.is_empty() && self.events.peek().is_none_or(|event| event.at > self.now)
+        self.dirty.pending.is_empty() && self.events.peek().is_none_or(|event| event.at > self.now)
     }
 
     /// Process all work and events that are causally due at the current simulation time.
@@ -799,11 +329,9 @@ impl Graph {
         if !self.is_quiescent() {
             return Err(self.not_quiescent_error());
         }
-        let mut queue = inbox.shared.queue.lock().map_err(|_| {
-            RuntimeError::InteractionIngress(InteractionIngressError::QueuePoisoned)
-        })?;
-        let interactions = std::mem::take(&mut queue.pending);
-        drop(queue);
+        let interactions = inbox
+            .drain_pending()
+            .map_err(RuntimeError::InteractionIngress)?;
 
         let mut result = InteractionImport::default();
         for interaction in interactions {
@@ -890,11 +418,7 @@ impl Graph {
         let raw_id =
             u32::try_from(self.windows.len()).map_err(|_| RuntimeError::TooManyHistories)?;
         let id = HistoryId::from_index(raw_id);
-        self.windows.push(EventWindow {
-            name: name.into(),
-            duration,
-            events: VecDeque::new(),
-        });
+        self.windows.push(EventWindow::new(name.into(), duration));
         Ok(id)
     }
 
@@ -906,7 +430,7 @@ impl Graph {
         q: Quantization,
         initial: f64,
     ) -> Result<NodeId, RuntimeError> {
-        self.add_node(name, q, initial, None)
+        self.add_numeric_node(name, q, initial, None)
     }
 
     /// # Errors
@@ -916,18 +440,7 @@ impl Graph {
         name: impl Into<String>,
         initial: u64,
     ) -> Result<NodeId, RuntimeError> {
-        let raw_id = u32::try_from(self.nodes.len()).map_err(|_| RuntimeError::TooManyNodes)?;
-        let id = NodeId::from_index(raw_id);
-        self.nodes.push(Node {
-            name: name.into(),
-            state: NodeState::Atom(initial),
-            evaluator: None,
-            dependencies: BTreeSet::new(),
-            dependents: BTreeSet::new(),
-            generation: 0,
-        });
-        self.node_is_dirty.push(false);
-        Ok(id)
+        self.add_node(name, NodeState::Atom(initial), None)
     }
 
     /// # Errors
@@ -942,34 +455,47 @@ impl Graph {
     where
         F: for<'a> Fn(&EvalContext<'a>) -> Result<EvalOutput, EvalError> + Send + Sync + 'static,
     {
-        self.add_node(name, q, initial, Some(Box::new(evaluator)))
+        self.add_numeric_node(name, q, initial, Some(Box::new(evaluator)))
     }
 
-    fn add_node(
+    fn add_numeric_node(
         &mut self,
         name: impl Into<String>,
         q: Quantization,
         initial: f64,
         evaluator: Option<EvalFn>,
     ) -> Result<NodeId, RuntimeError> {
-        let raw_id = u32::try_from(self.nodes.len()).map_err(|_| RuntimeError::TooManyNodes)?;
-        let id = NodeId::from_index(raw_id);
         let bucket = q.resolve(None, Estimate::point(initial))?;
-        let derived = evaluator.is_some();
-        self.nodes.push(Node {
-            name: name.into(),
-            state: NodeState::Numeric {
+        self.add_node(
+            name,
+            NodeState::Numeric {
                 quantization: q,
                 bucket,
             },
+            evaluator,
+        )
+    }
+
+    fn add_node(
+        &mut self,
+        name: impl Into<String>,
+        state: NodeState,
+        evaluator: Option<EvalFn>,
+    ) -> Result<NodeId, RuntimeError> {
+        let raw_id = u32::try_from(self.nodes.len()).map_err(|_| RuntimeError::TooManyNodes)?;
+        let id = NodeId::from_index(raw_id);
+        let derived = evaluator.is_some();
+        self.nodes.push(Node {
+            name: name.into(),
+            state,
             evaluator,
             dependencies: BTreeSet::new(),
             dependents: BTreeSet::new(),
             generation: 0,
         });
-        self.node_is_dirty.push(false);
+        self.dirty.nodes.push(false);
         if derived {
-            self.mark_dirty(WorkId::Node(id));
+            self.dirty.mark(WorkId::Node(id));
         }
         Ok(id)
     }
@@ -988,7 +514,7 @@ impl Graph {
             return Err(RuntimeError::ExpectedNumeric(id));
         }
         node.evaluator = Some(Box::new(evaluator));
-        self.mark_dirty(WorkId::Node(id));
+        self.dirty.mark(WorkId::Node(id));
         Ok(())
     }
 
@@ -1005,21 +531,7 @@ impl Graph {
             + Sync
             + 'static,
     {
-        let raw_id =
-            u32::try_from(self.reactions.len()).map_err(|_| RuntimeError::TooManyReactions)?;
-        let id = ReactionId::from_index(raw_id);
-        self.reactions.push(Reaction {
-            name: name.into(),
-            evaluator: Box::new(evaluator),
-            dependencies: BTreeSet::new(),
-            generation: 0,
-            track_dependencies: true,
-            pending_scheduled_key: None,
-            pending_external_token: None,
-        });
-        self.reaction_is_dirty.push(false);
-        self.mark_dirty(WorkId::Reaction(id));
-        Ok(id)
+        self.register_reaction(name.into(), Box::new(evaluator), true)
     }
 
     /// Add an event-only callback reaction.
@@ -1041,19 +553,31 @@ impl Graph {
             + Sync
             + 'static,
     {
+        self.register_reaction(name.into(), Box::new(evaluator), false)
+    }
+
+    fn register_reaction(
+        &mut self,
+        name: String,
+        evaluator: ReactionFn,
+        track_dependencies: bool,
+    ) -> Result<ReactionId, RuntimeError> {
         let raw_id =
             u32::try_from(self.reactions.len()).map_err(|_| RuntimeError::TooManyReactions)?;
         let id = ReactionId::from_index(raw_id);
         self.reactions.push(Reaction {
-            name: name.into(),
-            evaluator: Box::new(evaluator),
+            name,
+            evaluator,
             dependencies: BTreeSet::new(),
             generation: 0,
-            track_dependencies: false,
+            track_dependencies,
             pending_scheduled_key: None,
             pending_external_token: None,
         });
-        self.reaction_is_dirty.push(false);
+        self.dirty.reactions.push(false);
+        if track_dependencies {
+            self.dirty.mark(WorkId::Reaction(id));
+        }
         Ok(id)
     }
 
@@ -1119,7 +643,7 @@ impl Graph {
     fn not_quiescent_error(&self) -> RuntimeError {
         RuntimeError::NotQuiescent {
             at: self.now,
-            dirty_work: self.dirty.len(),
+            dirty_work: self.dirty.pending.len(),
             due_event: self
                 .events
                 .peek()
@@ -1156,36 +680,59 @@ impl Graph {
         }
     }
 
-    fn validate_state_write_batch(&self, writes: &[StateWrite]) -> Result<(), RuntimeError> {
+    fn validated_writes<'a>(
+        &'a self,
+        writes: &'a [StateWrite],
+    ) -> impl Iterator<Item = Result<(NodeId, ValidatedWrite), RuntimeError>> + 'a {
         let mut seen = BTreeSet::new();
-        for write in writes {
-            let node_id = write.node();
-            let node = self.node(node_id)?;
-            if !seen.insert(node_id) {
-                return Err(RuntimeError::DuplicateStateWrite(node_id));
+        writes.iter().map(move |&write| {
+            let id = write.node();
+            let node = self.node(id)?;
+            if !seen.insert(id) {
+                return Err(RuntimeError::DuplicateStateWrite(id));
             }
             if node.evaluator.is_some() {
-                return Err(RuntimeError::NotAnInput(node_id));
+                return Err(RuntimeError::NotAnInput(id));
             }
-            match (write, &node.state) {
-                (StateWrite::Numeric { value, .. }, NodeState::Numeric { .. }) => {
-                    // Finiteness is independent of the state at delivery time.
-                    // Bucket resolution depends on the then-current hysteresis
-                    // state, so it must remain in apply_state_writes.
+            let validated = match (write, &node.state) {
+                (
+                    StateWrite::Numeric { value, .. },
+                    NodeState::Numeric {
+                        quantization,
+                        bucket,
+                    },
+                ) => {
                     if !value.is_finite() {
                         return Err(QuantizeError::NonFiniteEstimate.into());
                     }
+                    ValidatedWrite::Numeric {
+                        quantization: *quantization,
+                        bucket: *bucket,
+                        value,
+                    }
                 }
-                (StateWrite::Atom { .. }, NodeState::Atom(_)) => {}
+                (StateWrite::Atom { value, .. }, NodeState::Atom(current)) => {
+                    ValidatedWrite::Atom {
+                        current: *current,
+                        value,
+                    }
+                }
                 (StateWrite::Numeric { .. }, NodeState::Atom(_)) => {
-                    return Err(RuntimeError::ExpectedNumeric(node_id));
+                    return Err(RuntimeError::ExpectedNumeric(id));
                 }
                 (StateWrite::Atom { .. }, NodeState::Numeric { .. }) => {
-                    return Err(RuntimeError::ExpectedAtom(node_id));
+                    return Err(RuntimeError::ExpectedAtom(id));
                 }
-            }
-        }
-        Ok(())
+            };
+            Ok((id, validated))
+        })
+    }
+
+    fn validate_state_write_batch(&self, writes: &[StateWrite]) -> Result<(), RuntimeError> {
+        // Quantization depends on the then-current hysteresis state and must
+        // remain at delivery time.
+        self.validated_writes(writes)
+            .try_for_each(|write| write.map(|_| ()))
     }
 
     fn enqueue_external_interaction(&mut self, interaction: ExternalInteraction) {
@@ -1351,20 +898,16 @@ impl Graph {
     }
 
     fn settle_with_budget(&mut self, steps: &mut usize) -> Result<(), RuntimeError> {
-        while let Some(&work) = self.dirty.front() {
+        while let Some(&work) = self.dirty.pending.front() {
             if *steps >= self.config.same_time_microstep_budget {
                 return Err(RuntimeError::CalculationInstability {
                     at: self.now,
                     microsteps: *steps,
-                    active_work: self.dirty.iter().copied().collect(),
+                    active_work: self.dirty.pending.iter().copied().collect(),
                 });
             }
             *steps += 1;
-            self.dirty.pop_front();
-            match work {
-                WorkId::Node(id) => self.node_is_dirty[id.index()] = false,
-                WorkId::Reaction(id) => self.reaction_is_dirty[id.index()] = false,
-            }
+            self.dirty.pop();
             let result = match work {
                 WorkId::Node(id) => {
                     if self.nodes[id.index()].evaluator.is_some() {
@@ -1376,14 +919,7 @@ impl Graph {
                 WorkId::Reaction(id) => self.evaluate_reaction(id),
             };
             if let Err(error) = result {
-                let already_dirty = match work {
-                    WorkId::Node(id) => &mut self.node_is_dirty[id.index()],
-                    WorkId::Reaction(id) => &mut self.reaction_is_dirty[id.index()],
-                };
-                if !*already_dirty {
-                    *already_dirty = true;
-                    self.dirty.push_front(work);
-                }
+                self.dirty.retry(work);
                 return Err(error);
             }
         }
@@ -1414,7 +950,7 @@ impl Graph {
                 return Err(RuntimeError::CalculationInstability {
                     at: event_time,
                     microsteps: steps,
-                    active_work: self.dirty.iter().copied().collect(),
+                    active_work: self.dirty.pending.iter().copied().collect(),
                 });
             }
             steps += 1;
@@ -1631,29 +1167,10 @@ impl Graph {
             ),
         };
         for dep in old.difference(&new).copied() {
-            match dependent {
-                WorkId::Node(id) => {
-                    self.nodes[dep.index()].dependents.remove(&id);
-                }
-                WorkId::Reaction(id) => {
-                    if let Some(reactions) = self.reaction_dependents.get_mut(&dep) {
-                        reactions.remove(&id);
-                        if reactions.is_empty() {
-                            self.reaction_dependents.remove(&dep);
-                        }
-                    }
-                }
-            }
+            self.nodes[dep.index()].dependents.remove(&dependent);
         }
         for dep in new.difference(&old).copied() {
-            match dependent {
-                WorkId::Node(id) => {
-                    self.nodes[dep.index()].dependents.insert(id);
-                }
-                WorkId::Reaction(id) => {
-                    self.reaction_dependents.entry(dep).or_default().insert(id);
-                }
-            }
+            self.nodes[dep.index()].dependents.insert(dependent);
         }
         match dependent {
             WorkId::Node(id) => self.nodes[id.index()].dependencies = new,
@@ -1680,7 +1197,7 @@ impl Graph {
             EventKind::Reevaluate { node, generation } => {
                 self.node(*node)?;
                 if self.nodes[node.index()].generation == *generation {
-                    self.mark_dirty(WorkId::Node(*node));
+                    self.dirty.mark(WorkId::Node(*node));
                 }
                 Ok(())
             }
@@ -1691,7 +1208,7 @@ impl Graph {
                     .ok_or(RuntimeError::UnknownReaction(*reaction))?;
                 target.pending_scheduled_key = None;
                 target.pending_external_token = *token;
-                self.mark_dirty(WorkId::Reaction(*reaction));
+                self.dirty.mark(WorkId::Reaction(*reaction));
                 Ok(())
             }
             EventKind::ScheduledReaction { reaction, key } => {
@@ -1702,7 +1219,7 @@ impl Graph {
                     .ok_or(RuntimeError::UnknownReaction(*reaction))?;
                 target.pending_scheduled_key = Some(*key);
                 target.pending_external_token = None;
-                self.mark_dirty(WorkId::Reaction(*reaction));
+                self.dirty.mark(WorkId::Reaction(*reaction));
                 Ok(())
             }
             EventKind::ReactionTransition {
@@ -1718,7 +1235,7 @@ impl Graph {
                     .generation;
                 if current_generation == *generation {
                     self.apply_reaction_effects(writes, window_records)?;
-                    self.mark_dirty(WorkId::Reaction(*reaction));
+                    self.dirty.mark(WorkId::Reaction(*reaction));
                 }
                 Ok(())
             }
@@ -1751,46 +1268,24 @@ impl Graph {
         &self,
         writes: &[StateWrite],
     ) -> Result<Vec<ResolvedWrite>, RuntimeError> {
-        let mut seen = BTreeSet::new();
-        let mut resolved = Vec::with_capacity(writes.len());
-        for write in writes {
-            let node_id = write.node();
-            self.node(node_id)?;
-            if !seen.insert(node_id) {
-                return Err(RuntimeError::DuplicateStateWrite(node_id));
-            }
-            if self.nodes[node_id.index()].evaluator.is_some() {
-                return Err(RuntimeError::NotAnInput(node_id));
-            }
-            let current = canonical_value(&self.nodes[node_id.index()]);
-            let next = match (*write, &self.nodes[node_id.index()].state) {
-                (
-                    StateWrite::Numeric { value, .. },
-                    NodeState::Numeric {
-                        quantization,
-                        bucket,
-                    },
-                ) => CanonicalValue::Numeric(
-                    quantization.resolve(Some(*bucket), Estimate::point(value))?,
-                ),
-                (StateWrite::Atom { value, .. }, NodeState::Atom(_)) => CanonicalValue::Atom(value),
-                (StateWrite::Numeric { .. }, NodeState::Atom(_)) => {
-                    return Err(RuntimeError::ExpectedNumeric(node_id));
-                }
-                (StateWrite::Atom { .. }, NodeState::Numeric { .. }) => {
-                    return Err(RuntimeError::ExpectedAtom(node_id));
-                }
-            };
-            resolved.push((node_id, current, next));
-        }
-        Ok(resolved)
+        self.validated_writes(writes)
+            .map(|write| {
+                let (node, validated) = write?;
+                validated.resolve(node)
+            })
+            .collect()
     }
 
     fn commit_resolved_state_writes(
         &mut self,
         resolved: Vec<ResolvedWrite>,
     ) -> Result<(), RuntimeError> {
-        for (node, current, next) in resolved {
+        for ResolvedWrite {
+            node,
+            current,
+            next,
+        } in resolved
+        {
             if next != current {
                 self.nodes[node.index()].generation =
                     self.nodes[node.index()].generation.saturating_add(1);
@@ -1823,31 +1318,10 @@ impl Graph {
             old,
             new: value,
         });
-        let node_dependents: Vec<_> = node.dependents.iter().copied().collect();
-        for dependent in node_dependents {
-            self.mark_dirty(WorkId::Node(dependent));
-        }
-        let reaction_dependents: Vec<_> = self
-            .reaction_dependents
-            .get(&id)
-            .into_iter()
-            .flat_map(|dependents| dependents.iter().copied())
-            .collect();
-        for dependent in reaction_dependents {
-            self.mark_dirty(WorkId::Reaction(dependent));
+        for &dependent in &node.dependents {
+            self.dirty.mark(dependent);
         }
         Ok(())
-    }
-
-    fn mark_dirty(&mut self, work: WorkId) {
-        let already_dirty = match work {
-            WorkId::Node(id) => &mut self.node_is_dirty[id.index()],
-            WorkId::Reaction(id) => &mut self.reaction_is_dirty[id.index()],
-        };
-        if !*already_dirty {
-            *already_dirty = true;
-            self.dirty.push_back(work);
-        }
     }
 
     fn schedule_reaction_once(&mut self, reaction: ReactionId, request: ScheduledReevaluation) {
@@ -1894,193 +1368,6 @@ const fn canonical_value(node: &Node) -> CanonicalValue {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
-enum EventKind {
-    SetState {
-        write: StateWrite,
-    },
-    SetStateBatch {
-        writes: Vec<StateWrite>,
-    },
-    Commit {
-        node: NodeId,
-        generation: u64,
-        value: CanonicalValue,
-    },
-    Reevaluate {
-        node: NodeId,
-        generation: u64,
-    },
-    ReactionTransition {
-        reaction: ReactionId,
-        generation: u64,
-        writes: Vec<StateWrite>,
-        window_records: Vec<WindowRecord>,
-    },
-    ExternalReaction {
-        reaction: ReactionId,
-        token: Option<u64>,
-    },
-    ScheduledReaction {
-        reaction: ReactionId,
-        key: u64,
-    },
-}
-#[derive(Clone, Debug, PartialEq)]
-struct ScheduledEvent {
-    at: SimTime,
-    priority: i32,
-    sequence: u64,
-    kind: EventKind,
-}
-/// Ordering ignores payloads, including NaN numeric writes; equality
-/// remains reflexive because heap identity is its assigned scheduling key.
-#[derive(Debug)]
-struct HeapEvent(ScheduledEvent);
-impl PartialEq for HeapEvent {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.at == other.0.at
-            && self.0.priority == other.0.priority
-            && self.0.sequence == other.0.sequence
-    }
-}
-impl Eq for HeapEvent {}
-impl Ord for HeapEvent {
-    fn cmp(&self, other: &Self) -> Ordering {
-        other
-            .0
-            .at
-            .cmp(&self.0.at)
-            .then_with(|| other.0.priority.cmp(&self.0.priority))
-            .then_with(|| other.0.sequence.cmp(&self.0.sequence))
-    }
-}
-impl PartialOrd for HeapEvent {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-/// A FIFO queue per event key while the workload has few distinct keys.
-/// When events spread over many times/priorities, switch to a conventional
-/// binary heap to avoid tree-map allocation overhead on sparse schedules.
-const MAX_GROUPED_KEYS: usize = 128;
-
-enum EventStorage {
-    Grouped(BTreeMap<(SimTime, i32), VecDeque<ScheduledEvent>>),
-    Sparse(BinaryHeap<HeapEvent>),
-}
-
-struct EventQueue {
-    storage: EventStorage,
-    next_sequence: u64,
-}
-impl EventQueue {
-    const fn new() -> Self {
-        Self {
-            storage: EventStorage::Grouped(BTreeMap::new()),
-            next_sequence: 0,
-        }
-    }
-
-    fn peek(&self) -> Option<&ScheduledEvent> {
-        match &self.storage {
-            EventStorage::Grouped(groups) => groups.first_key_value()?.1.front(),
-            EventStorage::Sparse(heap) => heap.peek().map(|event| &event.0),
-        }
-    }
-
-    fn push(&mut self, mut event: ScheduledEvent) {
-        if self.next_sequence == u64::MAX {
-            self.resequence();
-        }
-        event.sequence = self.next_sequence;
-        self.next_sequence += 1;
-        match &mut self.storage {
-            EventStorage::Grouped(groups) => {
-                groups
-                    .entry((event.at, event.priority))
-                    .or_default()
-                    .push_back(event);
-                if groups.len() > MAX_GROUPED_KEYS {
-                    // Conversion is linear in the pending event count, and the
-                    // heap handles future mostly-distinct keys efficiently.
-                    let old = std::mem::replace(
-                        &mut self.storage,
-                        EventStorage::Sparse(BinaryHeap::new()),
-                    );
-                    if let EventStorage::Grouped(groups) = old {
-                        let heap = BinaryHeap::from(
-                            groups
-                                .into_values()
-                                .flatten()
-                                .map(HeapEvent)
-                                .collect::<Vec<_>>(),
-                        );
-                        self.storage = EventStorage::Sparse(heap);
-                    }
-                }
-            }
-            EventStorage::Sparse(heap) => heap.push(HeapEvent(event)),
-        }
-    }
-
-    fn restore_front(&mut self, event: ScheduledEvent) {
-        match &mut self.storage {
-            EventStorage::Grouped(groups) => groups
-                .entry((event.at, event.priority))
-                .or_default()
-                .push_front(event),
-            EventStorage::Sparse(heap) => heap.push(HeapEvent(event)),
-        }
-    }
-
-    fn pop(&mut self) -> Option<ScheduledEvent> {
-        match &mut self.storage {
-            EventStorage::Grouped(groups) => {
-                let mut first = groups.first_entry()?;
-                let event = first.get_mut().pop_front();
-                if first.get().is_empty() {
-                    first.remove();
-                }
-                event
-            }
-            EventStorage::Sparse(heap) => {
-                let event = heap.pop().map(|event| event.0);
-                if heap.is_empty() {
-                    self.storage = EventStorage::Grouped(BTreeMap::new());
-                }
-                event
-            }
-        }
-    }
-
-    fn resequence(&mut self) {
-        let mut sequence = 0;
-        match &mut self.storage {
-            EventStorage::Grouped(groups) => {
-                for group in groups.values_mut() {
-                    for event in group {
-                        event.sequence = sequence;
-                        sequence += 1;
-                    }
-                }
-            }
-            EventStorage::Sparse(heap) => {
-                let mut ordered = std::mem::take(heap).into_sorted_vec();
-                // Our Ord is a max-heap reversal of causal order, so the
-                // chronological sequence is the reverse of into_sorted_vec.
-                for event in ordered.iter_mut().rev() {
-                    event.0.sequence = sequence;
-                    sequence += 1;
-                }
-                *heap = BinaryHeap::from(ordered);
-            }
-        }
-        self.next_sequence = sequence;
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransitionRecord {
     pub at: SimTime,
@@ -2090,1706 +1377,5 @@ pub struct TransitionRecord {
     pub new: CanonicalValue,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum EvalError {
-    UnknownNode(NodeId),
-    ExpectedNumeric(NodeId),
-    ExpectedAtom(NodeId),
-    UnknownHistory(HistoryId),
-    Message(String),
-}
-impl fmt::Display for EvalError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::UnknownNode(id) => write!(f, "evaluator read unknown node {id:?}"),
-            Self::ExpectedNumeric(id) => write!(f, "evaluator expected numeric node {id:?}"),
-            Self::ExpectedAtom(id) => write!(f, "evaluator expected atom node {id:?}"),
-            Self::UnknownHistory(id) => write!(f, "evaluator read unknown history {id:?}"),
-            Self::Message(m) => f.write_str(m),
-        }
-    }
-}
-impl std::error::Error for EvalError {}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum InteractionIngressError {
-    QueuePoisoned,
-    Disconnected,
-}
-impl fmt::Display for InteractionIngressError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::QueuePoisoned => f.write_str("interaction ingress queue lock poisoned"),
-            Self::Disconnected => f.write_str("interaction ingress channel disconnected"),
-        }
-    }
-}
-impl std::error::Error for InteractionIngressError {}
-
-#[derive(Debug)]
-pub enum RuntimeError {
-    Quantize(QuantizeError),
-    UnknownNode(NodeId),
-    MissingEvaluator(NodeId),
-    NotAnInput(NodeId),
-    ExpectedNumeric(NodeId),
-    ExpectedAtom(NodeId),
-    TooManyNodes,
-    TooManyReactions,
-    TooManyHistories,
-    UnknownReaction(ReactionId),
-    UnknownHistory(HistoryId),
-    UnscheduledReactionEffects(ReactionId),
-    DuplicateStateWrite(NodeId),
-    InteractionIngress(InteractionIngressError),
-    InteractionProcessing {
-        import: InteractionImport,
-        source: Box<Self>,
-    },
-    NotQuiescent {
-        at: SimTime,
-        dirty_work: usize,
-        due_event: Option<SimTime>,
-    },
-    CorruptEventQueue,
-    EventInPast {
-        now: SimTime,
-        requested: SimTime,
-    },
-    Evaluation {
-        node: NodeId,
-        source: EvalError,
-    },
-    ReactionEvaluation {
-        reaction: ReactionId,
-        source: EvalError,
-    },
-    CalculationInstability {
-        at: SimTime,
-        microsteps: usize,
-        active_work: Vec<WorkId>,
-    },
-}
-impl fmt::Display for RuntimeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Quantize(e) => write!(f, "quantization failed: {e}"),
-            Self::UnknownNode(id) => write!(f, "unknown node {id:?}"),
-            Self::MissingEvaluator(id) => write!(f, "node {id:?} has no evaluator"),
-            Self::NotAnInput(id) => write!(f, "node {id:?} is derived, not an input"),
-            Self::ExpectedNumeric(id) => write!(f, "node {id:?} is not numeric"),
-            Self::ExpectedAtom(id) => write!(f, "node {id:?} is not an atom"),
-            Self::TooManyNodes => f.write_str("graph contains too many nodes"),
-            Self::TooManyReactions => f.write_str("graph contains too many reactions"),
-            Self::TooManyHistories => f.write_str("graph contains too many temporal histories"),
-            Self::UnknownReaction(id) => write!(f, "unknown reaction {id:?}"),
-            Self::UnknownHistory(id) => write!(f, "unknown temporal history {id:?}"),
-            Self::UnscheduledReactionEffects(id) => {
-                write!(
-                    f,
-                    "reaction {id:?} returned effects without a transition time"
-                )
-            }
-            Self::DuplicateStateWrite(id) => {
-                write!(
-                    f,
-                    "reaction transition writes state node {id:?} more than once"
-                )
-            }
-            Self::InteractionIngress(source) => write!(f, "interaction ingress failed: {source}"),
-            Self::InteractionProcessing { source, .. } => {
-                write!(f, "interaction processing failed after import: {source}")
-            }
-            Self::NotQuiescent {
-                at,
-                dirty_work,
-                due_event,
-            } => write!(
-                f,
-                "graph is not quiescent at {at:?}: {dirty_work} dirty work items, due event {due_event:?}"
-            ),
-            Self::CorruptEventQueue => f.write_str("event queue became inconsistent"),
-            Self::EventInPast { now, requested } => write!(
-                f,
-                "cannot move backwards: now={now:?}, requested={requested:?}"
-            ),
-            Self::Evaluation { node, source } => {
-                write!(f, "evaluation of {node:?} failed: {source}")
-            }
-            Self::ReactionEvaluation { reaction, source } => {
-                write!(f, "evaluation of reaction {reaction:?} failed: {source}")
-            }
-            Self::CalculationInstability {
-                at,
-                microsteps,
-                active_work,
-            } => write!(
-                f,
-                "calculation instability at {at:?} after {microsteps} same-time microsteps; active work: {active_work:?}"
-            ),
-        }
-    }
-}
-impl std::error::Error for RuntimeError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Quantize(e) => Some(e),
-            Self::Evaluation { source, .. } | Self::ReactionEvaluation { source, .. } => {
-                Some(source)
-            }
-            Self::InteractionIngress(source) => Some(source),
-            Self::InteractionProcessing { source, .. } => Some(source.as_ref()),
-            _ => None,
-        }
-    }
-}
-impl From<QuantizeError> for RuntimeError {
-    fn from(value: QuantizeError) -> Self {
-        Self::Quantize(value)
-    }
-}
-
 #[cfg(test)]
-mod tests {
-    use super::{
-        CanonicalValue, EvalError, EvalOutput, Graph, InteractionIngressError, ReactionOutput,
-        RuntimeConfig, RuntimeError, StateWrite, interaction_channel,
-    };
-    use quiescence_core::{Bucket, Quantization, SimDuration, SimTime};
-    use std::{
-        sync::{
-            Arc, Mutex,
-            atomic::{AtomicU64, AtomicUsize, Ordering},
-        },
-        thread,
-    };
-
-    fn q0() -> Result<Quantization, Box<dyn std::error::Error>> {
-        Ok(Quantization::new(0, 0)?)
-    }
-
-    #[test]
-    fn failed_node_evaluation_stays_dirty_until_retry() -> Result<(), Box<dyn std::error::Error>> {
-        let mut g = Graph::new(RuntimeConfig::default());
-        let source = g.add_input("source", q0()?, 1.0)?;
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let count = Arc::clone(&attempts);
-        let derived = g.add_derived("fallible", q0()?, 0.0, move |context| {
-            let value = context.read_f64(source)?;
-            if count.fetch_add(1, Ordering::Relaxed) == 0 {
-                return Err(EvalError::Message(String::from(
-                    "temporary evaluation error",
-                )));
-            }
-            Ok(EvalOutput::immediate(value))
-        })?;
-        assert!(matches!(g.settle(), Err(RuntimeError::Evaluation { .. })));
-        assert!(!g.is_quiescent());
-        assert_eq!(g.value_bucket(derived)?, Bucket::new(0));
-        g.set_input_now(source, 2.0)?;
-        assert_eq!(g.value_bucket(derived)?, Bucket::new(2));
-        assert!(g.is_quiescent());
-        assert_eq!(attempts.load(Ordering::Relaxed), 2);
-        Ok(())
-    }
-
-    #[test]
-    fn failed_reaction_keeps_previous_subscriptions_until_success()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let mut g = Graph::new(RuntimeConfig::default());
-        let gate = g.add_input("gate", q0()?, 0.0)?;
-        let previous = g.add_input("previous", q0()?, 1.0)?;
-        let replacement = g.add_input("replacement", q0()?, 2.0)?;
-        let retry_allowed = Arc::new(AtomicUsize::new(0));
-        let allow_retry = Arc::clone(&retry_allowed);
-        let reaction = g.add_reaction("dynamic subscriptions", move |context| {
-            if context.read_bool(gate)? {
-                context.read_bucket(replacement)?;
-                if allow_retry.load(Ordering::Relaxed) == 0 {
-                    return Ok(ReactionOutput::schedule_reaction_once_after(
-                        quiescence_core::ReactionId::from_index(u32::MAX),
-                        SimDuration::ZERO,
-                        0,
-                        0,
-                    ));
-                }
-            } else {
-                context.read_bucket(previous)?;
-            }
-            Ok(ReactionOutput::idle())
-        })?;
-        g.settle()?;
-        let before = &g.reactions[reaction.index()].dependencies;
-        assert!(before.contains(&gate));
-        assert!(before.contains(&previous));
-        assert!(!before.contains(&replacement));
-
-        assert!(matches!(
-            g.set_input_now(gate, 1.0),
-            Err(RuntimeError::UnknownReaction(_))
-        ));
-        let still_previous = &g.reactions[reaction.index()].dependencies;
-        assert!(still_previous.contains(&previous));
-        assert!(!still_previous.contains(&replacement));
-        assert!(!g.is_quiescent());
-
-        retry_allowed.store(1, Ordering::Relaxed);
-        g.settle()?;
-        let after = &g.reactions[reaction.index()].dependencies;
-        assert!(after.contains(&gate));
-        assert!(!after.contains(&previous));
-        assert!(after.contains(&replacement));
-        Ok(())
-    }
-
-    #[test]
-    fn invalid_reaction_output_is_retryable_without_partial_effects()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let mut g = Graph::new(RuntimeConfig::default());
-        let sink = g.add_input("sink", q0()?, 0.0)?;
-        let _reaction = g.add_reaction("bad callback target", move |_| {
-            Ok(ReactionOutput::immediate(vec![StateWrite::new(sink, 8.0)])
-                .and_schedule_reaction_once_after(
-                    quiescence_core::ReactionId::from_index(u32::MAX),
-                    SimDuration::ZERO,
-                    13,
-                    0,
-                ))
-        })?;
-        for _ in 0..2 {
-            assert!(matches!(g.settle(), Err(RuntimeError::UnknownReaction(_))));
-            assert!(!g.is_quiescent());
-            assert_eq!(g.value_bucket(sink)?, Bucket::new(0));
-            assert_eq!(g.take_transitions().len(), 0);
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn event_callback_retry_preserves_external_token() -> Result<(), Box<dyn std::error::Error>> {
-        let mut g = Graph::new(RuntimeConfig::default());
-        let tokens = Arc::new(Mutex::new(Vec::new()));
-        let observed = Arc::clone(&tokens);
-        let callback = g.add_event_callback("temporarily failing event", move |context| {
-            let mut recorded = observed
-                .lock()
-                .map_err(|_| EvalError::Message(String::from("token lock poisoned")))?;
-            recorded.push(context.external_token());
-            if recorded.len() == 1 {
-                return Err(EvalError::Message(String::from("temporary callback error")));
-            }
-            drop(recorded);
-            Ok(ReactionOutput::idle())
-        })?;
-        let at = SimTime::from_millis(12);
-        g.schedule_reaction_event_with_token(callback, at, 0, 0xdead)?;
-        assert!(matches!(
-            g.advance_to(at),
-            Err(RuntimeError::ReactionEvaluation { .. })
-        ));
-        assert!(!g.is_quiescent());
-        g.advance_to(at)?;
-        assert_eq!(
-            *tokens
-                .lock()
-                .map_err(|_| String::from("token lock poisoned"))?,
-            vec![Some(0xdead), Some(0xdead)]
-        );
-        assert!(g.is_quiescent());
-        Ok(())
-    }
-
-    #[test]
-    fn scheduled_callback_retry_preserves_key() -> Result<(), Box<dyn std::error::Error>> {
-        let mut g = Graph::new(RuntimeConfig::default());
-        let keys = Arc::new(Mutex::new(Vec::new()));
-        let observed = Arc::clone(&keys);
-        let callback =
-            g.add_event_callback("temporarily failing scheduled callback", move |c| {
-                let mut recorded = observed
-                    .lock()
-                    .map_err(|_| EvalError::Message(String::from("key lock poisoned")))?;
-                recorded.push(c.scheduled_key());
-                if recorded.len() == 1 {
-                    return Err(EvalError::Message(String::from(
-                        "temporary scheduled error",
-                    )));
-                }
-                drop(recorded);
-                Ok(ReactionOutput::idle())
-            })?;
-        let _scheduler = g.add_reaction("schedule once", move |_| {
-            Ok(ReactionOutput::schedule_reaction_once_after(
-                callback,
-                SimDuration::from_millis(5),
-                71,
-                0,
-            ))
-        })?;
-        g.settle()?;
-        let at = SimTime::from_millis(5);
-        assert!(matches!(
-            g.advance_to(at),
-            Err(RuntimeError::ReactionEvaluation { .. })
-        ));
-        assert!(!g.is_quiescent());
-        g.advance_to(at)?;
-        assert_eq!(
-            *keys.lock().map_err(|_| String::from("key lock poisoned"))?,
-            vec![Some(71), Some(71)]
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn grouped_event_queue_preserves_priority_fifo_and_failed_event_position()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let mut queue = super::EventQueue::new();
-        let at = SimTime::from_millis(1);
-        let reaction = quiescence_core::ReactionId::from_index(0);
-        let event = |priority, token| super::ScheduledEvent {
-            at,
-            priority,
-            sequence: 0,
-            kind: super::EventKind::ExternalReaction {
-                reaction,
-                token: Some(token),
-            },
-        };
-        queue.push(event(2, 1));
-        queue.push(event(2, 2));
-        queue.push(event(3, 3));
-        assert_eq!(queue.peek().map(|e| &e.kind), Some(&event(2, 1).kind));
-        let failed = queue.pop().ok_or("queue unexpectedly empty")?;
-        assert_eq!(failed.kind, event(2, 1).kind);
-        queue.restore_front(failed);
-        queue.push(event(-1, 99));
-        assert_eq!(queue.pop().map(|e| e.kind), Some(event(-1, 99).kind));
-        assert_eq!(queue.pop().map(|e| e.kind), Some(event(2, 1).kind));
-        assert_eq!(queue.pop().map(|e| e.kind), Some(event(2, 2).kind));
-        assert_eq!(queue.pop().map(|e| e.kind), Some(event(3, 3).kind));
-        assert_eq!(queue.pop(), None);
-        Ok(())
-    }
-
-    #[test]
-    fn sparse_fallback_keeps_fifo_and_retry_priority() -> Result<(), Box<dyn std::error::Error>> {
-        let mut queue = super::EventQueue::new();
-        let reaction = quiescence_core::ReactionId::from_index(0);
-        let at = SimTime::from_nanos(8);
-        let event = |priority, token| super::ScheduledEvent {
-            at,
-            priority,
-            sequence: 0,
-            kind: super::EventKind::ExternalReaction {
-                reaction,
-                token: Some(token),
-            },
-        };
-        for index in 0..=super::MAX_GROUPED_KEYS {
-            queue.push(event(i32::try_from(index)?, u64::try_from(index)?));
-        }
-        assert!(matches!(&queue.storage, super::EventStorage::Sparse(_)));
-        queue.push(event(17, 999));
-        let failed = queue.pop().ok_or("sparse queue unexpectedly empty")?;
-        queue.restore_front(failed);
-        for index in 0..=super::MAX_GROUPED_KEYS {
-            assert_eq!(
-                queue.pop().map(|e| e.kind),
-                Some(event(i32::try_from(index)?, u64::try_from(index)?).kind)
-            );
-            if index == 17 {
-                assert_eq!(queue.pop().map(|e| e.kind), Some(event(17, 999).kind));
-            }
-        }
-        assert_eq!(queue.pop(), None);
-        assert!(matches!(&queue.storage, super::EventStorage::Grouped(_)));
-        Ok(())
-    }
-
-    #[test]
-    fn sequence_rebase_preserves_fifo_in_both_storage_modes()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let reaction = quiescence_core::ReactionId::from_index(0);
-        let event = |priority, token| super::ScheduledEvent {
-            at: SimTime::ZERO,
-            priority,
-            sequence: 0,
-            kind: super::EventKind::ExternalReaction {
-                reaction,
-                token: Some(token),
-            },
-        };
-        let mut grouped = super::EventQueue::new();
-        grouped.push(event(0, 1));
-        grouped.push(event(0, 2));
-        grouped.next_sequence = u64::MAX;
-        grouped.push(event(0, 3));
-        assert_eq!(grouped.pop().map(|e| e.kind), Some(event(0, 1).kind));
-        assert_eq!(grouped.pop().map(|e| e.kind), Some(event(0, 2).kind));
-        assert_eq!(grouped.pop().map(|e| e.kind), Some(event(0, 3).kind));
-
-        let mut sparse = super::EventQueue::new();
-        for index in 0..=super::MAX_GROUPED_KEYS {
-            sparse.push(event(i32::try_from(index)?, u64::try_from(index)?));
-        }
-        sparse.push(event(17, 999));
-        assert!(matches!(&sparse.storage, super::EventStorage::Sparse(_)));
-        sparse.next_sequence = u64::MAX;
-        sparse.push(event(17, 1_000));
-        for index in 0..=super::MAX_GROUPED_KEYS {
-            assert_eq!(
-                sparse.pop().map(|e| e.kind),
-                Some(event(i32::try_from(index)?, u64::try_from(index)?).kind)
-            );
-            if index == 17 {
-                assert_eq!(sparse.pop().map(|e| e.kind), Some(event(17, 999).kind));
-                assert_eq!(sparse.pop().map(|e| e.kind), Some(event(17, 1_000).kind));
-            }
-        }
-        assert_eq!(sparse.pop(), None);
-        Ok(())
-    }
-
-    #[test]
-    fn adaptive_queue_matches_reference_heap_under_interleaved_operations()
-    -> Result<(), Box<dyn std::error::Error>> {
-        // Deterministic mixes repeatedly cross the grouped/sparse threshold,
-        // insert earlier priorities after later ones, and retry popped work.
-        for distinct_keys in [1_u64, 64, 4_096] {
-            let mut queue = super::EventQueue::new();
-            let mut reference = std::collections::BinaryHeap::<super::HeapEvent>::new();
-            let reaction = quiescence_core::ReactionId::from_index(0);
-            let mut random = 0x9e37_79b9_7f4a_7c15_u64;
-            let mut next_sequence = 0_u64;
-            for turn in 0_u64..24_000 {
-                random ^= random << 13;
-                random ^= random >> 7;
-                random ^= random << 17;
-                if turn < 256 || random & 3 != 0 {
-                    let key = (random >> 8) % distinct_keys;
-                    let event = super::ScheduledEvent {
-                        at: SimTime::from_nanos(i64::try_from(key / 4)?),
-                        priority: i32::try_from(key % 4)? - 2,
-                        sequence: next_sequence,
-                        kind: super::EventKind::ExternalReaction {
-                            reaction,
-                            token: Some(turn),
-                        },
-                    };
-                    next_sequence += 1;
-                    queue.push(event.clone());
-                    reference.push(super::HeapEvent(event));
-                } else {
-                    assert_eq!(queue.peek(), reference.peek().map(|entry| &entry.0));
-                    let actual = queue.pop();
-                    let expected = reference.pop().map(|entry| entry.0);
-                    assert_eq!(actual, expected);
-                    if random.trailing_zeros() >= 7
-                        && let Some(event) = actual
-                    {
-                        queue.restore_front(event.clone());
-                        reference.push(super::HeapEvent(event));
-                    }
-                }
-            }
-            while let Some(expected) = reference.pop() {
-                assert_eq!(queue.pop(), Some(expected.0));
-            }
-            assert_eq!(queue.pop(), None);
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn sparse_heap_ordering_is_reflexive_for_nan_payloads() {
-        let node = quiescence_core::NodeId::from_index(0);
-        let event = super::HeapEvent(super::ScheduledEvent {
-            at: SimTime::ZERO,
-            priority: 0,
-            sequence: 0,
-            kind: super::EventKind::SetState {
-                write: StateWrite::new(node, f64::NAN),
-            },
-        });
-        assert_eq!(event, event);
-    }
-
-    #[test]
-    fn newly_scheduled_higher_priority_callback_preempts_existing_event()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let mut graph = Graph::new(RuntimeConfig::default());
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let captured = Arc::clone(&seen);
-        let target = graph.add_event_callback("target", move |context| {
-            captured
-                .lock()
-                .map_err(|_| EvalError::Message(String::from("capture lock poisoned")))?
-                .push((context.scheduled_key(), context.external_token()));
-            Ok(ReactionOutput::idle())
-        })?;
-        let producer = graph.add_event_callback("producer", move |_| {
-            Ok(ReactionOutput::schedule_reaction_once_after(
-                target,
-                SimDuration::ZERO,
-                55,
-                -5,
-            ))
-        })?;
-        graph.schedule_reaction_event(producer, SimTime::ZERO, 0)?;
-        graph.schedule_reaction_event_with_token(target, SimTime::ZERO, 10, 9)?;
-        graph.advance_to(SimTime::ZERO)?;
-        assert_eq!(
-            *seen
-                .lock()
-                .map_err(|_| String::from("capture lock poisoned"))?,
-            vec![(Some(55), None), (None, Some(9))]
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn failed_scheduled_write_remains_in_causal_queue() -> Result<(), Box<dyn std::error::Error>> {
-        let mut g = Graph::new(RuntimeConfig::default());
-        let node = g.add_input("node", q0()?, 0.0)?;
-        let at = SimTime::from_millis(8);
-        g.schedule_input(node, at, 1e100)?;
-        let original_event = g.events.peek().cloned();
-        for _ in 0..2 {
-            assert!(matches!(g.advance_to(at), Err(RuntimeError::Quantize(_))));
-            assert_eq!(g.next_event_time(), Some(at));
-            assert_eq!(g.events.peek().cloned(), original_event);
-            assert!(!g.is_quiescent());
-            assert_eq!(g.value_bucket(node)?, Bucket::new(0));
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn budget_exhaustion_preserves_pending_work_for_retry() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let mut g = Graph::new(RuntimeConfig {
-            same_time_microstep_budget: 1,
-        });
-        let first = g.add_derived("first", q0()?, 0.0, |_| Ok(EvalOutput::immediate(1.0)))?;
-        let second = g.add_derived("second", q0()?, 0.0, |_| Ok(EvalOutput::immediate(2.0)))?;
-        assert!(matches!(
-            g.settle(),
-            Err(RuntimeError::CalculationInstability { .. })
-        ));
-        assert!(!g.is_quiescent());
-        g.config.same_time_microstep_budget = 2;
-        g.settle()?;
-        assert!(g.is_quiescent());
-        assert_eq!(g.value_bucket(first)?, Bucket::new(1));
-        assert_eq!(g.value_bucket(second)?, Bucket::new(2));
-        Ok(())
-    }
-
-    #[test]
-    fn zero_delay_scheduled_callbacks_respect_same_time_budget()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let mut g = Graph::new(RuntimeConfig {
-            same_time_microstep_budget: 32,
-        });
-        let counter = Arc::new(AtomicU64::new(0));
-        let callback_counter = Arc::clone(&counter);
-        let callback = g.add_event_callback("self-reschedule", move |_| {
-            let key = callback_counter.fetch_add(1, Ordering::Relaxed);
-            Ok(ReactionOutput::schedule_once_after(
-                SimDuration::ZERO,
-                key,
-                0,
-            ))
-        })?;
-        g.schedule_reaction_event(callback, SimTime::ZERO, 0)?;
-        assert!(matches!(
-            g.advance_to(SimTime::ZERO),
-            Err(RuntimeError::CalculationInstability { .. })
-        ));
-        assert!(!g.is_quiescent());
-        assert!(counter.load(Ordering::Relaxed) <= 32);
-        Ok(())
-    }
-
-    #[test]
-    fn scheduled_writes_validate_target_before_entering_queue()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let mut g = Graph::new(RuntimeConfig::default());
-        let atom = g.add_atom_input("atom", 5)?;
-        let numeric = g.add_input("numeric", q0()?, 1.0)?;
-        let derived = g.add_derived("derived", q0()?, 1.0, |_| Ok(EvalOutput::immediate(1.0)))?;
-        assert!(matches!(
-            g.schedule_input(atom, SimTime::ZERO, 1.0),
-            Err(RuntimeError::ExpectedNumeric(_))
-        ));
-        assert!(matches!(
-            g.schedule_atom(numeric, SimTime::ZERO, 4),
-            Err(RuntimeError::ExpectedAtom(_))
-        ));
-        assert!(matches!(
-            g.schedule_input(derived, SimTime::ZERO, 1.0),
-            Err(RuntimeError::NotAnInput(_))
-        ));
-        assert!(matches!(
-            g.schedule_input(numeric, SimTime::ZERO, f64::NAN),
-            Err(RuntimeError::Quantize(_))
-        ));
-        assert_eq!(g.next_event_time(), None);
-        Ok(())
-    }
-
-    #[test]
-    fn invalid_callback_target_does_not_commit_reaction_writes()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let mut g = Graph::new(RuntimeConfig::default());
-        let output = g.add_input("output", q0()?, 0.0)?;
-        let _reaction = g.add_reaction("invalid callback target", move |_| {
-            Ok(
-                ReactionOutput::immediate(vec![StateWrite::new(output, 5.0)])
-                    .and_schedule_reaction_once_after(
-                        quiescence_core::ReactionId::from_index(999),
-                        SimDuration::ZERO,
-                        0,
-                        0,
-                    ),
-            )
-        })?;
-        assert!(matches!(g.settle(), Err(RuntimeError::UnknownReaction(_))));
-        assert_eq!(g.value_bucket(output)?, Bucket::new(0));
-        Ok(())
-    }
-
-    #[test]
-    fn event_window_handles_full_i64_time_span() {
-        let mut window = super::EventWindow {
-            name: String::from("extreme time"),
-            duration: SimDuration::from_nanos(i64::MAX),
-            events: std::collections::VecDeque::new(),
-        };
-        window.record(SimTime::from_nanos(i64::MIN), 1);
-        assert_eq!(window.count_at(SimTime::from_nanos(i64::MAX), 1), 0);
-        window.record(SimTime::from_nanos(i64::MAX), 1);
-        assert_eq!(window.events.len(), 1);
-    }
-
-    #[test]
-    fn unchanged_bucket_cuts_off_propagation() -> Result<(), Box<dyn std::error::Error>> {
-        let mut g = Graph::new(RuntimeConfig::default());
-        let source = g.add_input("source", Quantization::new(2, 0)?, 1.00)?;
-        let middle = g.add_derived("middle", q0()?, 1.0, move |c| {
-            Ok(EvalOutput::immediate(c.read_f64(source)?))
-        })?;
-        let calls = Arc::new(AtomicUsize::new(0));
-        let calls2 = Arc::clone(&calls);
-        let _sink = g.add_derived("sink", q0()?, 1.0, move |c| {
-            calls2.fetch_add(1, Ordering::Relaxed);
-            Ok(EvalOutput::immediate(c.read_f64(middle)?))
-        })?;
-        g.settle()?;
-        let before = calls.load(Ordering::Relaxed);
-        g.set_input_now(source, 1.04)?;
-        assert_eq!(g.value_f64(middle)?, 1.0);
-        assert_eq!(calls.load(Ordering::Relaxed), before);
-        Ok(())
-    }
-
-    #[test]
-    fn delay_is_just_another_node() -> Result<(), Box<dyn std::error::Error>> {
-        let mut g = Graph::new(RuntimeConfig::default());
-        let command = g.add_input("command", q0()?, 0.0)?;
-        let reaction = g.add_input("reaction_ms", q0()?, 50.0)?;
-        let out = g.add_derived("out", q0()?, 0.0, move |c| {
-            Ok(EvalOutput::after(
-                c.read_f64(command)?,
-                SimDuration::from_millis(c.read_bucket(reaction)?.raw()),
-            ))
-        })?;
-        g.settle()?;
-        g.set_input_now(command, 1.0)?;
-        g.advance_to(SimTime::from_millis(49))?;
-        assert_eq!(g.value_f64(out)?, 0.0);
-        g.advance_to(SimTime::from_millis(50))?;
-        assert_eq!(g.value_f64(out)?, 1.0);
-        Ok(())
-    }
-
-    #[test]
-    fn dynamic_dependencies_cull_irrelevant_branch() -> Result<(), Box<dyn std::error::Error>> {
-        let mut g = Graph::new(RuntimeConfig::default());
-        let enabled = g.add_input("enabled", q0()?, 0.0)?;
-        let source = g.add_input("source", q0()?, 10.0)?;
-        let calls = Arc::new(AtomicUsize::new(0));
-        let calls2 = Arc::clone(&calls);
-        let _gated = g.add_derived("gated", q0()?, 0.0, move |c| {
-            calls2.fetch_add(1, Ordering::Relaxed);
-            if c.read_bool(enabled)? {
-                Ok(EvalOutput::immediate(c.read_f64(source)?))
-            } else {
-                Ok(EvalOutput::immediate(0.0))
-            }
-        })?;
-        g.settle()?;
-        let before = calls.load(Ordering::Relaxed);
-        g.set_input_now(source, 11.0)?;
-        assert_eq!(calls.load(Ordering::Relaxed), before);
-        g.set_input_now(enabled, 1.0)?;
-        assert!(calls.load(Ordering::Relaxed) > before);
-        Ok(())
-    }
-
-    #[test]
-    fn reaction_forecast_is_invalidated_when_a_dependency_changes()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let mut g = Graph::new(RuntimeConfig::default());
-        let enabled = g.add_input("enabled", q0()?, 0.0)?;
-        let output = g.add_input("output", q0()?, 0.0)?;
-        let reaction = g.add_reaction("delayed output", move |c| {
-            if c.read_bool(enabled)? {
-                Ok(ReactionOutput::after(
-                    SimDuration::from_millis(10),
-                    vec![StateWrite::new(output, 1.0)],
-                ))
-            } else {
-                Ok(ReactionOutput::idle())
-            }
-        })?;
-        g.settle()?;
-        assert_eq!(g.reaction_name(reaction)?, "delayed output");
-
-        g.set_input_now(enabled, 1.0)?;
-        assert_eq!(g.next_event_time(), Some(SimTime::from_millis(10)));
-        g.advance_to(SimTime::from_millis(5))?;
-        g.set_input_now(enabled, 0.0)?;
-        g.advance_to(SimTime::from_millis(10))?;
-        assert_eq!(g.value_f64(output)?, 0.0);
-        Ok(())
-    }
-
-    #[test]
-    fn reaction_transition_applies_multiple_state_writes_before_dependents_run()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let mut g = Graph::new(RuntimeConfig::default());
-        let trigger = g.add_input("trigger", q0()?, 0.0)?;
-        let left = g.add_input("left", q0()?, 0.0)?;
-        let right = g.add_input("right", q0()?, 0.0)?;
-        let mismatches = Arc::new(AtomicUsize::new(0));
-        let seen = Arc::clone(&mismatches);
-        let _observer = g.add_derived("observer", q0()?, 0.0, move |c| {
-            let left_value = c.read_f64(left)?;
-            let right_value = c.read_f64(right)?;
-            if c.read_bucket(left)? != c.read_bucket(right)? {
-                seen.fetch_add(1, Ordering::Relaxed);
-            }
-            Ok(EvalOutput::immediate(left_value + right_value))
-        })?;
-        let _reaction = g.add_reaction("paired write", move |c| {
-            if c.read_bool(trigger)? {
-                Ok(ReactionOutput::after(
-                    SimDuration::from_millis(1),
-                    vec![StateWrite::new(left, 1.0), StateWrite::new(right, 1.0)],
-                ))
-            } else {
-                Ok(ReactionOutput::idle())
-            }
-        })?;
-        g.settle()?;
-        g.set_input_now(trigger, 1.0)?;
-        g.advance_to(SimTime::from_millis(1))?;
-        assert_eq!(g.value_f64(left)?, 1.0);
-        assert_eq!(g.value_f64(right)?, 1.0);
-        assert_eq!(mismatches.load(Ordering::Relaxed), 0);
-        Ok(())
-    }
-
-    #[test]
-    fn reaction_dependencies_are_dynamic() -> Result<(), Box<dyn std::error::Error>> {
-        let mut g = Graph::new(RuntimeConfig::default());
-        let enabled = g.add_input("enabled", q0()?, 0.0)?;
-        let source = g.add_input("source", q0()?, 1.0)?;
-        let sink = g.add_input("sink", q0()?, 0.0)?;
-        let evaluations = Arc::new(AtomicUsize::new(0));
-        let calls = Arc::clone(&evaluations);
-        let _reaction = g.add_reaction("gated copy", move |c| {
-            calls.fetch_add(1, Ordering::Relaxed);
-            if !c.read_bool(enabled)? {
-                return Ok(ReactionOutput::idle());
-            }
-            Ok(ReactionOutput::immediate(vec![StateWrite::new(
-                sink,
-                c.read_f64(source)?,
-            )]))
-        })?;
-        g.settle()?;
-        let before = evaluations.load(Ordering::Relaxed);
-        g.set_input_now(source, 2.0)?;
-        assert_eq!(evaluations.load(Ordering::Relaxed), before);
-        g.set_input_now(enabled, 1.0)?;
-        assert_eq!(g.value_f64(sink)?, 2.0);
-        Ok(())
-    }
-
-    #[test]
-    fn atom_state_uses_exact_equality_and_dynamic_dependencies()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let mut g = Graph::new(RuntimeConfig::default());
-        let snapshot = g.add_atom_input("inventory_snapshot", 10)?;
-        let sink = g.add_atom_input("sink", 0)?;
-        let evaluations = Arc::new(AtomicUsize::new(0));
-        let calls = Arc::clone(&evaluations);
-        let _reaction = g.add_reaction("observe snapshot", move |c| {
-            calls.fetch_add(1, Ordering::Relaxed);
-            let snapshot_value = c.read_atom(snapshot)?;
-            Ok(ReactionOutput::immediate(vec![StateWrite::atom(
-                sink,
-                snapshot_value,
-            )]))
-        })?;
-        g.settle()?;
-        assert_eq!(g.value_atom(snapshot)?, 10);
-        assert_eq!(g.value_atom(sink)?, 10);
-        let before = evaluations.load(Ordering::Relaxed);
-
-        g.set_atom_now(snapshot, 10)?;
-        assert_eq!(evaluations.load(Ordering::Relaxed), before);
-        g.set_atom_now(snapshot, 11)?;
-        assert!(evaluations.load(Ordering::Relaxed) > before);
-        assert_eq!(g.value_atom(sink)?, 11);
-        Ok(())
-    }
-
-    #[test]
-    fn scheduled_atom_change_invalidates_reaction_forecast()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let mut g = Graph::new(RuntimeConfig::default());
-        let snapshot = g.add_atom_input("snapshot", 1)?;
-        let output = g.add_input("output", q0()?, 0.0)?;
-        let _reaction = g.add_reaction("snapshot forecast", move |c| {
-            if c.read_atom(snapshot)? == 1 {
-                Ok(ReactionOutput::after(
-                    SimDuration::from_millis(10),
-                    vec![StateWrite::new(output, 1.0)],
-                ))
-            } else {
-                Ok(ReactionOutput::idle())
-            }
-        })?;
-        g.settle()?;
-        assert_eq!(g.next_event_time(), Some(SimTime::from_millis(10)));
-        g.schedule_atom(snapshot, SimTime::from_millis(5), 2)?;
-        g.advance_to(SimTime::from_millis(10))?;
-        assert_eq!(g.value_atom(snapshot)?, 2);
-        assert_eq!(g.value_f64(output)?, 0.0);
-        Ok(())
-    }
-
-    #[test]
-    fn mixed_numeric_and_atom_reaction_writes_are_atomic() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let mut g = Graph::new(RuntimeConfig::default());
-        let trigger = g.add_input("trigger", q0()?, 0.0)?;
-        let count = g.add_input("count", q0()?, 0.0)?;
-        let snapshot = g.add_atom_input("snapshot", 100)?;
-        let mismatches = Arc::new(AtomicUsize::new(0));
-        let seen = Arc::clone(&mismatches);
-        let _observer = g.add_derived("observer", q0()?, 0.0, move |c| {
-            let count_value = u64::try_from(c.read_bucket(count)?.raw())
-                .map_err(|_| EvalError::Message(String::from("count bucket is negative")))?;
-            let snapshot_value = c.read_atom(snapshot)?;
-            if snapshot_value != count_value + 100 {
-                seen.fetch_add(1, Ordering::Relaxed);
-            }
-            Ok(EvalOutput::immediate(c.read_f64(count)?))
-        })?;
-        let _reaction = g.add_reaction("mixed transaction", move |c| {
-            if c.read_bool(trigger)? {
-                Ok(ReactionOutput::after(
-                    SimDuration::from_millis(1),
-                    vec![StateWrite::new(count, 1.0), StateWrite::atom(snapshot, 101)],
-                ))
-            } else {
-                Ok(ReactionOutput::idle())
-            }
-        })?;
-        g.settle()?;
-        g.set_input_now(trigger, 1.0)?;
-        g.advance_to(SimTime::from_millis(1))?;
-        assert_eq!(g.value_f64(count)?, 1.0);
-        assert_eq!(g.value_atom(snapshot)?, 101);
-        assert_eq!(mismatches.load(Ordering::Relaxed), 0);
-        Ok(())
-    }
-
-    #[test]
-    fn node_kinds_are_checked_at_runtime() -> Result<(), Box<dyn std::error::Error>> {
-        let mut g = Graph::new(RuntimeConfig::default());
-        let numeric = g.add_input("numeric", q0()?, 1.0)?;
-        let atom = g.add_atom_input("atom", 7)?;
-        assert!(
-            matches!(g.value_atom(numeric), Err(RuntimeError::ExpectedAtom(id)) if id == numeric)
-        );
-        assert!(matches!(g.value_f64(atom), Err(RuntimeError::ExpectedNumeric(id)) if id == atom));
-        assert!(matches!(
-            g.set_input_now(atom, 1.0),
-            Err(RuntimeError::ExpectedNumeric(id)) if id == atom
-        ));
-        assert!(matches!(
-            g.set_atom_now(numeric, 8),
-            Err(RuntimeError::ExpectedAtom(id)) if id == numeric
-        ));
-        Ok(())
-    }
-
-    #[test]
-    fn lazy_event_window_counts_keyed_history_without_expiry_wakeups()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let mut g = Graph::new(RuntimeConfig::default());
-        let history = g.add_event_window("toggle history", SimDuration::from_millis(60))?;
-        let burned_out = g.add_input("burned out", q0()?, 0.0)?;
-        let key = 0x00ab_cdef_u64;
-        let reaction = g.add_reaction("window threshold", move |c| {
-            if c.now() == SimTime::ZERO {
-                return Ok(ReactionOutput::idle());
-            }
-            let next_count = c.window_count(history, key)?.saturating_add(1);
-            let writes = if next_count >= 8 {
-                vec![StateWrite::new(burned_out, 1.0)]
-            } else {
-                Vec::new()
-            };
-            Ok(ReactionOutput::immediate(writes).and_record_window(history, key))
-        })?;
-        g.settle()?;
-
-        for millisecond in 1..=7 {
-            g.schedule_reaction_event(reaction, SimTime::from_millis(millisecond), 0)?;
-        }
-        g.advance_to(SimTime::from_millis(7))?;
-        assert_eq!(g.event_window_count(history, key)?, 7);
-        assert_eq!(g.value_f64(burned_out)?, 0.0);
-
-        g.schedule_reaction_event(reaction, SimTime::from_millis(8), 0)?;
-        g.advance_to(SimTime::from_millis(8))?;
-        assert_eq!(g.event_window_count(history, key)?, 8);
-        assert_eq!(g.value_f64(burned_out)?, 1.0);
-        assert_eq!(g.next_event_time(), None);
-
-        g.advance_to(SimTime::from_millis(61))?;
-        assert_eq!(g.event_window_count(history, key)?, 8);
-        g.advance_to(SimTime::from_millis(62))?;
-        assert_eq!(g.event_window_count(history, key)?, 7);
-        g.advance_to(SimTime::from_millis(69))?;
-        assert_eq!(g.event_window_count(history, key)?, 0);
-        Ok(())
-    }
-
-    #[test]
-    fn interaction_ingress_crosses_threads_and_returns_quiescent_snapshot()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let mut g = Graph::new(RuntimeConfig::default());
-        let left = g.add_atom_input("left", 0)?;
-        let right = g.add_atom_input("right", 0)?;
-        let mismatches = Arc::new(AtomicUsize::new(0));
-        let seen_mismatch = Arc::clone(&mismatches);
-        let _observer = g.add_derived("paired observer", q0()?, 0.0, move |context| {
-            let left_value = context.read_atom(left)?;
-            let right_value = context.read_atom(right)?;
-            if left_value != right_value {
-                seen_mismatch.fetch_add(1, Ordering::Relaxed);
-            }
-            Ok(EvalOutput::immediate(0.0))
-        })?;
-        let callbacks = Arc::new(Mutex::new(Vec::new()));
-        let observed = Arc::clone(&callbacks);
-        let callback = g.add_event_callback("background interaction", move |context| {
-            observed
-                .lock()
-                .map_err(|_| EvalError::Message(String::from("callback capture lock poisoned")))?
-                .push((context.now(), context.external_token()));
-            Ok(ReactionOutput::idle())
-        })?;
-        g.quiesce()?;
-        g.advance_to(SimTime::from_millis(25))?;
-        let _baseline = g.publish_quiescent()?;
-        let (sender, inbox) = interaction_channel();
-        let producer = thread::spawn(move || -> Result<(), InteractionIngressError> {
-            sender.state_now(
-                -1,
-                vec![StateWrite::atom(left, 1), StateWrite::atom(right, 1)],
-            )?;
-            sender.callback_now_with_token(callback, 0, 77)?;
-            sender.callback_now_with_token(callback, 0, 77)?;
-            Ok(())
-        });
-        producer
-            .join()
-            .map_err(|_| String::from("interaction producer thread panicked"))??;
-        assert_eq!(inbox.pending_count()?, 3);
-        let (processed, publication) = g.process_interactions_and_publish(&inbox)?;
-        assert_eq!(processed.accepted, 3);
-        assert_eq!(processed.rejected.len(), 0);
-        assert_eq!(inbox.pending_count()?, 0);
-        assert!(g.is_quiescent());
-        assert_eq!(mismatches.load(Ordering::Relaxed), 0);
-        assert_eq!(
-            *callbacks
-                .lock()
-                .map_err(|_| String::from("callback capture lock poisoned"))?,
-            vec![
-                (SimTime::from_millis(25), Some(77)),
-                (SimTime::from_millis(25), Some(77)),
-            ]
-        );
-        assert_eq!(publication.snapshot.at, SimTime::from_millis(25));
-        assert_eq!(publication.snapshot.next_event_time, None);
-        assert_eq!(
-            publication.snapshot.value(left),
-            Some(CanonicalValue::Atom(1))
-        );
-        assert_eq!(
-            publication.snapshot.value(right),
-            Some(CanonicalValue::Atom(1))
-        );
-        assert_eq!(publication.snapshot.node_count(), 3);
-        assert!(
-            publication
-                .transitions
-                .iter()
-                .any(|record| record.node == left)
-        );
-        assert!(
-            publication
-                .transitions
-                .iter()
-                .any(|record| record.node == right)
-        );
-        assert_eq!(g.publish_quiescent()?.transitions.len(), 0);
-        Ok(())
-    }
-
-    #[test]
-    fn interaction_inbox_waits_without_polling_and_wakes_on_submit()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let (sender, inbox) = interaction_channel();
-        let waiter = thread::spawn(move || inbox.wait_for_pending());
-        sender.state_now(0, Vec::new())?;
-        let pending = waiter
-            .join()
-            .map_err(|_| String::from("interaction waiter thread panicked"))??;
-        assert_eq!(pending, 1);
-        Ok(())
-    }
-
-    #[test]
-    fn last_sender_drop_wakes_blocked_inbox() -> Result<(), Box<dyn std::error::Error>> {
-        let (sender, inbox) = interaction_channel();
-        let cloned = sender.clone();
-        let waiter = thread::spawn(move || inbox.wait_for_pending());
-        drop(sender);
-        drop(cloned);
-        let result = waiter
-            .join()
-            .map_err(|_| String::from("interaction waiter thread panicked"))?;
-        assert_eq!(result, Err(InteractionIngressError::Disconnected));
-        Ok(())
-    }
-
-    #[test]
-    fn closed_producer_side_drains_existing_queue_before_shutdown()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let (sender, inbox) = interaction_channel();
-        sender.state_now(0, Vec::new())?;
-        drop(sender);
-        assert_eq!(inbox.wait_for_pending()?, 1);
-        let mut graph = Graph::new(RuntimeConfig::default());
-        let result = graph.process_interactions(&inbox)?;
-        assert_eq!(result.accepted, 1);
-        assert_eq!(result.rejected.len(), 0);
-        assert_eq!(inbox.pending_count()?, 0);
-        assert_eq!(
-            inbox.wait_for_pending(),
-            Err(InteractionIngressError::Disconnected)
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn dropping_inbox_disconnects_all_sender_clones_and_releases_queue()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let (sender, inbox) = interaction_channel();
-        let clone = sender.clone();
-        sender.state_now(0, Vec::new())?;
-        drop(inbox);
-        assert_eq!(
-            sender.state_now(0, Vec::new()),
-            Err(InteractionIngressError::Disconnected)
-        );
-        assert_eq!(
-            clone.state_now(0, Vec::new()),
-            Err(InteractionIngressError::Disconnected)
-        );
-        let pending = sender
-            .shared
-            .queue
-            .lock()
-            .map_err(|_| String::from("ingress lock poisoned"))?
-            .pending
-            .len();
-        assert_eq!(pending, 0);
-        Ok(())
-    }
-
-    #[test]
-    fn evaluation_failure_after_import_keeps_rejected_items_visible()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let mut graph = Graph::new(RuntimeConfig::default());
-        let input = graph.add_input("input", q0()?, 0.0)?;
-        let _derived = graph.add_derived("fallible", q0()?, 0.0, move |context| {
-            let value = context.read_f64(input)?;
-            if value > 0.0 {
-                return Err(EvalError::Message(String::from("transient failure")));
-            }
-            Ok(EvalOutput::immediate(value))
-        })?;
-        graph.quiesce()?;
-        let (sender, inbox) = interaction_channel();
-        sender.state_now(
-            0,
-            vec![StateWrite::new(input, 1.0), StateWrite::new(input, 2.0)],
-        )?;
-        sender.state_now(0, vec![StateWrite::new(input, 3.0)])?;
-        let (import, source) = match graph.process_interactions(&inbox) {
-            Err(RuntimeError::InteractionProcessing { import, source }) => (import, source),
-            other => return Err(format!("expected import processing error: {other:?}").into()),
-        };
-        assert_eq!(import.accepted, 1);
-        assert_eq!(import.rejected.len(), 1);
-        assert!(matches!(
-            import.rejected[0].error,
-            RuntimeError::DuplicateStateWrite(id) if id == input
-        ));
-        assert!(matches!(*source, RuntimeError::Evaluation { .. }));
-        assert_eq!(inbox.pending_count()?, 0);
-        assert_eq!(graph.value_bucket(input)?, Bucket::new(3));
-        assert!(!graph.is_quiescent());
-        Ok(())
-    }
-
-    #[test]
-    fn past_interaction_rejected_without_blocking_current_input()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let mut graph = Graph::new(RuntimeConfig::default());
-        let node = graph.add_atom_input("atom", 0)?;
-        let now = SimTime::from_millis(20);
-        graph.advance_to(now)?;
-        let (sender, inbox) = interaction_channel();
-        sender.state_at(SimTime::ZERO, 0, vec![StateWrite::atom(node, 3)])?;
-        sender.state_now(0, vec![StateWrite::atom(node, 4)])?;
-        let result = graph.process_interactions(&inbox)?;
-        assert_eq!(result.accepted, 1);
-        assert_eq!(result.rejected.len(), 1);
-        assert!(matches!(
-            result.rejected[0].error,
-            RuntimeError::EventInPast { now: reported, requested } if reported == now && requested == SimTime::ZERO
-        ));
-        assert_eq!(graph.value_atom(node)?, 4);
-        assert!(graph.is_quiescent());
-        Ok(())
-    }
-
-    #[test]
-    fn concurrent_producers_all_deliver_before_last_sender_shutdown()
-    -> Result<(), Box<dyn std::error::Error>> {
-        const PRODUCERS: u64 = 4;
-        const PER_PRODUCER: u64 = 64;
-        let mut graph = Graph::new(RuntimeConfig::default());
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let captured = Arc::clone(&seen);
-        let callback = graph.add_event_callback("concurrent ingress", move |context| {
-            captured
-                .lock()
-                .map_err(|_| EvalError::Message(String::from("capture lock poisoned")))?
-                .push(context.external_token());
-            Ok(ReactionOutput::idle())
-        })?;
-        graph.quiesce()?;
-        let (sender, inbox) = interaction_channel();
-        let mut handles = Vec::new();
-        for id in 0..PRODUCERS {
-            let producer = sender.clone();
-            handles.push(thread::spawn(
-                move || -> Result<(), InteractionIngressError> {
-                    for index in 0..PER_PRODUCER {
-                        producer.callback_now_with_token(callback, 0, id * PER_PRODUCER + index)?;
-                    }
-                    Ok(())
-                },
-            ));
-        }
-        drop(sender);
-        let mut accepted = 0;
-        loop {
-            match inbox.wait_for_pending() {
-                Ok(_) => {
-                    let result = graph.process_interactions(&inbox)?;
-                    accepted += result.accepted;
-                    assert_eq!(result.rejected.len(), 0);
-                }
-                Err(InteractionIngressError::Disconnected) => break,
-                Err(other) => return Err(Box::new(other)),
-            }
-        }
-        for handle in handles {
-            handle
-                .join()
-                .map_err(|_| String::from("interaction producer panicked"))??;
-        }
-        assert_eq!(accepted, usize::try_from(PRODUCERS * PER_PRODUCER)?);
-        let mut tokens = seen
-            .lock()
-            .map_err(|_| String::from("capture lock poisoned"))?
-            .clone();
-        tokens.sort_unstable();
-        let expected: Vec<_> = (0..PRODUCERS * PER_PRODUCER).map(Some).collect();
-        assert_eq!(tokens, expected);
-        assert!(graph.is_quiescent());
-        Ok(())
-    }
-
-    #[test]
-    fn imported_now_interaction_is_not_quiescent_until_processed()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let mut g = Graph::new(RuntimeConfig::default());
-        let calls = Arc::new(AtomicUsize::new(0));
-        let observed = Arc::clone(&calls);
-        let callback = g.add_event_callback("explicit quiescence", move |_| {
-            observed.fetch_add(1, Ordering::Relaxed);
-            Ok(ReactionOutput::idle())
-        })?;
-        g.quiesce()?;
-        let (sender, inbox) = interaction_channel();
-        sender.callback_now(callback, 0)?;
-        let imported = g.import_interactions(&inbox)?;
-        assert_eq!(imported.accepted, 1);
-        assert_eq!(imported.rejected.len(), 0);
-        assert!(!g.is_quiescent());
-        assert!(matches!(
-            g.quiescent_snapshot(),
-            Err(RuntimeError::NotQuiescent { .. })
-        ));
-        assert_eq!(calls.load(Ordering::Relaxed), 0);
-        g.quiesce()?;
-        assert!(g.is_quiescent());
-        assert_eq!(calls.load(Ordering::Relaxed), 1);
-        Ok(())
-    }
-
-    #[test]
-    fn future_interactions_import_without_running_early() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let mut g = Graph::new(RuntimeConfig::default());
-        let tokens = Arc::new(Mutex::new(Vec::new()));
-        let observed = Arc::clone(&tokens);
-        let callback = g.add_event_callback("future ingress", move |context| {
-            observed
-                .lock()
-                .map_err(|_| EvalError::Message(String::from("future capture lock poisoned")))?
-                .push(context.external_token());
-            Ok(ReactionOutput::idle())
-        })?;
-        g.quiesce()?;
-        let (sender, inbox) = interaction_channel();
-        sender.callback_at_with_token(callback, SimTime::from_millis(40), 0, 9)?;
-        let processed = g.process_interactions(&inbox)?;
-        assert_eq!(processed.accepted, 1);
-        assert_eq!(processed.rejected.len(), 0);
-        assert!(g.is_quiescent());
-        let snapshot = g.quiescent_snapshot()?;
-        assert_eq!(snapshot.next_event_time, Some(SimTime::from_millis(40)));
-        assert!(
-            tokens
-                .lock()
-                .map_err(|_| String::from("future capture lock poisoned"))?
-                .is_empty()
-        );
-        let publication = g.advance_to_and_publish(SimTime::from_millis(40))?;
-        assert_eq!(publication.snapshot.at, SimTime::from_millis(40));
-        assert_eq!(
-            *tokens
-                .lock()
-                .map_err(|_| String::from("future capture lock poisoned"))?,
-            vec![Some(9)]
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn invalid_interaction_is_reported_without_blocking_valid_work()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let mut g = Graph::new(RuntimeConfig::default());
-        let atom = g.add_atom_input("atom", 0)?;
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let observed = Arc::clone(&seen);
-        let callback = g.add_event_callback("ordered callback", move |context| {
-            observed
-                .lock()
-                .map_err(|_| EvalError::Message(String::from("capture poisoned")))?
-                .push(context.external_token());
-            Ok(ReactionOutput::idle())
-        })?;
-        g.quiesce()?;
-        let (sender, inbox) = interaction_channel();
-        sender.callback_now_with_token(callback, 0, 11)?;
-        sender.state_now(
-            0,
-            vec![StateWrite::atom(atom, 1), StateWrite::atom(atom, 2)],
-        )?;
-        sender.callback_now_with_token(callback, 0, 12)?;
-        sender.callback_now(quiescence_core::ReactionId::from_index(u32::MAX), 0)?;
-        let result = g.process_interactions(&inbox)?;
-        assert_eq!(result.accepted, 2);
-        assert_eq!(result.rejected.len(), 2);
-        assert!(matches!(
-            result.rejected[0].error,
-            RuntimeError::DuplicateStateWrite(id) if id == atom
-        ));
-        assert!(matches!(
-            result.rejected[1].error,
-            RuntimeError::UnknownReaction(_)
-        ));
-        assert!(matches!(
-            &result.rejected[0].interaction,
-            super::ExternalInteraction::StateBatch { writes, .. } if writes.len() == 2
-        ));
-        assert_eq!(inbox.pending_count()?, 0);
-        assert_eq!(g.value_atom(atom)?, 0);
-        assert_eq!(
-            *seen.lock().map_err(|_| String::from("capture poisoned"))?,
-            vec![Some(11), Some(12)]
-        );
-        assert!(g.is_quiescent());
-        Ok(())
-    }
-
-    #[test]
-    fn external_reaction_event_tokens_are_delivered_per_duplicate()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let mut g = Graph::new(RuntimeConfig::default());
-        let tokens = Arc::new(Mutex::new(Vec::new()));
-        let observed = Arc::clone(&tokens);
-        let callback = g.add_event_callback("tokenized external callback", move |context| {
-            observed
-                .lock()
-                .map_err(|_| EvalError::Message(String::from("token capture lock poisoned")))?
-                .push(context.external_token());
-            Ok(ReactionOutput::idle())
-        })?;
-        g.schedule_reaction_event_with_token(callback, SimTime::from_millis(10), 0, 11)?;
-        g.schedule_reaction_event_with_token(callback, SimTime::from_millis(10), 0, 12)?;
-        g.advance_to(SimTime::from_millis(10))?;
-        assert_eq!(
-            *tokens
-                .lock()
-                .map_err(|_| String::from("token capture lock poisoned"))?,
-            vec![Some(11), Some(12)]
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn external_reaction_events_preserve_duplicates() -> Result<(), Box<dyn std::error::Error>> {
-        let mut g = Graph::new(RuntimeConfig::default());
-        let evaluations = Arc::new(AtomicUsize::new(0));
-        let calls = Arc::clone(&evaluations);
-        let reaction = g.add_reaction("external callback", move |_| {
-            calls.fetch_add(1, Ordering::Relaxed);
-            Ok(ReactionOutput::idle())
-        })?;
-        g.settle()?;
-        assert_eq!(evaluations.load(Ordering::Relaxed), 1);
-
-        g.schedule_reaction_event(reaction, SimTime::from_millis(10), 0)?;
-        g.schedule_reaction_event(reaction, SimTime::from_millis(10), 0)?;
-        g.advance_to(SimTime::from_millis(10))?;
-        assert_eq!(evaluations.load(Ordering::Relaxed), 3);
-        Ok(())
-    }
-
-    #[test]
-    fn external_reaction_events_honor_priority_without_dedup()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let mut g = Graph::new(RuntimeConfig::default());
-        let marker = g.add_input("marker", q0()?, 0.0)?;
-        let normal = g.add_reaction("normal external", move |c| {
-            if c.now() == SimTime::ZERO {
-                Ok(ReactionOutput::idle())
-            } else {
-                Ok(ReactionOutput::immediate(vec![StateWrite::new(
-                    marker, 2.0,
-                )]))
-            }
-        })?;
-        let high = g.add_reaction("high external", move |c| {
-            if c.now() == SimTime::ZERO {
-                Ok(ReactionOutput::idle())
-            } else {
-                Ok(ReactionOutput::immediate(vec![StateWrite::new(
-                    marker, 1.0,
-                )]))
-            }
-        })?;
-        g.settle()?;
-        g.schedule_reaction_event(normal, SimTime::from_millis(10), 0)?;
-        g.schedule_reaction_event(high, SimTime::from_millis(10), -1)?;
-        g.advance_to(SimTime::from_millis(10))?;
-
-        let marker_values: Vec<_> = g
-            .take_transitions()
-            .into_iter()
-            .filter(|transition| transition.node == marker)
-            .map(|transition| transition.new)
-            .collect();
-        assert_eq!(
-            marker_values,
-            vec![
-                CanonicalValue::Numeric(Bucket::new(1)),
-                CanonicalValue::Numeric(Bucket::new(2)),
-            ]
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn keyed_scheduled_reaction_preserves_first_pending_request()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let mut g = Graph::new(RuntimeConfig::default());
-        let trigger = g.add_input("trigger", q0()?, 1.0)?;
-        let evaluations = Arc::new(AtomicUsize::new(0));
-        let calls = Arc::clone(&evaluations);
-        let _reaction = g.add_reaction("schedule once", move |c| {
-            calls.fetch_add(1, Ordering::Relaxed);
-            if c.read_bool(trigger)? {
-                Ok(ReactionOutput::schedule_once_after(
-                    SimDuration::from_millis(10),
-                    7,
-                    0,
-                ))
-            } else {
-                Ok(ReactionOutput::idle())
-            }
-        })?;
-        g.settle()?;
-        assert_eq!(g.next_event_time(), Some(SimTime::from_millis(10)));
-
-        g.schedule_input(trigger, SimTime::from_millis(5), 2.0)?;
-        g.advance_to(SimTime::from_millis(5))?;
-        assert_eq!(evaluations.load(Ordering::Relaxed), 2);
-        assert_eq!(g.next_event_time(), Some(SimTime::from_millis(10)));
-
-        g.advance_to(SimTime::from_millis(10))?;
-        assert_eq!(evaluations.load(Ordering::Relaxed), 3);
-        assert_eq!(g.next_event_time(), Some(SimTime::from_millis(20)));
-        Ok(())
-    }
-
-    #[test]
-    fn keyed_schedule_can_target_a_different_reaction() -> Result<(), Box<dyn std::error::Error>> {
-        let mut g = Graph::new(RuntimeConfig::default());
-        let callbacks = Arc::new(AtomicUsize::new(0));
-        let observed_callbacks = Arc::clone(&callbacks);
-        let observed_keys = Arc::new(Mutex::new(Vec::new()));
-        let callback_keys = Arc::clone(&observed_keys);
-        let callback = g.add_event_callback("scheduled callback target", move |context| {
-            observed_callbacks.fetch_add(1, Ordering::Relaxed);
-            callback_keys
-                .lock()
-                .map_err(|_| EvalError::Message(String::from("callback-key lock poisoned")))?
-                .push(context.scheduled_key());
-            Ok(ReactionOutput::idle())
-        })?;
-        let producer_calls = Arc::new(AtomicUsize::new(0));
-        let observed_producer = Arc::clone(&producer_calls);
-        let producer = g.add_reaction("schedule producer", move |_| {
-            let call = observed_producer.fetch_add(1, Ordering::Relaxed);
-            if call < 2 {
-                Ok(ReactionOutput::schedule_reaction_once_after(
-                    callback,
-                    SimDuration::from_millis(10),
-                    7,
-                    -1,
-                ))
-            } else {
-                Ok(ReactionOutput::idle())
-            }
-        })?;
-        g.settle()?;
-        g.schedule_reaction_event(producer, SimTime::from_millis(5), 0)?;
-        g.advance_to(SimTime::from_millis(5))?;
-        assert_eq!(callbacks.load(Ordering::Relaxed), 0);
-        assert_eq!(g.next_event_time(), Some(SimTime::from_millis(10)));
-        g.advance_to(SimTime::from_millis(9))?;
-        assert_eq!(callbacks.load(Ordering::Relaxed), 0);
-        g.advance_to(SimTime::from_millis(10))?;
-        assert_eq!(callbacks.load(Ordering::Relaxed), 1);
-        assert_eq!(
-            *observed_keys
-                .lock()
-                .map_err(|_| String::from("callback-key lock poisoned"))?,
-            vec![Some(7)]
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn event_callback_is_dormant_and_does_not_subscribe_to_reads()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let mut g = Graph::new(RuntimeConfig::default());
-        let observed = g.add_input("observed", q0()?, 1.0)?;
-        let calls = Arc::new(AtomicUsize::new(0));
-        let callback_calls = Arc::clone(&calls);
-        let callback = g.add_event_callback("event-only callback", move |context| {
-            context.read_bool(observed)?;
-            callback_calls.fetch_add(1, Ordering::Relaxed);
-            Ok(ReactionOutput::idle())
-        })?;
-        g.settle()?;
-        assert_eq!(calls.load(Ordering::Relaxed), 0);
-
-        g.schedule_reaction_event(callback, SimTime::from_millis(10), 0)?;
-        g.advance_to(SimTime::from_millis(10))?;
-        assert_eq!(calls.load(Ordering::Relaxed), 1);
-
-        g.schedule_input(observed, SimTime::from_millis(20), 0.0)?;
-        g.advance_to(SimTime::from_millis(20))?;
-        assert_eq!(calls.load(Ordering::Relaxed), 1);
-        Ok(())
-    }
-
-    #[test]
-    fn scheduled_reaction_priority_orders_same_time_callbacks()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let mut g = Graph::new(RuntimeConfig::default());
-        let marker = g.add_input("marker", q0()?, 0.0)?;
-        let _normal = g.add_reaction("normal priority", move |c| {
-            if c.now() == SimTime::ZERO {
-                Ok(ReactionOutput::schedule_once_after(
-                    SimDuration::from_millis(10),
-                    1,
-                    0,
-                ))
-            } else {
-                Ok(ReactionOutput::immediate(vec![StateWrite::new(
-                    marker, 2.0,
-                )]))
-            }
-        })?;
-        let _high = g.add_reaction("high priority", move |c| {
-            if c.now() == SimTime::ZERO {
-                Ok(ReactionOutput::schedule_once_after(
-                    SimDuration::from_millis(10),
-                    1,
-                    -1,
-                ))
-            } else {
-                Ok(ReactionOutput::immediate(vec![StateWrite::new(
-                    marker, 1.0,
-                )]))
-            }
-        })?;
-        g.settle()?;
-        g.advance_to(SimTime::from_millis(10))?;
-        assert_eq!(g.value_f64(marker)?, 2.0);
-        let marker_values: Vec<_> = g
-            .take_transitions()
-            .into_iter()
-            .filter(|transition| transition.node == marker)
-            .map(|transition| transition.new)
-            .collect();
-        assert_eq!(
-            marker_values,
-            vec![
-                CanonicalValue::Numeric(Bucket::new(1)),
-                CanonicalValue::Numeric(Bucket::new(2)),
-            ]
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn delayed_reevaluation_defers_dynamic_atom_dependencies()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let mut g = Graph::new(RuntimeConfig::default());
-        let ready_at_ms = g.add_input("ready_at_ms", q0()?, 10.0)?;
-        let snapshot = g.add_atom_input("snapshot", 1)?;
-        let observed = g.add_atom_input("observed", 0)?;
-        let evaluations = Arc::new(AtomicUsize::new(0));
-        let calls = Arc::clone(&evaluations);
-        let _reaction = g.add_reaction("deadline-gated snapshot", move |c| {
-            calls.fetch_add(1, Ordering::Relaxed);
-            let now_ms = c.now().as_nanos() / 1_000_000;
-            let ready_at = c.read_bucket(ready_at_ms)?.raw();
-            if now_ms < ready_at {
-                return Ok(ReactionOutput::reevaluate_after(SimDuration::from_millis(
-                    ready_at - now_ms,
-                )));
-            }
-            Ok(ReactionOutput::immediate(vec![StateWrite::atom(
-                observed,
-                c.read_atom(snapshot)?,
-            )]))
-        })?;
-        g.settle()?;
-        assert_eq!(evaluations.load(Ordering::Relaxed), 1);
-
-        g.schedule_atom(snapshot, SimTime::from_millis(5), 2)?;
-        g.advance_to(SimTime::from_millis(5))?;
-        assert_eq!(evaluations.load(Ordering::Relaxed), 1);
-        assert_eq!(g.value_atom(observed)?, 0);
-
-        g.advance_to(SimTime::from_millis(10))?;
-        assert_eq!(g.value_atom(observed)?, 2);
-        assert_eq!(evaluations.load(Ordering::Relaxed), 2);
-        Ok(())
-    }
-
-    #[test]
-    fn zero_time_oscillation_is_explicit_instability() -> Result<(), Box<dyn std::error::Error>> {
-        let mut g = Graph::new(RuntimeConfig {
-            same_time_microstep_budget: 32,
-        });
-        let a = g.add_input("a", q0()?, 0.0)?;
-        let b = g.add_input("b", q0()?, 0.0)?;
-        g.set_evaluator(a, move |c| {
-            Ok(EvalOutput::immediate(if c.read_bool(b)? {
-                0.0
-            } else {
-                1.0
-            }))
-        })?;
-        g.set_evaluator(b, move |c| {
-            Ok(EvalOutput::immediate(if c.read_bool(a)? {
-                1.0
-            } else {
-                0.0
-            }))
-        })?;
-        assert!(matches!(
-            g.settle(),
-            Err(RuntimeError::CalculationInstability { .. })
-        ));
-        Ok(())
-    }
-
-    #[test]
-    fn future_inputs_run_in_time_order() -> Result<(), Box<dyn std::error::Error>> {
-        let mut g = Graph::new(RuntimeConfig::default());
-        let n = g.add_input("n", q0()?, 0.0)?;
-        g.schedule_input(n, SimTime::from_secs(2), 2.0)?;
-        g.schedule_input(n, SimTime::from_secs(1), 1.0)?;
-        g.advance_to(SimTime::from_secs(1))?;
-        assert_eq!(g.value_f64(n)?, 1.0);
-        g.advance_to(SimTime::from_secs(2))?;
-        assert_eq!(g.value_f64(n)?, 2.0);
-        Ok(())
-    }
-}
+mod tests;
