@@ -211,8 +211,14 @@ impl Quantization {
         clippy::cast_precision_loss,
         reason = "decoding intentionally maps the exact integer bucket into the f64 estimate domain"
     )]
+    #[inline]
     pub fn decode(self, bucket: Bucket) -> f64 {
-        bucket.raw() as f64 / self.scale()
+        let value = bucket.raw() as f64;
+        if self.decimal_places == 0 {
+            value
+        } else {
+            value / self.scale()
+        }
     }
 
     /// Quantize the exact real interval represented by the binary64 center and radius.
@@ -297,6 +303,33 @@ impl std::error::Error for QuantizeError {}
 #[cfg(test)]
 mod tests {
     use super::{Bucket, Estimate, Quantization};
+
+    #[test]
+    fn decode_preserves_original_binary64_rounding() -> Result<(), super::QuantizeError> {
+        // The integer-to-binary64 conversion rounds these extreme and
+        // halfway integers to the representable values below before scaling.
+        let cases = [
+            (i64::MIN, -9_223_372_036_854_775_808.0_f64),
+            (i64::MIN + 1, -9_223_372_036_854_775_808.0),
+            (-9_007_199_254_740_993, -9_007_199_254_740_992.0),
+            (-1, -1.0),
+            (0, 0.0),
+            (1, 1.0),
+            (9_007_199_254_740_993, 9_007_199_254_740_992.0),
+            (i64::MAX - 1, 9_223_372_036_854_775_808.0),
+            (i64::MAX, 9_223_372_036_854_775_808.0),
+        ];
+        for places in 0..=Quantization::MAX_DECIMAL_PLACES {
+            let q = Quantization::new(places, 0)?;
+            for (raw, rounded) in cases {
+                assert_eq!(
+                    q.decode(Bucket::new(raw)).to_bits(),
+                    (rounded / q.scale()).to_bits()
+                );
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn quantization_rejects_unrepresentable_float_boundaries()

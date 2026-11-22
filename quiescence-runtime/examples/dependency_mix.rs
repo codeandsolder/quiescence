@@ -17,11 +17,11 @@ fn median(samples: &mut [Duration]) -> Duration {
     samples[samples.len() / 2]
 }
 
-fn run(mode: &str, count: usize, width: usize) -> Result<(), Box<dyn Error>> {
+fn run(mode: &str, count: usize, width: usize, places: u8) -> Result<(), Box<dyn Error>> {
     let mut graph = Graph::new(RuntimeConfig {
         same_time_microstep_budget: count + 16,
     });
-    let q = Quantization::INTEGER;
+    let q = Quantization::new(places, 0)?;
     let shared = graph.add_input("shared", q, 0.0)?;
     let gate = graph.add_atom_input("gate", 0)?;
     let started = Instant::now();
@@ -92,5 +92,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         .next()
         .map_or(Ok(100_000), |arg| arg.parse::<usize>())?;
     let width = args.next().map_or(Ok(4), |arg| arg.parse::<usize>())?;
-    run(&mode, count, width)
+    let places = args.next().map_or(Ok(0), |arg| arg.parse::<u8>())?;
+    run(&mode, count, width, places)
 }
