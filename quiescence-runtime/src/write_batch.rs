@@ -113,22 +113,15 @@ impl Graph {
         write: StateWrite,
     ) -> Result<ValidatedWrite, RuntimeError> {
         let id = write.node();
-        if node.state.is_derived() {
-            return Err(RuntimeError::NotAnInput(id));
-        }
         let validated = match (write, &node.state) {
-            (
-                StateWrite::Numeric { value, .. },
-                NodeState::Numeric {
-                    quantization,
-                    bucket,
-                    ..
-                },
-            ) => ValidatedWrite::Numeric(PointRequest {
-                quantization: *quantization,
-                previous: Some(*bucket),
-                value,
-            }),
+            (_, NodeState::Derived { .. }) => return Err(RuntimeError::NotAnInput(id)),
+            (StateWrite::Numeric { value, .. }, NodeState::Input(cell)) => {
+                ValidatedWrite::Numeric(PointRequest {
+                    quantization: cell.quantization,
+                    previous: Some(cell.bucket),
+                    value,
+                })
+            }
             (StateWrite::Atom { value, .. }, NodeState::Atom(current)) => ValidatedWrite::Atom {
                 current: *current,
                 next: value,
@@ -136,7 +129,7 @@ impl Graph {
             (StateWrite::Numeric { .. }, NodeState::Atom(_)) => {
                 return Err(RuntimeError::ExpectedNumeric(id));
             }
-            (StateWrite::Atom { .. }, NodeState::Numeric { .. }) => {
+            (StateWrite::Atom { .. }, NodeState::Input(_)) => {
                 return Err(RuntimeError::ExpectedAtom(id));
             }
         };
