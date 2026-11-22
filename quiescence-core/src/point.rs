@@ -11,7 +11,7 @@ use super::{Bucket, Estimate, Quantization, QuantizeError};
 use core::simd::{
     Select, Simd,
     cmp::SimdPartialOrd,
-    num::{SimdFloat, SimdUint},
+    num::{SimdFloat, SimdInt, SimdUint},
 };
 
 const MAGIC: f64 = 4_503_599_627_370_496.0; // 2^52: spacing = 1
@@ -53,6 +53,7 @@ impl PointRequest {
     ///
     /// # Errors
     /// Returns the first numeric error, or a length mismatch before writing.
+    #[inline]
     pub fn resolve_batch(requests: &[Self], output: &mut [Bucket]) -> Result<(), QuantizeError> {
         if requests.len() != output.len() {
             return Err(QuantizeError::BatchLengthMismatch);
@@ -104,8 +105,12 @@ fn resolve_block(
     let widths =
         Simd::from_array(requests.map(|request| i64::from(request.quantization.hysteresis_lsd())));
     let (rounded, certified) = round_block(values * scales);
-    // Compare rather than subtract: an arbitrary previous i64 cannot overflow.
-    let retain = previous.simd_ge(rounded - widths) & previous.simd_le(rounded + widths);
+    // Translate the signed retention interval to an unsigned interval.
+    // SIMD integer operations wrap. For certified lanes the rounded bucket
+    // is bounded by 2^51, so an arbitrary i64 previous bucket cannot wrap
+    // across the entire u64 domain into the (at most 2^33) retention range.
+    let distance = (rounded - previous + widths).cast::<u64>();
+    let retain = distance.simd_le((widths + widths).cast::<u64>());
     let mut buckets = retain.select(previous, rounded).to_array().map(Bucket::new);
     let failures = !certified;
     if failures.any() {
@@ -129,7 +134,10 @@ fn round_block(scaled: Simd<f64, LANES>) -> (Simd<i64, LANES>, core::simd::Mask<
         & (magnitude - rounded).abs().simd_lt(Simd::splat(0.5));
     let unsigned = encoded.to_bits() & Simd::splat(MANTISSA);
     let signed = unsigned.cast::<i64>();
-    (scaled.is_sign_negative().select(-signed, signed), certified)
+    (
+        scaled.simd_lt(Simd::splat(0.0)).select(-signed, signed),
+        certified,
+    )
 }
 
 #[cfg(test)]

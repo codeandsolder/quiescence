@@ -28,8 +28,7 @@
 #![forbid(unsafe_code)]
 
 use quiescence_core::{
-    Bucket, Estimate, HistoryId, NodeId, Quantization, QuantizeError, ReactionId, SimDuration,
-    SimTime,
+    Bucket, Estimate, HistoryId, NodeId, Quantization, ReactionId, SimDuration, SimTime,
 };
 use std::{
     cell::RefCell,
@@ -42,6 +41,7 @@ mod event_queue;
 mod history;
 mod ingress;
 mod output;
+mod write_batch;
 
 pub use error::{EvalError, InteractionIngressError, RuntimeError};
 pub use ingress::{
@@ -55,6 +55,7 @@ pub use output::{
 
 use event_queue::{EventKind, EventQueue, ScheduledEvent};
 use history::EventWindow;
+use write_batch::ResolvedWrite;
 
 type EvalFn =
     Box<dyn for<'a> Fn(&EvalContext<'a>) -> Result<EvalOutput, EvalError> + Send + Sync + 'static>;
@@ -78,38 +79,6 @@ struct PreparedCallback {
     at: SimTime,
     key: u64,
     priority: i32,
-}
-
-struct ResolvedWrite {
-    node: NodeId,
-    next: CanonicalValue,
-}
-
-enum ValidatedWrite {
-    Numeric {
-        quantization: Quantization,
-        bucket: Bucket,
-        value: f64,
-    },
-    Atom {
-        value: u64,
-    },
-}
-
-impl ValidatedWrite {
-    fn resolve(self, node: NodeId) -> Result<ResolvedWrite, RuntimeError> {
-        let next = match self {
-            Self::Numeric {
-                quantization,
-                bucket,
-                value,
-            } => {
-                CanonicalValue::Numeric(quantization.resolve(Some(bucket), Estimate::point(value))?)
-            }
-            Self::Atom { value } => CanonicalValue::Atom(value),
-        };
-        Ok(ResolvedWrite { node, next })
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -769,64 +738,6 @@ impl Graph {
         }
     }
 
-    fn validated_writes<'a>(
-        &'a self,
-        writes: &'a [StateWrite],
-    ) -> impl Iterator<Item = Result<(NodeId, ValidatedWrite), RuntimeError>> + 'a {
-        let mut seen = BTreeSet::new();
-        writes.iter().map(move |&write| {
-            let id = write.node();
-            let node = self.node(id)?;
-            if writes.len() > 1 && !seen.insert(id) {
-                return Err(RuntimeError::DuplicateStateWrite(id));
-            }
-            Self::validate_write(node, write).map(|validated| (id, validated))
-        })
-    }
-
-    fn validate_write(node: &Node, write: StateWrite) -> Result<ValidatedWrite, RuntimeError> {
-        let id = write.node();
-        if node.state.is_derived() {
-            return Err(RuntimeError::NotAnInput(id));
-        }
-        let validated = match (write, &node.state) {
-            (
-                StateWrite::Numeric { value, .. },
-                NodeState::Numeric {
-                    quantization,
-                    bucket,
-                    ..
-                },
-            ) => {
-                if !value.is_finite() {
-                    return Err(QuantizeError::NonFiniteEstimate.into());
-                }
-                ValidatedWrite::Numeric {
-                    quantization: *quantization,
-                    bucket: *bucket,
-                    value,
-                }
-            }
-            (StateWrite::Atom { value, .. }, NodeState::Atom(_)) => ValidatedWrite::Atom { value },
-            (StateWrite::Numeric { .. }, NodeState::Atom(_)) => {
-                return Err(RuntimeError::ExpectedNumeric(id));
-            }
-            (StateWrite::Atom { .. }, NodeState::Numeric { .. }) => {
-                return Err(RuntimeError::ExpectedAtom(id));
-            }
-        };
-        Ok(validated)
-    }
-
-    fn validate_state_write_batch(&self, writes: &[StateWrite]) -> Result<(), RuntimeError> {
-        // Point estimates have state-independent representability. Reject
-        // invalid values at admission, but resolve hysteresis again at delivery.
-        self.validated_writes(writes).try_for_each(|write| {
-            let (id, validated) = write?;
-            validated.resolve(id).map(|_| ())
-        })
-    }
-
     fn enqueue_external_interaction(&mut self, interaction: ExternalInteraction) {
         match interaction {
             ExternalInteraction::StateBatch {
@@ -1378,38 +1289,6 @@ impl Graph {
         for record in records {
             self.windows[record.history.index()].record(self.now, record.key);
         }
-    }
-
-    fn apply_state_writes(&mut self, writes: &[StateWrite]) -> Result<(), RuntimeError> {
-        if let [write] = writes {
-            let id = write.node();
-            let resolved = Self::validate_write(self.node(id)?, *write)?.resolve(id)?;
-            return self.commit(resolved.node, resolved.next);
-        }
-        let resolved = self.resolve_state_writes(writes)?;
-        self.commit_resolved_state_writes(resolved)
-    }
-
-    fn resolve_state_writes(
-        &self,
-        writes: &[StateWrite],
-    ) -> Result<Vec<ResolvedWrite>, RuntimeError> {
-        self.validated_writes(writes)
-            .map(|write| {
-                let (node, validated) = write?;
-                validated.resolve(node)
-            })
-            .collect()
-    }
-
-    fn commit_resolved_state_writes(
-        &mut self,
-        resolved: Vec<ResolvedWrite>,
-    ) -> Result<(), RuntimeError> {
-        for ResolvedWrite { node, next } in resolved {
-            self.commit(node, next)?;
-        }
-        Ok(())
     }
 
     fn commit(&mut self, id: NodeId, value: CanonicalValue) -> Result<(), RuntimeError> {

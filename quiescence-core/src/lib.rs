@@ -147,6 +147,11 @@ pub struct Quantization {
 
 impl Quantization {
     pub const MAX_DECIMAL_PLACES: u8 = 15;
+    /// Integer buckets without hysteresis.
+    pub const INTEGER: Self = Self {
+        decimal_places: 0,
+        hysteresis_lsd: 0,
+    };
 
     /// # Errors
     /// Returns [`QuantizeError::TooManyDecimalPlaces`] when the requested precision exceeds the supported bound.
