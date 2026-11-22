@@ -38,6 +38,11 @@ macro_rules! graph_id {
                 Self(index)
             }
 
+            #[must_use = "the identifier value must be used"]
+            pub const fn raw(self) -> u32 {
+                self.0
+            }
+
             #[must_use = "the converted index must be used"]
             pub const fn index(self) -> usize {
                 self.0 as usize

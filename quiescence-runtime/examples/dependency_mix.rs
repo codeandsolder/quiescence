@@ -17,7 +17,13 @@ fn median(samples: &mut [Duration]) -> Duration {
     samples[samples.len() / 2]
 }
 
-fn run(mode: &str, count: usize, width: usize, places: u8) -> Result<(), Box<dyn Error>> {
+fn run(
+    mode: &str,
+    count: usize,
+    width: usize,
+    places: u8,
+    stride: usize,
+) -> Result<(), Box<dyn Error>> {
     let mut graph = Graph::new(RuntimeConfig {
         same_time_microstep_budget: count + 16,
     });
@@ -31,6 +37,9 @@ fn run(mode: &str, count: usize, width: usize, places: u8) -> Result<(), Box<dyn
         .collect::<Result<Vec<_>, _>>()?
         .into();
     for _ in 0..count {
+        for _ in 1..stride {
+            graph.add_atom_input("unused", 0)?;
+        }
         last = match mode {
             "chain" => {
                 let upstream = last;
@@ -93,5 +102,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         .map_or(Ok(100_000), |arg| arg.parse::<usize>())?;
     let width = args.next().map_or(Ok(4), |arg| arg.parse::<usize>())?;
     let places = args.next().map_or(Ok(0), |arg| arg.parse::<u8>())?;
-    run(&mode, count, width, places)
+    let stride = args.next().map_or(Ok(1), |arg| arg.parse::<usize>())?;
+    if stride == 0 {
+        return Err("expected a nonzero stride".into());
+    }
+    run(&mode, count, width, places, stride)
 }
