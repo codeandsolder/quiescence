@@ -5,6 +5,51 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, BinaryHeap, VecDeque},
 };
+/// Most events carry only a small payload. Keep empty and singleton
+/// reaction forecasts inline; variable-sized effects own their storage.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DeferredEffects {
+    None,
+    Write(StateWrite),
+    Record(WindowRecord),
+    Writes(Box<[StateWrite]>),
+    Records(Box<[WindowRecord]>),
+    Pair(Box<(StateWrite, WindowRecord)>),
+    Both(Box<CombinedEffects>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CombinedEffects {
+    writes: Vec<StateWrite>,
+    records: Vec<WindowRecord>,
+}
+
+impl DeferredEffects {
+    pub(super) fn new(writes: Vec<StateWrite>, records: Vec<WindowRecord>) -> Self {
+        match (writes.as_slice(), records.as_slice()) {
+            ([], []) => Self::None,
+            ([write], []) => Self::Write(*write),
+            ([], [record]) => Self::Record(*record),
+            ([write], [record]) => Self::Pair(Box::new((*write, *record))),
+            (_, []) => Self::Writes(writes.into_boxed_slice()),
+            ([], _) => Self::Records(records.into_boxed_slice()),
+            _ => Self::Both(Box::new(CombinedEffects { writes, records })),
+        }
+    }
+
+    pub(super) fn parts(&self) -> (&[StateWrite], &[WindowRecord]) {
+        match self {
+            Self::None => (&[], &[]),
+            Self::Write(write) => (std::slice::from_ref(write), &[]),
+            Self::Record(record) => (&[], std::slice::from_ref(record)),
+            Self::Writes(writes) => (writes, &[]),
+            Self::Records(records) => (&[], records),
+            Self::Pair(pair) => (std::slice::from_ref(&pair.0), std::slice::from_ref(&pair.1)),
+            Self::Both(effects) => (&effects.writes, &effects.records),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum EventKind {
     SetState {
@@ -25,8 +70,7 @@ pub enum EventKind {
     ReactionTransition {
         reaction: ReactionId,
         generation: u64,
-        writes: Vec<StateWrite>,
-        window_records: Vec<WindowRecord>,
+        effects: DeferredEffects,
     },
     ExternalReaction {
         reaction: ReactionId,
@@ -506,5 +550,27 @@ mod tests {
         assert!(matches!(&queue.storage, EventStorage::SingleKey(_)));
         assert_eq!(queue.len(), 0);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod effect_tests {
+    use super::*;
+    use quiescence_core::{HistoryId, NodeId};
+
+    #[test]
+    fn compact_effect_payload_preserves_every_shape_and_order() {
+        for write_count in 0..=5_u32 {
+            for record_count in 0..=5_u32 {
+                let writes: Vec<_> = (0..write_count)
+                    .map(|id| StateWrite::atom(NodeId::from_index(id), u64::from(id) * 2))
+                    .collect();
+                let records: Vec<_> = (0..record_count)
+                    .map(|id| WindowRecord::new(HistoryId::from_index(id % 2), u64::from(id % 3)))
+                    .collect();
+                let effects = DeferredEffects::new(writes.clone(), records.clone());
+                assert_eq!(effects.parts(), (writes.as_slice(), records.as_slice()));
+            }
+        }
     }
 }

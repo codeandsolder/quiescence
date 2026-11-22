@@ -85,6 +85,8 @@ The invariant is only:
 
 ## Layer 4: temporal scheduling
 
+The event queue stores compact causal records. Deferred reaction effects specialize empty, singleton, single-kind batch and mixed-kind payloads; an empty or single-write/history forecast requires no separate effect allocation. One write plus one history record share one compact allocation. Larger mixed batches retain their owned vectors behind one pointer; this keeps all ordinary callback and numeric forecast records small.
+
 Ordinary events use an adaptive event queue. Single-key workloads use a FIFO directly, reusing small buffers across drain cycles and releasing larger empty buffers. With two to 128 distinct
 `(simulation timestamp, priority)` keys, a sorted map holds one FIFO deque per
 key; this avoids one heap sift per callback in a dense same-time batch.

@@ -57,7 +57,7 @@ pub use output::{
 };
 
 use edge_set::ReverseEdges;
-use event_queue::{EventKind, EventQueue, ForecastOwner, ScheduledEvent};
+use event_queue::{DeferredEffects, EventKind, EventQueue, ForecastOwner, ScheduledEvent};
 use history::EventWindow;
 use node_storage::{DerivedId, DerivedNode, NodeLinks, NodeState, NumericCell};
 use read_set::{Dependencies, ReadTracker};
@@ -75,8 +75,7 @@ enum PreparedTransition {
     },
     Delayed {
         at: SimTime,
-        writes: Vec<StateWrite>,
-        window_records: Vec<WindowRecord>,
+        effects: DeferredEffects,
     },
 }
 
@@ -1083,18 +1082,13 @@ impl Graph {
                 self.commit_resolved_state_writes(writes)?;
                 self.record_windows(&window_records);
             }
-            Some(PreparedTransition::Delayed {
-                at,
-                writes,
-                window_records,
-            }) => {
+            Some(PreparedTransition::Delayed { at, effects }) => {
                 self.push_event(
                     at,
                     EventKind::ReactionTransition {
                         reaction: id,
                         generation,
-                        writes,
-                        window_records,
+                        effects,
                     },
                 );
             }
@@ -1150,8 +1144,7 @@ impl Graph {
             self.validate_state_write_batch(&transition.writes)?;
             Ok(PreparedTransition::Delayed {
                 at: self.event_time(transition.after)?,
-                writes: transition.writes,
-                window_records: transition.window_records,
+                effects: DeferredEffects::new(transition.writes, transition.window_records),
             })
         }
     }
@@ -1211,8 +1204,7 @@ impl Graph {
             EventKind::ReactionTransition {
                 reaction,
                 generation,
-                writes,
-                window_records,
+                effects,
             } => {
                 let current_generation = self
                     .reactions
@@ -1220,6 +1212,7 @@ impl Graph {
                     .ok_or(RuntimeError::UnknownReaction(*reaction))?
                     .generation;
                 if current_generation == *generation {
+                    let (writes, window_records) = effects.parts();
                     self.apply_reaction_effects(writes, window_records)?;
                     self.wake_reaction(*reaction, Invocation::Forecast)?;
                 }
