@@ -306,13 +306,13 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_queue_matches_reference_heap_under_interleaved_operations()
+    fn adaptive_queue_matches_independent_ordered_map_under_interleaved_operations()
     -> Result<(), Box<dyn std::error::Error>> {
         // Deterministic mixes repeatedly cross the grouped/sparse threshold,
         // insert earlier priorities after later ones, and retry popped work.
         for distinct_keys in [1_u64, 64, 4_096] {
             let mut queue = super::EventQueue::new();
-            let mut reference = std::collections::BinaryHeap::<super::HeapEvent>::new();
+            let mut reference = std::collections::BTreeMap::new();
             let reaction = quiescence_core::ReactionId::from_index(0);
             let mut random = 0x9e37_79b9_7f4a_7c15_u64;
             let mut next_sequence = 0_u64;
@@ -333,22 +333,33 @@ mod tests {
                     };
                     next_sequence += 1;
                     queue.push(event.clone());
-                    reference.push(super::HeapEvent(event));
+                    assert!(
+                        reference
+                            .insert((event.at, event.priority, event.sequence), event)
+                            .is_none()
+                    );
                 } else {
-                    assert_eq!(queue.peek(), reference.peek().map(|entry| &entry.0));
+                    assert_eq!(
+                        queue.peek(),
+                        reference.first_key_value().map(|(_, event)| event)
+                    );
                     let actual = queue.pop();
-                    let expected = reference.pop().map(|entry| entry.0);
+                    let expected = reference.pop_first().map(|(_, event)| event);
                     assert_eq!(actual, expected);
                     if random.trailing_zeros() >= 7
                         && let Some(event) = actual
                     {
                         queue.restore_front(event.clone());
-                        reference.push(super::HeapEvent(event));
+                        assert!(
+                            reference
+                                .insert((event.at, event.priority, event.sequence), event)
+                                .is_none()
+                        );
                     }
                 }
             }
-            while let Some(expected) = reference.pop() {
-                assert_eq!(queue.pop(), Some(expected.0));
+            while let Some((_, expected)) = reference.pop_first() {
+                assert_eq!(queue.pop(), Some(expected));
             }
             assert_eq!(queue.pop(), None);
         }

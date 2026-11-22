@@ -84,49 +84,63 @@ impl WindowRecord {
     }
 }
 
+/// Destination of a keyed callback.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ScheduledReevaluation {
+pub enum CallbackTarget {
+    CurrentReaction,
+    Reaction(ReactionId),
+}
+
+impl CallbackTarget {
+    pub(super) const fn resolve(self, current: ReactionId) -> ReactionId {
+        match self {
+            Self::CurrentReaction => current,
+            Self::Reaction(reaction) => reaction,
+        }
+    }
+}
+
+/// A keyed callback request. Requests are admitted in output order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScheduledCallback {
+    pub target: CallbackTarget,
     pub key: u64,
     pub after: SimDuration,
     pub priority: i32,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ScheduledReactionCallback {
-    pub reaction: ReactionId,
-    pub key: u64,
+/// State and history effects applied atomically at a simulation time.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReactionTransition {
     pub after: SimDuration,
-    pub priority: i32,
+    pub writes: Vec<StateWrite>,
+    pub window_records: Vec<WindowRecord>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReactionOutput {
-    pub transition_after: Option<SimDuration>,
-    pub writes: Vec<StateWrite>,
-    pub window_records: Vec<WindowRecord>,
-    pub scheduled_reevaluations: Vec<ScheduledReevaluation>,
-    pub scheduled_callbacks: Vec<ScheduledReactionCallback>,
+    pub transition: Option<ReactionTransition>,
+    pub callbacks: Vec<ScheduledCallback>,
 }
+
 impl ReactionOutput {
     #[must_use = "the reaction result must be returned to the scheduler"]
     pub const fn idle() -> Self {
         Self {
-            transition_after: None,
-            writes: Vec::new(),
-            window_records: Vec::new(),
-            scheduled_reevaluations: Vec::new(),
-            scheduled_callbacks: Vec::new(),
+            transition: None,
+            callbacks: Vec::new(),
         }
     }
 
     #[must_use = "the constructed evaluation or reaction result must be used"]
     pub const fn after(delay: SimDuration, writes: Vec<StateWrite>) -> Self {
         Self {
-            transition_after: Some(delay),
-            writes,
-            window_records: Vec::new(),
-            scheduled_reevaluations: Vec::new(),
-            scheduled_callbacks: Vec::new(),
+            transition: Some(ReactionTransition {
+                after: delay,
+                writes,
+                window_records: Vec::new(),
+            }),
+            callbacks: Vec::new(),
         }
     }
 
@@ -146,13 +160,13 @@ impl ReactionOutput {
     }
 
     #[must_use = "the updated reaction result contains the new scheduling request"]
-    pub fn and_schedule_once_after(mut self, delay: SimDuration, key: u64, priority: i32) -> Self {
-        self.scheduled_reevaluations.push(ScheduledReevaluation {
+    pub fn and_schedule_once_after(self, delay: SimDuration, key: u64, priority: i32) -> Self {
+        self.and_schedule(ScheduledCallback {
+            target: CallbackTarget::CurrentReaction,
             key,
             after: delay,
             priority,
-        });
-        self
+        })
     }
 
     #[must_use = "the callback request must be returned to the scheduler"]
@@ -167,24 +181,37 @@ impl ReactionOutput {
 
     #[must_use = "the updated reaction result contains the callback request"]
     pub fn and_schedule_reaction_once_after(
-        mut self,
+        self,
         reaction: ReactionId,
         delay: SimDuration,
         key: u64,
         priority: i32,
     ) -> Self {
-        self.scheduled_callbacks.push(ScheduledReactionCallback {
-            reaction,
+        self.and_schedule(ScheduledCallback {
+            target: CallbackTarget::Reaction(reaction),
             key,
             after: delay,
             priority,
-        });
+        })
+    }
+
+    #[must_use = "the updated reaction result contains the callback request"]
+    pub fn and_schedule(mut self, callback: ScheduledCallback) -> Self {
+        self.callbacks.push(callback);
         self
     }
 
+    /// Record at the transition time, or immediately if no transition was requested.
     #[must_use = "the updated reaction result contains the history record"]
     pub fn and_record_window(mut self, history: HistoryId, key: u64) -> Self {
-        self.window_records.push(WindowRecord::new(history, key));
+        self.transition
+            .get_or_insert_with(|| ReactionTransition {
+                after: SimDuration::ZERO,
+                writes: Vec::new(),
+                window_records: Vec::new(),
+            })
+            .window_records
+            .push(WindowRecord::new(history, key));
         self
     }
 }

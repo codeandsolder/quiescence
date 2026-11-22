@@ -50,7 +50,6 @@ pub enum RuntimeError {
     TooManyHistories,
     UnknownReaction(ReactionId),
     UnknownHistory(HistoryId),
-    UnscheduledReactionEffects(ReactionId),
     DuplicateStateWrite(NodeId),
     InteractionIngress(InteractionIngressError),
     InteractionProcessing {
@@ -95,12 +94,6 @@ impl fmt::Display for RuntimeError {
             Self::TooManyHistories => f.write_str("graph contains too many temporal histories"),
             Self::UnknownReaction(id) => write!(f, "unknown reaction {id:?}"),
             Self::UnknownHistory(id) => write!(f, "unknown temporal history {id:?}"),
-            Self::UnscheduledReactionEffects(id) => {
-                write!(
-                    f,
-                    "reaction {id:?} returned effects without a transition time"
-                )
-            }
             Self::DuplicateStateWrite(id) => {
                 write!(
                     f,

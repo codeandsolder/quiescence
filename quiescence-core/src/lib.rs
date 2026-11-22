@@ -2,47 +2,30 @@
 
 use core::fmt;
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct NodeId(u32);
+macro_rules! graph_id {
+    ($name:ident, $doc:literal) => {
+        #[doc = $doc]
+        #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+        pub struct $name(u32);
 
-impl NodeId {
-    #[must_use = "the constructed identifier must be used"]
-    pub const fn from_index(index: u32) -> Self {
-        Self(index)
-    }
-    #[must_use = "the converted index must be used"]
-    pub const fn index(self) -> usize {
-        self.0 as usize
-    }
+        impl $name {
+            /// Construct a graph-local identifier from its raw index.
+            #[must_use = "the constructed identifier must be used"]
+            pub const fn from_index(index: u32) -> Self {
+                Self(index)
+            }
+
+            #[must_use = "the converted index must be used"]
+            pub const fn index(self) -> usize {
+                self.0 as usize
+            }
+        }
+    };
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct HistoryId(u32);
-
-impl HistoryId {
-    #[must_use = "the constructed identifier must be used"]
-    pub const fn from_index(index: u32) -> Self {
-        Self(index)
-    }
-    #[must_use = "the converted index must be used"]
-    pub const fn index(self) -> usize {
-        self.0 as usize
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ReactionId(u32);
-
-impl ReactionId {
-    #[must_use = "the constructed identifier must be used"]
-    pub const fn from_index(index: u32) -> Self {
-        Self(index)
-    }
-    #[must_use = "the converted index must be used"]
-    pub const fn index(self) -> usize {
-        self.0 as usize
-    }
-}
+graph_id!(NodeId, "Graph-local state node identifier.");
+graph_id!(HistoryId, "Graph-local event history identifier.");
+graph_id!(ReactionId, "Graph-local reaction identifier.");
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct SimTime(i64);

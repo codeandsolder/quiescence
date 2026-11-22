@@ -1319,3 +1319,101 @@ fn future_inputs_run_in_time_order() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(g.value_f64(n)?, 2.0);
     Ok(())
 }
+
+#[test]
+fn mixed_callback_destinations_preserve_output_order() -> Result<(), Box<dyn std::error::Error>> {
+    let mut graph = Graph::new(RuntimeConfig::default());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let capture = Arc::clone(&seen);
+    let target = graph.add_event_callback("target", move |context| {
+        capture
+            .lock()
+            .map_err(|_| EvalError::Message(String::from("capture poisoned")))?
+            .push(context.invocation());
+        Ok(ReactionOutput::idle())
+    })?;
+    let capture = Arc::clone(&seen);
+    let producer =
+        graph.add_event_callback("producer", move |context| match context.invocation() {
+            super::Invocation::External { token: None } => Ok(
+                ReactionOutput::schedule_reaction_once_after(target, SimDuration::ZERO, 1, 0)
+                    .and_schedule_once_after(SimDuration::ZERO, 2, 0)
+                    .and_schedule_reaction_once_after(target, SimDuration::ZERO, 3, 0),
+            ),
+            invocation => {
+                capture
+                    .lock()
+                    .map_err(|_| EvalError::Message(String::from("capture poisoned")))?
+                    .push(invocation);
+                Ok(ReactionOutput::idle())
+            }
+        })?;
+    graph.schedule_reaction_event(producer, SimTime::ZERO, 0)?;
+    graph.advance_to(SimTime::ZERO)?;
+    assert_eq!(
+        *seen.lock().map_err(|_| "capture poisoned")?,
+        [
+            super::Invocation::Scheduled { key: 1 },
+            super::Invocation::Scheduled { key: 2 },
+            super::Invocation::Scheduled { key: 3 },
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn explicit_and_implicit_self_requests_share_first_wins_deduplication()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut graph = Graph::new(RuntimeConfig::default());
+    // First reaction has graph-local index zero.
+    let callback = quiescence_core::ReactionId::from_index(0);
+    let actual = graph.add_event_callback("self", move |context| {
+        if matches!(context.invocation(), super::Invocation::External { .. }) {
+            Ok(ReactionOutput::schedule_reaction_once_after(
+                callback,
+                SimDuration::from_millis(5),
+                9,
+                0,
+            )
+            .and_schedule_once_after(SimDuration::from_millis(1), 9, 0))
+        } else {
+            Ok(ReactionOutput::idle())
+        }
+    })?;
+    assert_eq!(actual, callback);
+    graph.schedule_reaction_event(callback, SimTime::ZERO, 0)?;
+    graph.advance_to(SimTime::ZERO)?;
+    assert_eq!(graph.next_event_time(), Some(SimTime::from_millis(5)));
+    graph.advance_to(SimTime::from_millis(5))?;
+    assert_eq!(graph.next_event_time(), None);
+    Ok(())
+}
+
+#[test]
+fn history_only_transition_and_invalid_batch_are_atomic() -> Result<(), Box<dyn std::error::Error>>
+{
+    let mut graph = Graph::new(RuntimeConfig::default());
+    let history = graph.add_event_window("history", SimDuration::from_secs(1))?;
+    let node = graph.add_input("value", q0()?, 0.0)?;
+    let callback = graph.add_event_callback("record", move |_| {
+        Ok(ReactionOutput::idle().and_record_window(history, 7))
+    })?;
+    graph.schedule_reaction_event(callback, SimTime::ZERO, 0)?;
+    graph.advance_to(SimTime::ZERO)?;
+    assert_eq!(graph.event_window_count(history, 7)?, 1);
+    let invalid = graph.add_event_callback("invalid", move |_| {
+        Ok(
+            ReactionOutput::immediate(vec![StateWrite::new(node, 13.0), StateWrite::atom(node, 0)])
+                .and_record_window(history, 7),
+        )
+    })?;
+    graph.schedule_reaction_event(invalid, SimTime::ZERO, 0)?;
+    assert!(matches!(
+        graph.advance_to(SimTime::ZERO),
+        Err(RuntimeError::DuplicateStateWrite(_))
+    ));
+    assert_eq!(graph.value_bucket(node)?, Bucket::new(0));
+    assert_eq!(graph.event_window_count(history, 7)?, 1);
+    assert_eq!(graph.take_transitions(), []);
+    Ok(())
+}

@@ -21,8 +21,8 @@ pub use ingress::{
     RejectedInteraction, interaction_channel,
 };
 pub use output::{
-    CanonicalValue, EvalOutput, QuiescentPublication, QuiescentSnapshot, ReactionOutput,
-    ScheduledReactionCallback, ScheduledReevaluation, StateWrite, WindowRecord,
+    CallbackTarget, CanonicalValue, EvalOutput, QuiescentPublication, QuiescentSnapshot,
+    ReactionOutput, ReactionTransition, ScheduledCallback, StateWrite, WindowRecord,
 };
 
 use event_queue::{EventKind, EventQueue, ScheduledEvent};
@@ -33,6 +33,14 @@ type EvalFn =
 type ReactionFn = Box<
     dyn for<'a> Fn(&EvalContext<'a>) -> Result<ReactionOutput, EvalError> + Send + Sync + 'static,
 >;
+enum PreparedTransition {
+    Immediate {
+        writes: Vec<ResolvedWrite>,
+        window_records: Vec<WindowRecord>,
+    },
+    Delayed(ReactionTransition),
+}
+
 struct ResolvedWrite {
     node: NodeId,
     current: CanonicalValue,
@@ -89,13 +97,21 @@ impl Default for RuntimeConfig {
     }
 }
 
+/// Why the current evaluation was requested.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Invocation {
+    Reactive,
+    Scheduled { key: u64 },
+    External { token: Option<u64> },
+}
+
 pub struct EvalContext<'a> {
     now: SimTime,
     nodes: &'a [Node],
     windows: &'a [EventWindow],
     reads: RefCell<BTreeSet<NodeId>>,
-    scheduled_key: Option<u64>,
-    external_token: Option<u64>,
+    track_dependencies: bool,
+    invocation: Invocation,
 }
 impl EvalContext<'_> {
     #[must_use = "the current simulation time must be used"]
@@ -106,14 +122,26 @@ impl EvalContext<'_> {
     /// Key of the keyed scheduled callback that caused this evaluation, when applicable.
     #[must_use = "the scheduled key must be considered by the caller"]
     pub const fn scheduled_key(&self) -> Option<u64> {
-        self.scheduled_key
+        match self.invocation {
+            Invocation::Scheduled { key } => Some(key),
+            _ => None,
+        }
     }
 
     /// Source-defined token attached to an unkeyed external event, when applicable.
     #[must_use = "the external token must be considered by the caller"]
     pub const fn external_token(&self) -> Option<u64> {
-        self.external_token
+        match self.invocation {
+            Invocation::External { token } => token,
+            _ => None,
+        }
     }
+    /// Distinguishes tokenless external events from reactive evaluation.
+    #[must_use = "the invocation cause must be considered by the caller"]
+    pub const fn invocation(&self) -> Invocation {
+        self.invocation
+    }
+
     /// # Errors
     /// Returns an error if the node does not exist or is not numeric.
     pub fn read_bucket(&self, id: NodeId) -> Result<Bucket, EvalError> {
@@ -165,7 +193,9 @@ impl EvalContext<'_> {
             .nodes
             .get(id.index())
             .ok_or(EvalError::UnknownNode(id))?;
-        self.reads.borrow_mut().insert(id);
+        if self.track_dependencies {
+            self.reads.borrow_mut().insert(id);
+        }
         Ok(&node.state)
     }
 
@@ -197,8 +227,7 @@ struct Reaction {
     dependencies: BTreeSet<NodeId>,
     generation: u64,
     track_dependencies: bool,
-    pending_scheduled_key: Option<u64>,
-    pending_external_token: Option<u64>,
+    pending_invocation: Invocation,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -571,8 +600,7 @@ impl Graph {
             dependencies: BTreeSet::new(),
             generation: 0,
             track_dependencies,
-            pending_scheduled_key: None,
-            pending_external_token: None,
+            pending_invocation: Invocation::Reactive,
         });
         self.dirty.reactions.push(false);
         if track_dependencies {
@@ -661,12 +689,7 @@ impl Graph {
             | ExternalInteraction::Callback { moment, .. } => *moment,
         };
         let at = moment.resolve(self.now);
-        if at < self.now {
-            return Err(RuntimeError::EventInPast {
-                now: self.now,
-                requested: at,
-            });
-        }
+        self.validate_time(at)?;
         match interaction {
             ExternalInteraction::StateBatch { writes, .. } => {
                 self.validate_state_write_batch(writes)
@@ -762,62 +785,59 @@ impl Graph {
     /// # Errors
     /// Propagates node validation, quantization, evaluation, and calculation-instability errors.
     pub fn set_input_now(&mut self, id: NodeId, value: f64) -> Result<(), RuntimeError> {
-        self.apply_state_writes(&[StateWrite::new(id, value)])?;
-        self.settle()
+        self.set_state_now(&[StateWrite::new(id, value)])
     }
 
     /// # Errors
     /// Propagates node validation, evaluation, and calculation-instability errors.
     pub fn set_atom_now(&mut self, id: NodeId, value: u64) -> Result<(), RuntimeError> {
-        self.apply_state_writes(&[StateWrite::atom(id, value)])?;
+        self.set_state_now(&[StateWrite::atom(id, value)])
+    }
+
+    /// Apply a batch atomically, then settle dirty computations without delivering queued events.
+    ///
+    /// # Errors
+    /// Returns validation, quantization, evaluation, or calculation-instability errors.
+    /// An evaluation error after the batch commits does not roll back the input batch.
+    pub fn set_state_now(&mut self, writes: &[StateWrite]) -> Result<(), RuntimeError> {
+        self.apply_state_writes(writes)?;
         self.settle()
     }
 
+    /// Schedule a numeric input write.
+    ///
     /// # Errors
-    /// Returns an error if the node does not exist or the requested time is in the past.
+    /// Rejects invalid input targets, non-finite values, and past timestamps.
     pub fn schedule_input(
         &mut self,
         id: NodeId,
         at: SimTime,
         value: f64,
     ) -> Result<(), RuntimeError> {
-        self.validate_state_write_batch(&[StateWrite::new(id, value)])?;
-        if at < self.now {
-            return Err(RuntimeError::EventInPast {
-                now: self.now,
-                requested: at,
-            });
-        }
-        self.push_event(
-            at,
-            EventKind::SetState {
-                write: StateWrite::new(id, value),
-            },
-        );
-        Ok(())
+        self.schedule_write(at, StateWrite::new(id, value))
     }
 
+    /// Schedule an atom input write.
+    ///
     /// # Errors
-    /// Returns an error if the node does not exist or the requested time is in the past.
+    /// Rejects invalid input targets and past timestamps.
     pub fn schedule_atom(
         &mut self,
         id: NodeId,
         at: SimTime,
         value: u64,
     ) -> Result<(), RuntimeError> {
-        self.validate_state_write_batch(&[StateWrite::atom(id, value)])?;
-        if at < self.now {
-            return Err(RuntimeError::EventInPast {
-                now: self.now,
-                requested: at,
-            });
-        }
-        self.push_event(
-            at,
-            EventKind::SetState {
-                write: StateWrite::atom(id, value),
-            },
-        );
+        self.schedule_write(at, StateWrite::atom(id, value))
+    }
+
+    /// Schedule a single typed input write without allocating a batch.
+    ///
+    /// # Errors
+    /// Rejects invalid input targets, non-finite numeric values, and past timestamps.
+    pub fn schedule_write(&mut self, at: SimTime, write: StateWrite) -> Result<(), RuntimeError> {
+        self.validate_state_write_batch(&[write])?;
+        self.validate_time(at)?;
+        self.push_event(at, EventKind::SetState { write });
         Ok(())
     }
 
@@ -835,24 +855,7 @@ impl Graph {
         at: SimTime,
         priority: i32,
     ) -> Result<(), RuntimeError> {
-        self.reactions
-            .get(reaction.index())
-            .ok_or(RuntimeError::UnknownReaction(reaction))?;
-        if at < self.now {
-            return Err(RuntimeError::EventInPast {
-                now: self.now,
-                requested: at,
-            });
-        }
-        self.push_event_with_priority(
-            at,
-            priority,
-            EventKind::ExternalReaction {
-                reaction,
-                token: None,
-            },
-        );
-        Ok(())
+        self.schedule_callback(reaction, at, priority, None)
     }
 
     /// Schedule one externally sourced reaction callback with an opaque source token.
@@ -870,26 +873,40 @@ impl Graph {
         priority: i32,
         token: u64,
     ) -> Result<(), RuntimeError> {
+        self.schedule_callback(reaction, at, priority, Some(token))
+    }
+
+    fn schedule_callback(
+        &mut self,
+        reaction: ReactionId,
+        at: SimTime,
+        priority: i32,
+        token: Option<u64>,
+    ) -> Result<(), RuntimeError> {
         self.reactions
             .get(reaction.index())
             .ok_or(RuntimeError::UnknownReaction(reaction))?;
+        self.validate_time(at)?;
+        self.push_event_with_priority(
+            at,
+            priority,
+            EventKind::ExternalReaction { reaction, token },
+        );
+        Ok(())
+    }
+
+    fn validate_time(&self, at: SimTime) -> Result<(), RuntimeError> {
         if at < self.now {
             return Err(RuntimeError::EventInPast {
                 now: self.now,
                 requested: at,
             });
         }
-        self.push_event_with_priority(
-            at,
-            priority,
-            EventKind::ExternalReaction {
-                reaction,
-                token: Some(token),
-            },
-        );
         Ok(())
     }
 
+    /// Process dirty computations without delivering queued events.
+    ///
     /// # Errors
     /// Propagates evaluation, scheduling, quantization, and calculation-instability errors.
     pub fn settle(&mut self) -> Result<(), RuntimeError> {
@@ -929,12 +946,7 @@ impl Graph {
     /// # Errors
     /// Returns an error for backwards time travel or if processing due work fails.
     pub fn advance_to(&mut self, target: SimTime) -> Result<(), RuntimeError> {
-        if target < self.now {
-            return Err(RuntimeError::EventInPast {
-                now: self.now,
-                requested: target,
-            });
-        }
+        self.validate_time(target)?;
         let mut steps = 0;
         self.settle_with_budget(&mut steps)?;
         while self.events.peek().is_some_and(|e| e.at <= target) {
@@ -986,8 +998,8 @@ impl Graph {
             nodes: &self.nodes,
             windows: &self.windows,
             reads: RefCell::new(BTreeSet::new()),
-            scheduled_key: None,
-            external_token: None,
+            track_dependencies: true,
+            invocation: Invocation::Reactive,
         };
         let output =
             evaluator(&context).map_err(|source| RuntimeError::Evaluation { node: id, source })?;
@@ -1033,7 +1045,7 @@ impl Graph {
     }
 
     fn evaluate_reaction(&mut self, id: ReactionId) -> Result<(), RuntimeError> {
-        let (evaluator, track_dependencies, scheduled_key, external_token) = {
+        let (evaluator, track_dependencies, invocation) = {
             let reaction = self
                 .reactions
                 .get(id.index())
@@ -1041,8 +1053,7 @@ impl Graph {
             (
                 &reaction.evaluator,
                 reaction.track_dependencies,
-                reaction.pending_scheduled_key,
-                reaction.pending_external_token,
+                reaction.pending_invocation,
             )
         };
         let context = EvalContext {
@@ -1050,8 +1061,8 @@ impl Graph {
             nodes: &self.nodes,
             windows: &self.windows,
             reads: RefCell::new(BTreeSet::new()),
-            scheduled_key,
-            external_token,
+            track_dependencies,
+            invocation,
         };
         let output = evaluator(&context).map_err(|source| RuntimeError::ReactionEvaluation {
             reaction: id,
@@ -1063,40 +1074,20 @@ impl Graph {
             None
         };
         let ReactionOutput {
-            transition_after,
-            writes,
-            window_records,
-            scheduled_reevaluations,
-            scheduled_callbacks,
+            transition,
+            callbacks,
         } = output;
 
-        // Validate the entire proposed result before changing dependency
-        // subscriptions, consuming callback metadata, or publishing effects.
-        if transition_after.is_none() && (!writes.is_empty() || !window_records.is_empty()) {
-            return Err(RuntimeError::UnscheduledReactionEffects(id));
-        }
-        for callback in &scheduled_callbacks {
+        // Validate every effect before changing subscriptions or publishing state.
+        for callback in &callbacks {
+            let target = callback.target.resolve(id);
             self.reactions
-                .get(callback.reaction.index())
-                .ok_or(RuntimeError::UnknownReaction(callback.reaction))?;
+                .get(target.index())
+                .ok_or(RuntimeError::UnknownReaction(target))?;
         }
-        let prepared_writes = if let Some(delay) = transition_after {
-            for record in &window_records {
-                if self.windows.get(record.history.index()).is_none() {
-                    return Err(RuntimeError::UnknownHistory(record.history));
-                }
-            }
-            if delay == SimDuration::ZERO {
-                Some(self.resolve_state_writes(&writes)?)
-            } else {
-                // Delayed writes will be resolved against the canonical state
-                // when they fire, but their types and targets are fixed now.
-                self.validate_state_write_batch(&writes)?;
-                None
-            }
-        } else {
-            None
-        };
+        let prepared = transition
+            .map(|transition| self.prepare_transition(transition))
+            .transpose()?;
 
         if let Some(deps) = dependencies {
             self.update_dependencies(WorkId::Reaction(id), deps)?;
@@ -1105,41 +1096,56 @@ impl Graph {
             .reactions
             .get_mut(id.index())
             .ok_or(RuntimeError::UnknownReaction(id))?;
-        reaction.pending_scheduled_key = None;
-        reaction.pending_external_token = None;
+        reaction.pending_invocation = Invocation::Reactive;
         reaction.generation = reaction.generation.saturating_add(1);
         let generation = reaction.generation;
 
-        if let Some(resolved) = prepared_writes {
-            self.commit_resolved_state_writes(resolved)?;
-            for record in window_records {
-                self.windows[record.history.index()].record(self.now, record.key);
+        match prepared {
+            Some(PreparedTransition::Immediate {
+                writes,
+                window_records,
+            }) => {
+                self.commit_resolved_state_writes(writes)?;
+                self.record_windows(&window_records);
             }
-        } else if let Some(delay) = transition_after {
-            self.push_event(
-                self.now.saturating_add(delay),
-                EventKind::ReactionTransition {
-                    reaction: id,
-                    generation,
-                    writes,
-                    window_records,
-                },
-            );
+            Some(PreparedTransition::Delayed(ReactionTransition {
+                after,
+                writes,
+                window_records,
+            })) => {
+                self.push_event(
+                    self.now.saturating_add(after),
+                    EventKind::ReactionTransition {
+                        reaction: id,
+                        generation,
+                        writes,
+                        window_records,
+                    },
+                );
+            }
+            None => {}
         }
-        for request in scheduled_reevaluations {
-            self.schedule_reaction_once(id, request);
-        }
-        for callback in scheduled_callbacks {
-            self.schedule_reaction_once(
-                callback.reaction,
-                ScheduledReevaluation {
-                    key: callback.key,
-                    after: callback.after,
-                    priority: callback.priority,
-                },
-            );
+        for callback in callbacks {
+            self.schedule_reaction_once(callback.target.resolve(id), callback);
         }
         Ok(())
+    }
+
+    fn prepare_transition(
+        &self,
+        transition: ReactionTransition,
+    ) -> Result<PreparedTransition, RuntimeError> {
+        self.validate_window_records(&transition.window_records)?;
+        if transition.after == SimDuration::ZERO {
+            Ok(PreparedTransition::Immediate {
+                writes: self.resolve_state_writes(&transition.writes)?,
+                window_records: transition.window_records,
+            })
+        } else {
+            // Delayed writes resolve against canonical state at delivery.
+            self.validate_state_write_batch(&transition.writes)?;
+            Ok(PreparedTransition::Delayed(transition))
+        }
     }
 
     fn update_dependencies(
@@ -1202,24 +1208,11 @@ impl Graph {
                 Ok(())
             }
             EventKind::ExternalReaction { reaction, token } => {
-                let target = self
-                    .reactions
-                    .get_mut(reaction.index())
-                    .ok_or(RuntimeError::UnknownReaction(*reaction))?;
-                target.pending_scheduled_key = None;
-                target.pending_external_token = *token;
-                self.dirty.mark(WorkId::Reaction(*reaction));
-                Ok(())
+                self.wake_reaction(*reaction, Invocation::External { token: *token })
             }
             EventKind::ScheduledReaction { reaction, key } => {
+                self.wake_reaction(*reaction, Invocation::Scheduled { key: *key })?;
                 self.pending_scheduled_reactions.remove(&(*reaction, *key));
-                let target = self
-                    .reactions
-                    .get_mut(reaction.index())
-                    .ok_or(RuntimeError::UnknownReaction(*reaction))?;
-                target.pending_scheduled_key = Some(*key);
-                target.pending_external_token = None;
-                self.dirty.mark(WorkId::Reaction(*reaction));
                 Ok(())
             }
             EventKind::ReactionTransition {
@@ -1242,21 +1235,43 @@ impl Graph {
         }
     }
 
+    fn wake_reaction(
+        &mut self,
+        reaction: ReactionId,
+        invocation: Invocation,
+    ) -> Result<(), RuntimeError> {
+        self.reactions
+            .get_mut(reaction.index())
+            .ok_or(RuntimeError::UnknownReaction(reaction))?
+            .pending_invocation = invocation;
+        self.dirty.mark(WorkId::Reaction(reaction));
+        Ok(())
+    }
+
     fn apply_reaction_effects(
         &mut self,
         writes: &[StateWrite],
         window_records: &[WindowRecord],
     ) -> Result<(), RuntimeError> {
-        for record in window_records {
+        self.validate_window_records(window_records)?;
+        self.apply_state_writes(writes)?;
+        self.record_windows(window_records);
+        Ok(())
+    }
+
+    fn validate_window_records(&self, records: &[WindowRecord]) -> Result<(), RuntimeError> {
+        for record in records {
             if self.windows.get(record.history.index()).is_none() {
                 return Err(RuntimeError::UnknownHistory(record.history));
             }
         }
-        self.apply_state_writes(writes)?;
-        for record in window_records {
+        Ok(())
+    }
+
+    fn record_windows(&mut self, records: &[WindowRecord]) {
+        for record in records {
             self.windows[record.history.index()].record(self.now, record.key);
         }
-        Ok(())
     }
 
     fn apply_state_writes(&mut self, writes: &[StateWrite]) -> Result<(), RuntimeError> {
@@ -1324,7 +1339,7 @@ impl Graph {
         Ok(())
     }
 
-    fn schedule_reaction_once(&mut self, reaction: ReactionId, request: ScheduledReevaluation) {
+    fn schedule_reaction_once(&mut self, reaction: ReactionId, request: ScheduledCallback) {
         if !self
             .pending_scheduled_reactions
             .insert((reaction, request.key))
