@@ -61,6 +61,73 @@ impl Fraction {
     }
 }
 
+/// Exact unsigned binary significand multiplied by the decimal scale.
+/// The power is in full bucket units (half-grid callers add one).
+struct ScaledDyadic {
+    numerator: u128,
+    power: i32,
+}
+
+impl ScaledDyadic {
+    fn new(value: f64, scale: u128) -> Result<Self, QuantizeError> {
+        const FRACTION_BITS: u32 = 52;
+        const FRACTION_MASK: u64 = (1_u64 << FRACTION_BITS) - 1;
+        let bits = value.to_bits();
+        let exponent = i32::from(
+            u16::try_from((bits >> FRACTION_BITS) & 0x7ff)
+                .map_err(|_| QuantizeError::NonFiniteEstimate)?,
+        );
+        let (significand, power) = if exponent == 0 {
+            (bits & FRACTION_MASK, -1074)
+        } else {
+            (
+                (bits & FRACTION_MASK) | (1_u64 << FRACTION_BITS),
+                exponent - 1023 - 52,
+            )
+        };
+        Ok(Self {
+            numerator: u128::from(significand) * scale,
+            power,
+        })
+    }
+}
+
+/// Direct exact nearest-integer point rounding. Only one full-width
+/// magnitude and one midpoint comparison are needed, not two endpoints.
+pub fn exact_point(value: f64, scale: u128) -> Result<(Bucket, bool), QuantizeError> {
+    if !value.is_finite() {
+        return Err(QuantizeError::NonFiniteEstimate);
+    }
+    let ScaledDyadic { numerator, power } = ScaledDyadic::new(value, scale)?;
+    let negative = value.is_sign_negative();
+    let limit = (1_u128 << 63) - u128::from(!negative);
+    let shift = power.unsigned_abs();
+    let (rounded, midpoint) = if power >= 0 {
+        if numerator > limit.checked_shr(shift).unwrap_or(0) {
+            return Err(QuantizeError::OutOfRange);
+        }
+        (numerator << shift, false)
+    } else if shift >= u128::BITS {
+        // The significand times any supported decimal scale uses <=103 bits.
+        (0, false)
+    } else {
+        let half = 1_u128 << (shift - 1);
+        let whole = numerator >> shift;
+        let fraction = numerator & ((half << 1) - 1);
+        (whole + u128::from(fraction >= half), fraction == half)
+    };
+    if rounded > limit {
+        return Err(QuantizeError::OutOfRange);
+    }
+    let magnitude = u64::try_from(rounded).map_err(|_| QuantizeError::OutOfRange)?;
+    let raw = if negative {
+        magnitude.wrapping_neg()
+    } else {
+        magnitude
+    };
+    Ok((Bucket::new(raw.cast_signed()), midpoint))
+}
+
 #[derive(Clone, Copy)]
 struct Magnitude {
     whole: i128,
@@ -72,22 +139,8 @@ impl Magnitude {
     const LIMIT: u128 = 1_u128 << 64;
 
     fn scaled(value: f64, scale: u128) -> Result<Self, QuantizeError> {
-        const FRACTION_BITS: u32 = 52;
-        const FRACTION_MASK: u64 = (1_u64 << FRACTION_BITS) - 1;
-        let bits = value.to_bits();
-        let exponent = i32::from(
-            u16::try_from((bits >> FRACTION_BITS) & 0x7ff)
-                .map_err(|_| QuantizeError::NonFiniteEstimate)?,
-        );
-        let (significand, power) = if exponent == 0 {
-            (bits & FRACTION_MASK, -1074 + 1)
-        } else {
-            (
-                (bits & FRACTION_MASK) | (1_u64 << FRACTION_BITS),
-                exponent - 1023 - 52 + 1,
-            )
-        };
-        let numerator = u128::from(significand) * scale;
+        let ScaledDyadic { numerator, power } = ScaledDyadic::new(value, scale)?;
+        let power = power + 1;
         let shift = power.unsigned_abs();
         let (whole, fraction) = if power >= 0 {
             if numerator > Self::LIMIT.checked_shr(shift).unwrap_or(0) {
@@ -195,6 +248,38 @@ impl HalfBounds {
 mod tests {
     use super::*;
     use crate::Quantization;
+
+    #[test]
+    fn direct_points_match_half_grid_over_binary64_exponents() {
+        let mut random = 0xa076_1d64_78bd_642f_u64;
+        for places in 0..=15 {
+            let scale = 10_u128.pow(places);
+            for exponent in 0..2047_u64 {
+                random ^= random << 13;
+                random ^= random >> 7;
+                random ^= random << 17;
+                for fraction in [0, 1, (1 << 51), (1 << 52) - 1, random & ((1 << 52) - 1)] {
+                    for sign in [0, 1 << 63] {
+                        let value = f64::from_bits(sign | (exponent << 52) | fraction);
+                        let expected = HalfBounds::estimate(Estimate::point(value), scale)
+                            .and_then(|(bounds, _)| {
+                                bounds.round_bucket().map(|bucket| {
+                                    (bucket, bounds.floor == bounds.ceil && bounds.floor % 2 != 0)
+                                })
+                            });
+                        assert_eq!(
+                            exact_point(value, scale),
+                            expected,
+                            "{value:?}, scale {scale}"
+                        );
+                    }
+                }
+            }
+        }
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(exact_point(value, 1), Err(QuantizeError::NonFiniteEstimate));
+        }
+    }
 
     #[test]
     fn sub_ulp_radius_cannot_disappear_at_half_bucket() -> Result<(), Box<dyn std::error::Error>> {

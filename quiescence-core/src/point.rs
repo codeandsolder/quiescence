@@ -8,7 +8,7 @@
 //! arithmetic instead. Nonzero-radius intervals use an explicit absolute
 //! endpoint error bound and two-lane certification.
 
-use super::{Bucket, Estimate, HalfBounds, Quantization, QuantizeError};
+use super::{Bucket, Estimate, Quantization, QuantizeError, quantize::exact_point};
 use core::simd::{
     Select, Simd,
     cmp::SimdPartialOrd,
@@ -72,8 +72,7 @@ impl PointRequest {
     /// Rejects nonfinite or unrepresentable values.
     #[inline]
     pub fn resolve(self) -> Result<Bucket, QuantizeError> {
-        self.certified_bucket()
-            .map_or_else(|| self.resolve_exact(), |bucket| Ok(self.retain(bucket)))
+        resolve_point(self.quantization, self.previous, self.value)
     }
 
     /// Compile point rounding independently of the current previous bucket.
@@ -83,41 +82,10 @@ impl PointRequest {
     /// Rejects nonfinite or unrepresentable values.
     #[inline]
     pub fn prepare(self) -> Result<PreparedPoint, QuantizeError> {
-        self.certified_bucket().map_or_else(
-            || self.prepare_exact(),
+        certified_bucket(self.quantization, self.value).map_or_else(
+            || prepare_point_exact(self.quantization, self.value),
             |raw| Ok(PreparedPoint::Interior(Bucket::new(raw))),
         )
-    }
-
-    #[inline]
-    fn certified_bucket(self) -> Option<i64> {
-        let scaled = self.value * self.quantization.scale();
-        let magnitude = scaled.abs();
-        let encoded = magnitude + MAGIC;
-        let rounded = encoded - MAGIC;
-        if magnitude < LIMIT && (magnitude - rounded).abs() < 0.5 {
-            let unsigned = encoded.to_bits() & MANTISSA;
-            Some(signed_magnitude(unsigned, scaled.is_sign_negative()))
-        } else {
-            None
-        }
-    }
-
-    #[cold]
-    fn prepare_exact(self) -> Result<PreparedPoint, QuantizeError> {
-        if !self.value.is_finite() {
-            return Err(QuantizeError::NonFiniteEstimate);
-        }
-        let (bounds, _) = HalfBounds::estimate(
-            Estimate::point(self.value),
-            u128::from(self.quantization.scale_integer()),
-        )?;
-        let bucket = bounds.round_bucket()?;
-        Ok(if bounds.floor == bounds.ceil && bounds.floor % 2 != 0 {
-            PreparedPoint::Midpoint(bucket)
-        } else {
-            PreparedPoint::Interior(bucket)
-        })
     }
 
     /// Resolve independent requests into a caller-owned output buffer.
@@ -143,22 +111,63 @@ impl PointRequest {
     ) -> Result<(), QuantizeError> {
         transform_batch(requests, output, prepare_block, Self::prepare)
     }
+}
 
-    #[inline]
-    fn retain(self, rounded: i64) -> Bucket {
-        if let Some(previous) = self.previous
-            && rounded.abs_diff(previous.raw()) <= u64::from(self.quantization.hysteresis_lsd())
-        {
-            return previous;
-        }
-        Bucket::new(rounded)
-    }
+/// Scalar point entry shared by the quantization API and batch requests.
+#[inline]
+pub fn resolve_point(
+    quantization: Quantization,
+    previous: Option<Bucket>,
+    value: f64,
+) -> Result<Bucket, QuantizeError> {
+    let Some(rounded) = certified_bucket(quantization, value) else {
+        return resolve_point_exact(quantization, previous, value);
+    };
+    Ok(previous
+        .filter(|bucket| rounded.abs_diff(bucket.raw()) <= u64::from(quantization.hysteresis_lsd()))
+        .unwrap_or_else(|| Bucket::new(rounded)))
+}
 
-    #[cold]
-    fn resolve_exact(self) -> Result<Bucket, QuantizeError> {
-        self.quantization
-            .resolve_exact(self.previous, Estimate::point(self.value))
+#[inline]
+fn certified_bucket(quantization: Quantization, value: f64) -> Option<i64> {
+    let scaled = value * quantization.scale();
+    let magnitude = scaled.abs();
+    let encoded = magnitude + MAGIC;
+    let rounded = encoded - MAGIC;
+    if magnitude < LIMIT && (magnitude - rounded).abs() < 0.5 {
+        let unsigned = encoded.to_bits() & MANTISSA;
+        Some(signed_magnitude(unsigned, scaled.is_sign_negative()))
+    } else {
+        None
     }
+}
+
+#[cold]
+fn prepare_point_exact(
+    quantization: Quantization,
+    value: f64,
+) -> Result<PreparedPoint, QuantizeError> {
+    let (bucket, midpoint) = exact_point(value, u128::from(quantization.scale_integer()))?;
+    Ok(if midpoint {
+        PreparedPoint::Midpoint(bucket)
+    } else {
+        PreparedPoint::Interior(bucket)
+    })
+}
+
+#[cold]
+fn resolve_point_exact(
+    quantization: Quantization,
+    previous: Option<Bucket>,
+    value: f64,
+) -> Result<Bucket, QuantizeError> {
+    let prepared = prepare_point_exact(quantization, value)?;
+    Ok(previous.map_or(
+        match prepared {
+            PreparedPoint::Interior(bucket) | PreparedPoint::Midpoint(bucket) => bucket,
+        },
+        |previous| prepared.resolve(previous, quantization.hysteresis_lsd()),
+    ))
 }
 
 #[inline]
@@ -259,12 +268,9 @@ fn resolve_block(
     let distance = (rounded - previous + widths).cast::<u64>();
     let retain = distance.simd_le((widths + widths).cast::<u64>());
     let mut buckets = retain.select(previous, rounded).to_array().map(Bucket::new);
-    patch_uncertified(
-        requests,
-        certified,
-        &mut buckets,
-        PointRequest::resolve_exact,
-    )?;
+    patch_uncertified(requests, certified, &mut buckets, |request| {
+        resolve_point_exact(request.quantization, request.previous, request.value)
+    })?;
     *output = buckets;
     Ok(())
 }
@@ -278,12 +284,9 @@ fn prepare_block(
     let mut prepared = rounded
         .to_array()
         .map(|raw| PreparedPoint::Interior(Bucket::new(raw)));
-    patch_uncertified(
-        requests,
-        certified,
-        &mut prepared,
-        PointRequest::prepare_exact,
-    )?;
+    patch_uncertified(requests, certified, &mut prepared, |request| {
+        prepare_point_exact(request.quantization, request.value)
+    })?;
     *output = prepared;
     Ok(())
 }
@@ -339,6 +342,12 @@ fn round_block<const N: usize>(
 mod tests {
     use super::*;
 
+    fn oracle(request: PointRequest) -> Result<Bucket, QuantizeError> {
+        request
+            .quantization
+            .resolve_exact(request.previous, Estimate::point(request.value))
+    }
+
     fn next(random: &mut u64) -> u64 {
         *random ^= *random << 13;
         *random ^= *random >> 7;
@@ -392,7 +401,7 @@ mod tests {
                 let mut expected = [Bucket::new(0); LANES + 3];
                 let mut error = None;
                 for (request, out) in requests.iter().zip(&mut expected) {
-                    let exact = request.resolve_exact();
+                    let exact = oracle(*request);
                     assert_eq!(request.resolve(), exact, "{request:?}");
                     match exact {
                         Ok(bucket) => *out = bucket,
@@ -408,9 +417,9 @@ mod tests {
                 if let Some(error) = error {
                     assert_eq!(result, Err(error));
                     for (request, out) in requests.iter_mut().zip(&mut expected) {
-                        if request.resolve_exact().is_err() {
+                        if oracle(*request).is_err() {
                             request.value = 0.0;
-                            *out = request.resolve_exact()?;
+                            *out = oracle(*request)?;
                         }
                     }
                     PointRequest::resolve_batch(&requests, &mut actual)?;
@@ -453,7 +462,7 @@ mod tests {
                     });
                     let mut first_error = None;
                     for request in &requests {
-                        let exact = request.resolve_exact();
+                        let exact = oracle(*request);
                         let prepared = request.prepare();
                         match exact {
                             Ok(bucket) => {
