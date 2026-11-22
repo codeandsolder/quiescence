@@ -60,6 +60,12 @@ pub struct ScheduledEvent {
     pub(super) sequence: u64,
     pub(super) kind: EventKind,
 }
+impl ScheduledEvent {
+    const fn group_key(&self) -> (SimTime, i32) {
+        (self.at, self.priority)
+    }
+}
+
 /// Ordering ignores payloads, including NaN numeric writes; equality
 /// remains reflexive because heap identity is its assigned scheduling key.
 #[derive(Debug)]
@@ -92,8 +98,12 @@ impl PartialOrd for HeapEvent {
 /// When events spread over many times/priorities, switch to a conventional
 /// binary heap to avoid tree-map allocation overhead on sparse schedules.
 const MAX_GROUPED_KEYS: usize = 128;
+// Reuse small same-key buffers across quiescent cycles without retaining
+// a potentially huge burst allocation indefinitely.
+const MAX_RETAINED_FIFO: usize = 64;
 
 enum EventStorage {
+    SingleKey(VecDeque<ScheduledEvent>),
     Grouped(BTreeMap<(SimTime, i32), VecDeque<ScheduledEvent>>),
     Sparse(BinaryHeap<HeapEvent>),
 }
@@ -106,7 +116,7 @@ pub struct EventQueue {
 impl EventQueue {
     pub(super) const fn new() -> Self {
         Self {
-            storage: EventStorage::Grouped(BTreeMap::new()),
+            storage: EventStorage::SingleKey(VecDeque::new()),
             next_sequence: 0,
             len: 0,
         }
@@ -118,6 +128,7 @@ impl EventQueue {
 
     pub(super) fn peek(&self) -> Option<&ScheduledEvent> {
         match &self.storage {
+            EventStorage::SingleKey(queue) => queue.front(),
             EventStorage::Grouped(groups) => groups.first_key_value()?.1.front(),
             EventStorage::Sparse(heap) => heap.peek().map(|event| &event.0),
         }
@@ -129,61 +140,79 @@ impl EventQueue {
         }
         event.sequence = self.next_sequence;
         self.next_sequence += 1;
+        self.insert_assigned(event, VecDeque::push_back);
+    }
+
+    pub(super) fn restore_front(&mut self, event: ScheduledEvent) {
+        self.insert_assigned(event, VecDeque::push_front);
+    }
+
+    fn insert_assigned(
+        &mut self,
+        event: ScheduledEvent,
+        insert: impl FnOnce(&mut VecDeque<ScheduledEvent>, ScheduledEvent),
+    ) {
         self.len += 1;
+        let key = event.group_key();
         match &mut self.storage {
+            EventStorage::SingleKey(queue) => {
+                if let Some(previous) = queue.front().map(ScheduledEvent::group_key)
+                    && previous != key
+                {
+                    let mut groups = BTreeMap::from([(previous, std::mem::take(queue))]);
+                    insert(groups.entry(key).or_default(), event);
+                    self.storage = EventStorage::Grouped(groups);
+                } else {
+                    insert(queue, event);
+                }
+            }
             EventStorage::Grouped(groups) => {
-                groups
-                    .entry((event.at, event.priority))
-                    .or_default()
-                    .push_back(event);
+                insert(groups.entry(key).or_default(), event);
                 if groups.len() > MAX_GROUPED_KEYS {
-                    // Conversion is linear in the pending event count, and the
-                    // heap handles future mostly-distinct keys efficiently.
-                    let old = std::mem::replace(
-                        &mut self.storage,
-                        EventStorage::Sparse(BinaryHeap::new()),
+                    // Conversion is linear in the number of pending events.
+                    let heap = BinaryHeap::from(
+                        std::mem::take(groups)
+                            .into_values()
+                            .flatten()
+                            .map(HeapEvent)
+                            .collect::<Vec<_>>(),
                     );
-                    if let EventStorage::Grouped(groups) = old {
-                        let heap = BinaryHeap::from(
-                            groups
-                                .into_values()
-                                .flatten()
-                                .map(HeapEvent)
-                                .collect::<Vec<_>>(),
-                        );
-                        self.storage = EventStorage::Sparse(heap);
-                    }
+                    self.storage = EventStorage::Sparse(heap);
                 }
             }
             EventStorage::Sparse(heap) => heap.push(HeapEvent(event)),
         }
     }
 
-    pub(super) fn restore_front(&mut self, event: ScheduledEvent) {
-        self.len += 1;
-        match &mut self.storage {
-            EventStorage::Grouped(groups) => groups
-                .entry((event.at, event.priority))
-                .or_default()
-                .push_front(event),
-            EventStorage::Sparse(heap) => heap.push(HeapEvent(event)),
+    fn trim_empty_fifo(queue: &mut VecDeque<ScheduledEvent>) {
+        if queue.is_empty() && queue.capacity() > MAX_RETAINED_FIFO {
+            queue.shrink_to_fit();
         }
     }
 
     pub(super) fn pop(&mut self) -> Option<ScheduledEvent> {
         let event = match &mut self.storage {
+            EventStorage::SingleKey(queue) => {
+                let event = queue.pop_front();
+                Self::trim_empty_fifo(queue);
+                event
+            }
             EventStorage::Grouped(groups) => {
                 let mut first = groups.first_entry()?;
                 let event = first.get_mut().pop_front();
                 if first.get().is_empty() {
-                    first.remove();
+                    let mut queue = first.remove();
+                    if groups.is_empty() {
+                        Self::trim_empty_fifo(&mut queue);
+                        self.storage = EventStorage::SingleKey(queue);
+                    }
                 }
                 event
             }
             EventStorage::Sparse(heap) => {
                 let event = heap.pop().map(|event| event.0);
                 if heap.is_empty() {
-                    self.storage = EventStorage::Grouped(BTreeMap::new());
+                    self.storage = EventStorage::SingleKey(VecDeque::new());
                 }
                 event
             }
@@ -197,18 +226,26 @@ impl EventQueue {
     /// Remove invalidated entries without changing surviving causal keys.
     pub(super) fn retain(&mut self, mut keep: impl FnMut(&EventKind) -> bool) {
         match &mut self.storage {
+            EventStorage::SingleKey(queue) => {
+                queue.retain(|event| keep(&event.kind));
+                self.len = queue.len();
+                Self::trim_empty_fifo(queue);
+            }
             EventStorage::Grouped(groups) => {
                 groups.retain(|_, group| {
                     group.retain(|event| keep(&event.kind));
                     !group.is_empty()
                 });
                 self.len = groups.values().map(VecDeque::len).sum();
+                if groups.is_empty() {
+                    self.storage = EventStorage::SingleKey(VecDeque::new());
+                }
             }
             EventStorage::Sparse(heap) => {
                 heap.retain(|event| keep(&event.0.kind));
                 self.len = heap.len();
                 if heap.is_empty() {
-                    self.storage = EventStorage::Grouped(BTreeMap::new());
+                    self.storage = EventStorage::SingleKey(VecDeque::new());
                 }
             }
         }
@@ -217,6 +254,12 @@ impl EventQueue {
     fn resequence(&mut self) {
         let mut sequence = 0;
         match &mut self.storage {
+            EventStorage::SingleKey(queue) => {
+                for event in queue {
+                    event.sequence = sequence;
+                    sequence += 1;
+                }
+            }
             EventStorage::Grouped(groups) => {
                 for group in groups.values_mut() {
                     for event in group {
@@ -300,7 +343,7 @@ mod tests {
             }
         }
         assert_eq!(queue.pop(), None);
-        assert!(matches!(&queue.storage, super::EventStorage::Grouped(_)));
+        assert!(matches!(&queue.storage, super::EventStorage::SingleKey(_)));
         Ok(())
     }
 
@@ -412,5 +455,47 @@ mod tests {
             },
         });
         assert_eq!(event, event);
+    }
+    #[test]
+    fn single_key_storage_reuses_small_buffers_and_releases_large_bursts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::{EventQueue, EventStorage, MAX_RETAINED_FIFO};
+        let mut queue = EventQueue::new();
+        for turn in 0..128_u64 {
+            let event = token_event(SimTime::from_nanos(i64::try_from(turn)?), 0, turn);
+            queue.push(event.clone());
+            assert_eq!(queue.len(), 1);
+            assert_eq!(queue.pop().map(|e| e.kind), Some(event.kind));
+            assert_eq!(queue.len(), 0);
+            assert!(matches!(&queue.storage, EventStorage::SingleKey(fifo)
+                if fifo.capacity() > 0 && fifo.capacity() <= MAX_RETAINED_FIFO));
+        }
+        for token in 0..=MAX_RETAINED_FIFO {
+            queue.push(token_event(SimTime::ZERO, 0, u64::try_from(token)?));
+        }
+        queue.retain(|_| false);
+        assert_eq!(queue.len(), 0);
+        assert!(matches!(&queue.storage, EventStorage::SingleKey(fifo) if fifo.capacity() == 0));
+        Ok(())
+    }
+
+    #[test]
+    fn single_key_promotion_and_compaction_preserve_causal_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::{EventQueue, EventStorage};
+        let mut queue = EventQueue::new();
+        let late = token_event(SimTime::from_nanos(2), 0, 1);
+        let early = token_event(SimTime::from_nanos(1), 0, 2);
+        queue.push(late.clone());
+        queue.push(early.clone());
+        assert!(matches!(&queue.storage, EventStorage::Grouped(_)));
+        let popped = queue.pop().ok_or("missing earlier event")?;
+        queue.restore_front(popped);
+        queue.retain(|kind| kind != &early.kind);
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.pop().map(|e| e.kind), Some(late.kind));
+        assert!(matches!(&queue.storage, EventStorage::SingleKey(_)));
+        assert_eq!(queue.len(), 0);
+        Ok(())
     }
 }
