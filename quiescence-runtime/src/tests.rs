@@ -1086,7 +1086,7 @@ fn external_reaction_events_honor_priority_without_dedup() -> Result<(), Box<dyn
         .take_transitions()
         .into_iter()
         .filter(|transition| transition.node == marker)
-        .map(|transition| transition.new)
+        .map(|transition| transition.new())
         .collect();
     assert_eq!(
         marker_values,
@@ -1242,7 +1242,7 @@ fn scheduled_reaction_priority_orders_same_time_callbacks() -> Result<(), Box<dy
         .take_transitions()
         .into_iter()
         .filter(|transition| transition.node == marker)
-        .map(|transition| transition.new)
+        .map(|transition| transition.new())
         .collect();
     assert_eq!(
         marker_values,

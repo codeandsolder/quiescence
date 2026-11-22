@@ -1301,31 +1301,39 @@ impl Graph {
     }
 
     fn commit(&mut self, id: NodeId, value: CanonicalValue) -> Result<(), RuntimeError> {
-        let state = &mut self.values[id.index()];
-        let old = state.canonical();
-        if old == value {
-            return Ok(());
-        }
-        match (state, value) {
+        let (kind, before, after) = match (&mut self.values[id.index()], value) {
             (
                 NodeState::Input(cell) | NodeState::Derived { cell, .. },
                 CanonicalValue::Numeric(next),
-            ) => cell.bucket = next,
-            (NodeState::Atom(current), CanonicalValue::Atom(next)) => *current = next,
+            ) => {
+                let previous = std::mem::replace(&mut cell.bucket, next);
+                (
+                    TransitionKind::Numeric,
+                    previous.raw().cast_unsigned(),
+                    next.raw().cast_unsigned(),
+                )
+            }
+            (NodeState::Atom(current), CanonicalValue::Atom(next)) => {
+                (TransitionKind::Atom, std::mem::replace(current, next), next)
+            }
             (NodeState::Input(_) | NodeState::Derived { .. }, CanonicalValue::Atom(_)) => {
                 return Err(RuntimeError::ExpectedNumeric(id));
             }
             (NodeState::Atom(_), CanonicalValue::Numeric(_)) => {
                 return Err(RuntimeError::ExpectedAtom(id));
             }
+        };
+        if before == after {
+            return Ok(());
         }
         let node = &self.links[id.index()];
         self.transitions.push(TransitionRecord {
             at: self.now,
             node: id,
             node_name: Arc::clone(&node.name),
-            old,
-            new: value,
+            kind,
+            before,
+            after,
         });
         node.dependents
             .for_each(|dependent| self.dirty.mark(dependent));
@@ -1416,14 +1424,44 @@ impl Graph {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TransitionKind {
+    Numeric,
+    Atom,
+}
+
+impl TransitionKind {
+    const fn decode(self, raw: u64) -> CanonicalValue {
+        match self {
+            Self::Numeric => CanonicalValue::Numeric(Bucket::new(raw.cast_signed())),
+            Self::Atom => CanonicalValue::Atom(raw),
+        }
+    }
+}
+
+/// One committed change. A node's value kind is immutable, so both
+/// payloads share one discriminant without losing any bits.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransitionRecord {
     pub at: SimTime,
     pub node: NodeId,
     /// Shared immutable node label, retained after the graph is dropped.
     pub node_name: Arc<str>,
-    pub old: CanonicalValue,
-    pub new: CanonicalValue,
+    kind: TransitionKind,
+    before: u64,
+    after: u64,
+}
+
+impl TransitionRecord {
+    #[must_use = "the previous canonical value must be considered"]
+    pub const fn old(&self) -> CanonicalValue {
+        self.kind.decode(self.before)
+    }
+
+    #[must_use = "the committed canonical value must be considered"]
+    pub const fn new(&self) -> CanonicalValue {
+        self.kind.decode(self.after)
+    }
 }
 
 #[cfg(test)]
