@@ -149,16 +149,14 @@ impl EvalContext<'_> {
     /// Returns an error if the node does not exist or is not numeric.
     pub fn read_bucket(&self, id: NodeId) -> Result<Bucket, EvalError> {
         self.read_state(id)?
-            .numeric()
-            .map(|(_, bucket)| bucket)
+            .bucket()
             .ok_or(EvalError::ExpectedNumeric(id))
     }
     /// # Errors
     /// Returns an error if the node does not exist or is not numeric.
     pub fn read_f64(&self, id: NodeId) -> Result<f64, EvalError> {
         self.read_state(id)?
-            .numeric()
-            .map(|(quantization, bucket)| quantization.decode(bucket))
+            .decoded()
             .ok_or(EvalError::ExpectedNumeric(id))
     }
     /// # Errors
@@ -661,16 +659,14 @@ impl Graph {
     /// Returns an error if the node does not exist or is not numeric.
     pub fn value_bucket(&self, id: NodeId) -> Result<Bucket, RuntimeError> {
         self.node_state(id)?
-            .numeric()
-            .map(|(_, bucket)| bucket)
+            .bucket()
             .ok_or(RuntimeError::ExpectedNumeric(id))
     }
     /// # Errors
     /// Returns an error if the node does not exist or is not numeric.
     pub fn value_f64(&self, id: NodeId) -> Result<f64, RuntimeError> {
         self.node_state(id)?
-            .numeric()
-            .map(|(quantization, bucket)| quantization.decode(bucket))
+            .decoded()
             .ok_or(RuntimeError::ExpectedNumeric(id))
     }
     /// # Errors

@@ -37,13 +37,20 @@ pub enum NodeState {
 }
 
 impl NodeState {
-    pub(super) const fn numeric(&self) -> Option<(Quantization, Bucket)> {
+    const fn numeric(&self) -> Option<NumericCell> {
         match self {
-            Self::Input(cell) | Self::Derived { cell, .. } => {
-                Some((cell.quantization, cell.bucket))
-            }
+            Self::Input(cell) | Self::Derived { cell, .. } => Some(*cell),
             Self::Atom(_) => None,
         }
+    }
+
+    pub(super) fn bucket(&self) -> Option<Bucket> {
+        self.numeric().map(|cell| cell.bucket)
+    }
+
+    pub(super) fn decoded(&self) -> Option<f64> {
+        self.numeric()
+            .map(|cell| cell.quantization.decode(cell.bucket))
     }
 
     pub(super) const fn atom(&self) -> Option<u64> {
