@@ -2,6 +2,9 @@
 
 use core::fmt;
 
+mod quantize;
+use quantize::HalfBounds;
+
 macro_rules! graph_id {
     ($name:ident, $doc:literal) => {
         #[doc = $doc]
@@ -147,6 +150,10 @@ impl Quantization {
         bucket.raw() as f64 / self.scale()
     }
 
+    /// Quantize the exact real interval represented by the binary64 center and radius.
+    /// Decimal scaling and half-bucket comparisons introduce no additional rounding.
+    /// Halfway points round away from zero.
+    ///
     /// # Errors
     /// Returns a [`QuantizeError`] for non-finite inputs, out-of-range rounded values, or intervals spanning multiple buckets.
     pub fn resolve(
@@ -157,64 +164,22 @@ impl Quantization {
         if !estimate.center.is_finite() || !estimate.radius.is_finite() || estimate.radius < 0.0 {
             return Err(QuantizeError::NonFiniteEstimate);
         }
-        let scale = self.scale();
-        let lower_value = estimate.center - estimate.radius;
-        let upper_value = estimate.center + estimate.radius;
-        let lower = lower_value * scale;
-        let upper = upper_value * scale;
+        let (lower, upper) = HalfBounds::estimate(estimate, self.decimal_places)?;
+        let lo = lower.round_bucket()?;
+        let hi = upper.round_bucket()?;
 
-        let lo = round_i64(lower)?;
-        let hi = round_i64(upper)?;
-
-        if let Some(previous) = previous
-            && retains_bucket(previous, self.hysteresis_lsd, lower, upper)
-        {
-            return Ok(previous);
+        if let Some(previous) = previous {
+            let twice_bucket = 2 * i128::from(previous.raw());
+            let twice_width = 2 * i128::from(self.hysteresis_lsd) + 1;
+            if lower.ceil > twice_bucket - twice_width && upper.floor < twice_bucket + twice_width {
+                return Ok(previous);
+            }
         }
         if lo != hi {
-            return Err(QuantizeError::Ambiguous {
-                lower: lower_value,
-                upper: upper_value,
-            });
+            return Err(QuantizeError::Ambiguous { estimate });
         }
-        Ok(Bucket::new(lo))
+        Ok(lo)
     }
-}
-
-// Both scaled endpoints have already passed round_i64. Multiplication by
-// two is exact in that range, and the directed integer conversions preserve
-// strict comparisons with the integer half-bucket boundaries. In particular,
-// we never project a previous i64 bucket into a lossy floating-point value.
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "the validated scaled endpoints are rounded directionally and fit in i128"
-)]
-fn retains_bucket(previous: Bucket, hysteresis: u32, lower: f64, upper: f64) -> bool {
-    let twice_bucket = 2 * i128::from(previous.raw());
-    let twice_width = 2 * i128::from(hysteresis) + 1;
-    (2.0 * lower).ceil() as i128 > twice_bucket - twice_width
-        && ((2.0 * upper).floor() as i128) < twice_bucket + twice_width
-}
-
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "the i64 bounds are intentionally projected into f64 before validating the rounded value"
-)]
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "the value is finite, rounded to an integer, and range-checked before conversion"
-)]
-fn round_i64(value: f64) -> Result<i64, QuantizeError> {
-    if !value.is_finite() {
-        return Err(QuantizeError::NonFiniteEstimate);
-    }
-    let rounded = value.round();
-    // i64::MAX rounds up to 2^63 in f64. The upper bound is exclusive,
-    // otherwise the saturating float-to-integer cast silently accepts 2^63.
-    if rounded < i64::MIN as f64 || rounded >= -(i64::MIN as f64) {
-        return Err(QuantizeError::OutOfRange);
-    }
-    Ok(rounded as i64)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -222,7 +187,7 @@ pub enum QuantizeError {
     TooManyDecimalPlaces(u8),
     NonFiniteEstimate,
     OutOfRange,
-    Ambiguous { lower: f64, upper: f64 },
+    Ambiguous { estimate: Estimate },
 }
 
 impl fmt::Display for QuantizeError {
@@ -231,11 +196,14 @@ impl fmt::Display for QuantizeError {
             Self::TooManyDecimalPlaces(v) => {
                 write!(f, "decimal precision {v} exceeds supported maximum")
             }
-            Self::NonFiniteEstimate => f.write_str("estimate must be finite"),
+            Self::NonFiniteEstimate => {
+                f.write_str("estimate must be finite with a nonnegative radius")
+            }
             Self::OutOfRange => f.write_str("quantized value does not fit in i64"),
-            Self::Ambiguous { lower, upper } => write!(
+            Self::Ambiguous { estimate } => write!(
                 f,
-                "estimate interval [{lower}, {upper}] crosses an observable bucket boundary"
+                "estimate {} ± {} crosses an observable bucket boundary",
+                estimate.center, estimate.radius
             ),
         }
     }

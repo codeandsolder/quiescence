@@ -36,6 +36,8 @@ The numerical layer is deliberately replaceable. Point `f64` evaluation is merel
 
 A numeric node declares `decimal_places` and `hysteresis_lsd`. Working arithmetic may use floating point, but floating point is not graph-observable state. Graph equality, serialization and propagation decisions use the canonical integer bucket.
 
+Quantization computes the exact mathematical interval represented by the supplied binary64 center and nonnegative radius. Decimal scaling and half-bucket comparisons do not introduce extra rounding; exact halfway values round away from zero. Decimal-looking floating-point literals can lie on either side of a decimal midpoint. An interval must establish a single bucket (or fit strictly inside the previous bucket’s retention region), otherwise resolution returns an ambiguity error.
+
 A one-LSD hysteresis widens the retention region by one last digit before a node moves into a new bucket. This makes the chosen information resolution part of the model and gives the runtime a natural early-termination boundary.
 
 ## Exact atom semantics
