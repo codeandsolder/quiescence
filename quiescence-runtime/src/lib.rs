@@ -59,17 +59,17 @@ pub enum StateWrite {
     Atom { node: NodeId, value: u64 },
 }
 impl StateWrite {
-    #[must_use]
+    #[must_use = "the constructed value must be used"]
     pub const fn new(node: NodeId, value: f64) -> Self {
         Self::Numeric { node, value }
     }
 
-    #[must_use]
+    #[must_use = "the constructed state write must be applied or scheduled"]
     pub const fn atom(node: NodeId, value: u64) -> Self {
         Self::Atom { node, value }
     }
 
-    #[must_use]
+    #[must_use = "the target node identifier must be used"]
     pub const fn node(self) -> NodeId {
         match self {
             Self::Numeric { node, .. } | Self::Atom { node, .. } => node,
@@ -154,7 +154,7 @@ pub struct InteractionInbox {
     shared: Arc<InteractionShared>,
 }
 
-#[must_use]
+#[must_use = "both endpoints are required to submit and consume interactions"]
 pub fn interaction_channel() -> (InteractionSender, InteractionInbox) {
     let shared = Arc::new(InteractionShared::default());
     (
@@ -374,12 +374,12 @@ pub struct QuiescentSnapshot {
 }
 
 impl QuiescentSnapshot {
-    #[must_use]
+    #[must_use = "the observed canonical value must be used"]
     pub fn value(&self, node: NodeId) -> Option<CanonicalValue> {
         self.values.get(node.index()).copied()
     }
 
-    #[must_use]
+    #[must_use = "the snapshot node count must be used"]
     pub const fn node_count(&self) -> usize {
         self.values.len()
     }
@@ -398,7 +398,7 @@ pub struct WindowRecord {
 }
 
 impl WindowRecord {
-    #[must_use]
+    #[must_use = "the constructed value must be used"]
     pub const fn new(history: HistoryId, key: u64) -> Self {
         Self { history, key }
     }
@@ -428,7 +428,7 @@ pub struct ReactionOutput {
     pub scheduled_callbacks: Vec<ScheduledReactionCallback>,
 }
 impl ReactionOutput {
-    #[must_use]
+    #[must_use = "the reaction result must be returned to the scheduler"]
     pub const fn idle() -> Self {
         Self {
             transition_after: None,
@@ -439,7 +439,7 @@ impl ReactionOutput {
         }
     }
 
-    #[must_use]
+    #[must_use = "the constructed evaluation or reaction result must be used"]
     pub const fn after(delay: SimDuration, writes: Vec<StateWrite>) -> Self {
         Self {
             transition_after: Some(delay),
@@ -450,17 +450,17 @@ impl ReactionOutput {
         }
     }
 
-    #[must_use]
+    #[must_use = "the constructed evaluation or reaction result must be used"]
     pub const fn immediate(writes: Vec<StateWrite>) -> Self {
         Self::after(SimDuration::ZERO, writes)
     }
 
-    #[must_use]
+    #[must_use = "the reevaluation request must be returned to the scheduler"]
     pub const fn reevaluate_after(delay: SimDuration) -> Self {
         Self::after(delay, Vec::new())
     }
 
-    #[must_use]
+    #[must_use = "the scheduling request must be returned to the scheduler"]
     pub fn schedule_once_after(delay: SimDuration, key: u64, priority: i32) -> Self {
         Self {
             transition_after: None,
@@ -475,7 +475,7 @@ impl ReactionOutput {
         }
     }
 
-    #[must_use]
+    #[must_use = "the updated reaction result contains the new scheduling request"]
     pub fn and_schedule_once_after(mut self, delay: SimDuration, key: u64, priority: i32) -> Self {
         self.scheduled_reevaluations.push(ScheduledReevaluation {
             key,
@@ -485,7 +485,7 @@ impl ReactionOutput {
         self
     }
 
-    #[must_use]
+    #[must_use = "the callback request must be returned to the scheduler"]
     pub fn schedule_reaction_once_after(
         reaction: ReactionId,
         delay: SimDuration,
@@ -502,7 +502,7 @@ impl ReactionOutput {
         output
     }
 
-    #[must_use]
+    #[must_use = "the updated reaction result contains the callback request"]
     pub fn and_schedule_reaction_once_after(
         mut self,
         reaction: ReactionId,
@@ -519,7 +519,7 @@ impl ReactionOutput {
         self
     }
 
-    #[must_use]
+    #[must_use = "the updated reaction result contains the history record"]
     pub fn and_record_window(mut self, history: HistoryId, key: u64) -> Self {
         self.window_records.push(WindowRecord::new(history, key));
         self
@@ -527,7 +527,7 @@ impl ReactionOutput {
 }
 
 impl EvalOutput {
-    #[must_use]
+    #[must_use = "the constructed evaluation or reaction result must be used"]
     pub const fn immediate(value: f64) -> Self {
         Self {
             estimate: Estimate::point(value),
@@ -535,7 +535,7 @@ impl EvalOutput {
             valid_for: None,
         }
     }
-    #[must_use]
+    #[must_use = "the constructed evaluation or reaction result must be used"]
     pub const fn after(value: f64, delay: SimDuration) -> Self {
         Self {
             estimate: Estimate::point(value),
@@ -543,7 +543,7 @@ impl EvalOutput {
             valid_for: None,
         }
     }
-    #[must_use]
+    #[must_use = "the constructed evaluation result must be used"]
     pub const fn estimate(estimate: Estimate) -> Self {
         Self {
             estimate,
@@ -551,7 +551,7 @@ impl EvalOutput {
             valid_for: None,
         }
     }
-    #[must_use]
+    #[must_use = "the returned evaluation result contains the validity interval"]
     pub const fn with_valid_for(mut self, duration: SimDuration) -> Self {
         self.valid_for = Some(duration);
         self
@@ -567,19 +567,19 @@ pub struct EvalContext<'a> {
     external_token: Option<u64>,
 }
 impl EvalContext<'_> {
-    #[must_use]
+    #[must_use = "the current simulation time must be used"]
     pub const fn now(&self) -> SimTime {
         self.now
     }
 
     /// Key of the keyed scheduled callback that caused this evaluation, when applicable.
-    #[must_use]
+    #[must_use = "the scheduled key must be considered by the caller"]
     pub const fn scheduled_key(&self) -> Option<u64> {
         self.scheduled_key
     }
 
     /// Source-defined token attached to an unkeyed external event, when applicable.
-    #[must_use]
+    #[must_use = "the external token must be considered by the caller"]
     pub const fn external_token(&self) -> Option<u64> {
         self.external_token
     }
@@ -729,7 +729,7 @@ pub struct Graph {
 }
 
 impl Graph {
-    #[must_use]
+    #[must_use = "the constructed value must be used"]
     pub const fn new(config: RuntimeConfig) -> Self {
         Self {
             config,
@@ -746,14 +746,14 @@ impl Graph {
             transitions: Vec::new(),
         }
     }
-    #[must_use]
+    #[must_use = "the current simulation time must be used"]
     pub const fn now(&self) -> SimTime {
         self.now
     }
 
     /// True only at an externally observable safe point: no dirty computation and no event due at
     /// the current simulation time. Future events do not prevent quiescence.
-    #[must_use]
+    #[must_use = "the quiescence result must be checked"]
     pub fn is_quiescent(&self) -> bool {
         self.dirty.is_empty() && self.events.peek().is_none_or(|event| event.at > self.now)
     }
@@ -1430,12 +1430,12 @@ impl Graph {
         Ok(())
     }
 
-    #[must_use]
+    #[must_use = "the next event time must be considered before advancing"]
     pub fn next_event_time(&self) -> Option<SimTime> {
         self.events.peek().map(|event| event.at)
     }
 
-    #[must_use]
+    #[must_use = "discarding the returned records permanently drains the transition log"]
     pub fn take_transitions(&mut self) -> Vec<TransitionRecord> {
         std::mem::take(&mut self.transitions)
     }

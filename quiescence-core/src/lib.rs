@@ -6,11 +6,11 @@ use core::fmt;
 pub struct NodeId(u32);
 
 impl NodeId {
-    #[must_use]
+    #[must_use = "the constructed identifier must be used"]
     pub const fn from_index(index: u32) -> Self {
         Self(index)
     }
-    #[must_use]
+    #[must_use = "the converted index must be used"]
     pub const fn index(self) -> usize {
         self.0 as usize
     }
@@ -20,11 +20,11 @@ impl NodeId {
 pub struct HistoryId(u32);
 
 impl HistoryId {
-    #[must_use]
+    #[must_use = "the constructed identifier must be used"]
     pub const fn from_index(index: u32) -> Self {
         Self(index)
     }
-    #[must_use]
+    #[must_use = "the converted index must be used"]
     pub const fn index(self) -> usize {
         self.0 as usize
     }
@@ -34,11 +34,11 @@ impl HistoryId {
 pub struct ReactionId(u32);
 
 impl ReactionId {
-    #[must_use]
+    #[must_use = "the constructed identifier must be used"]
     pub const fn from_index(index: u32) -> Self {
         Self(index)
     }
-    #[must_use]
+    #[must_use = "the converted index must be used"]
     pub const fn index(self) -> usize {
         self.0 as usize
     }
@@ -49,23 +49,23 @@ pub struct SimTime(i64);
 
 impl SimTime {
     pub const ZERO: Self = Self(0);
-    #[must_use]
+    #[must_use = "the converted simulation time or duration must be used"]
     pub const fn from_nanos(v: i64) -> Self {
         Self(v)
     }
-    #[must_use]
+    #[must_use = "the converted simulation time or duration must be used"]
     pub const fn from_millis(v: i64) -> Self {
         Self(v.saturating_mul(1_000_000))
     }
-    #[must_use]
+    #[must_use = "the converted simulation time or duration must be used"]
     pub const fn from_secs(v: i64) -> Self {
         Self(v.saturating_mul(1_000_000_000))
     }
-    #[must_use]
+    #[must_use = "the converted nanosecond count must be used"]
     pub const fn as_nanos(self) -> i64 {
         self.0
     }
-    #[must_use]
+    #[must_use = "time arithmetic returns a new time without modifying the original"]
     pub const fn saturating_add(self, d: SimDuration) -> Self {
         Self(self.0.saturating_add(d.0))
     }
@@ -76,19 +76,19 @@ pub struct SimDuration(i64);
 
 impl SimDuration {
     pub const ZERO: Self = Self(0);
-    #[must_use]
+    #[must_use = "the converted simulation time or duration must be used"]
     pub const fn from_nanos(v: i64) -> Self {
         Self(if v < 0 { 0 } else { v })
     }
-    #[must_use]
+    #[must_use = "the converted simulation time or duration must be used"]
     pub const fn from_millis(v: i64) -> Self {
         Self::from_nanos(v.saturating_mul(1_000_000))
     }
-    #[must_use]
+    #[must_use = "the converted simulation time or duration must be used"]
     pub const fn from_secs(v: i64) -> Self {
         Self::from_nanos(v.saturating_mul(1_000_000_000))
     }
-    #[must_use]
+    #[must_use = "the converted nanosecond count must be used"]
     pub const fn as_nanos(self) -> i64 {
         self.0
     }
@@ -97,11 +97,11 @@ impl SimDuration {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Bucket(i64);
 impl Bucket {
-    #[must_use]
+    #[must_use = "the constructed value must be used"]
     pub const fn new(raw: i64) -> Self {
         Self(raw)
     }
-    #[must_use]
+    #[must_use = "the canonical integer bucket must be used"]
     pub const fn raw(self) -> i64 {
         self.0
     }
@@ -113,7 +113,7 @@ pub struct Estimate {
     pub radius: f64,
 }
 impl Estimate {
-    #[must_use]
+    #[must_use = "the constructed estimate must be used"]
     pub const fn point(value: f64) -> Self {
         Self {
             center: value,
@@ -143,19 +143,19 @@ impl Quantization {
         })
     }
 
-    #[must_use]
+    #[must_use = "the configured precision must be used"]
     pub const fn decimal_places(self) -> u8 {
         self.decimal_places
     }
-    #[must_use]
+    #[must_use = "the configured hysteresis width must be used"]
     pub const fn hysteresis_lsd(self) -> u32 {
         self.hysteresis_lsd
     }
-    #[must_use]
+    #[must_use = "the calculated quantization scale must be used"]
     pub fn scale(self) -> f64 {
         10_f64.powi(i32::from(self.decimal_places))
     }
-    #[must_use]
+    #[must_use = "the decoded working value must be used"]
     #[expect(
         clippy::cast_precision_loss,
         reason = "decoding intentionally maps the exact integer bucket into the f64 estimate domain"
@@ -166,10 +166,6 @@ impl Quantization {
 
     /// # Errors
     /// Returns a [`QuantizeError`] for non-finite inputs, out-of-range rounded values, or intervals spanning multiple buckets.
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "hysteresis comparisons intentionally operate in the f64 estimate domain"
-    )]
     pub fn resolve(
         self,
         previous: Option<Bucket>,
@@ -184,16 +180,14 @@ impl Quantization {
         let lower = lower_value * scale;
         let upper = upper_value * scale;
 
-        if let Some(previous) = previous {
-            let raw = previous.raw() as f64;
-            let h = f64::from(self.hysteresis_lsd);
-            if lower > raw - 0.5 - h && upper < raw + 0.5 + h {
-                return Ok(previous);
-            }
-        }
-
         let lo = round_i64(lower)?;
         let hi = round_i64(upper)?;
+
+        if let Some(previous) = previous
+            && retains_bucket(previous, self.hysteresis_lsd, lower, upper)
+        {
+            return Ok(previous);
+        }
         if lo != hi {
             return Err(QuantizeError::Ambiguous {
                 lower: lower_value,
@@ -202,6 +196,21 @@ impl Quantization {
         }
         Ok(Bucket::new(lo))
     }
+}
+
+// Both scaled endpoints have already passed round_i64. Multiplication by
+// two is exact in that range, and the directed integer conversions preserve
+// strict comparisons with the integer half-bucket boundaries. In particular,
+// we never project a previous i64 bucket into a lossy floating-point value.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the validated scaled endpoints are rounded directionally and fit in i128"
+)]
+fn retains_bucket(previous: Bucket, hysteresis: u32, lower: f64, upper: f64) -> bool {
+    let twice_bucket = 2 * i128::from(previous.raw());
+    let twice_width = 2 * i128::from(hysteresis) + 1;
+    (2.0 * lower).ceil() as i128 > twice_bucket - twice_width
+        && ((2.0 * upper).floor() as i128) < twice_bucket + twice_width
 }
 
 #[expect(
@@ -266,6 +275,70 @@ mod tests {
             q.resolve(None, Estimate::point(-9_223_372_036_854_775_808.0))?,
             Bucket::new(i64::MIN)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn hysteresis_preserves_exact_large_bucket_identity() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let q = Quantization::new(0, 1)?;
+        // Both previous buckets lie between consecutive representable f64
+        // integers. The estimate is exactly one LSD from the previous
+        // bucket, inside its open retention interval on either side.
+        for (bucket, estimate) in [
+            (9_007_199_254_740_993, 9_007_199_254_740_994.0),
+            (-9_007_199_254_740_993, -9_007_199_254_740_994.0),
+            (i64::MIN + 1, -9_223_372_036_854_775_808.0),
+        ] {
+            assert_eq!(
+                q.resolve(Some(Bucket::new(bucket)), Estimate::point(estimate))?,
+                Bucket::new(bucket)
+            );
+        }
+        // A previous bucket cannot make a rounded out-of-range estimate valid.
+        assert!(matches!(
+            q.resolve(
+                Some(Bucket::new(i64::MAX)),
+                Estimate::point(9_223_372_036_854_775_808.0)
+            ),
+            Err(super::QuantizeError::OutOfRange)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn hysteresis_half_grid_matches_integer_oracle() -> Result<(), Box<dyn std::error::Error>> {
+        for hysteresis in 0..=3_u32 {
+            let q = Quantization::new(0, hysteresis)?;
+            for bucket in -5_i64..=5 {
+                for lower_half in -20_i32..=20 {
+                    for upper_half in lower_half..=20 {
+                        let center = f64::from(lower_half + upper_half) / 4.0;
+                        let radius = f64::from(upper_half - lower_half) / 4.0;
+                        let lower = i64::from(lower_half);
+                        let upper = i64::from(upper_half);
+                        let width = 2 * i64::from(hysteresis) + 1;
+                        let expected = if lower > 2 * bucket - width && upper < 2 * bucket + width {
+                            Some(Bucket::new(bucket))
+                        } else {
+                            // Independent exact half-grid rounding, ties away from zero.
+                            let round_half = |n: i64| n / 2 + n % 2;
+                            (round_half(lower) == round_half(upper))
+                                .then(|| Bucket::new(round_half(lower)))
+                        };
+                        let actual =
+                            q.resolve(Some(Bucket::new(bucket)), Estimate { center, radius });
+                        match expected {
+                            Some(value) => assert_eq!(actual?, value),
+                            None => assert!(matches!(
+                                actual,
+                                Err(super::QuantizeError::Ambiguous { .. })
+                            )),
+                        }
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
