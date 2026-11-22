@@ -38,12 +38,22 @@ enum PreparedTransition {
         writes: Vec<ResolvedWrite>,
         window_records: Vec<WindowRecord>,
     },
-    Delayed(ReactionTransition),
+    Delayed {
+        at: SimTime,
+        writes: Vec<StateWrite>,
+        window_records: Vec<WindowRecord>,
+    },
+}
+
+struct PreparedCallback {
+    reaction: ReactionId,
+    at: SimTime,
+    key: u64,
+    priority: i32,
 }
 
 struct ResolvedWrite {
     node: NodeId,
-    current: CanonicalValue,
     next: CanonicalValue,
 }
 
@@ -54,39 +64,29 @@ enum ValidatedWrite {
         value: f64,
     },
     Atom {
-        current: u64,
         value: u64,
     },
 }
 
 impl ValidatedWrite {
     fn resolve(self, node: NodeId) -> Result<ResolvedWrite, RuntimeError> {
-        let (current, next) = match self {
+        let next = match self {
             Self::Numeric {
                 quantization,
                 bucket,
                 value,
-            } => (
-                CanonicalValue::Numeric(bucket),
-                CanonicalValue::Numeric(
-                    quantization.resolve(Some(bucket), Estimate::point(value))?,
-                ),
-            ),
-            Self::Atom { current, value } => {
-                (CanonicalValue::Atom(current), CanonicalValue::Atom(value))
+            } => {
+                CanonicalValue::Numeric(quantization.resolve(Some(bucket), Estimate::point(value))?)
             }
+            Self::Atom { value } => CanonicalValue::Atom(value),
         };
-        Ok(ResolvedWrite {
-            node,
-            current,
-            next,
-        })
+        Ok(ResolvedWrite { node, next })
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RuntimeConfig {
-    /// Maximum total event deliveries and evaluations at one simulation timestamp.
+    /// Maximum event deliveries and evaluations per timestamp within one settlement call.
     pub same_time_microstep_budget: usize,
 }
 impl Default for RuntimeConfig {
@@ -101,6 +101,7 @@ impl Default for RuntimeConfig {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Invocation {
     Reactive,
+    Forecast,
     Scheduled { key: u64 },
     External { token: Option<u64> },
 }
@@ -308,6 +309,11 @@ impl Graph {
     #[must_use = "the current simulation time must be used"]
     pub const fn now(&self) -> SimTime {
         self.now
+    }
+
+    /// Update the per-timestamp settlement budget, including when retrying an exhausted call.
+    pub const fn set_microstep_budget(&mut self, budget: usize) {
+        self.config.same_time_microstep_budget = budget;
     }
 
     /// True only at an externally observable safe point: no dirty computation and no event due at
@@ -711,44 +717,44 @@ impl Graph {
         writes.iter().map(move |&write| {
             let id = write.node();
             let node = self.node(id)?;
-            if !seen.insert(id) {
+            if writes.len() > 1 && !seen.insert(id) {
                 return Err(RuntimeError::DuplicateStateWrite(id));
             }
-            if node.evaluator.is_some() {
-                return Err(RuntimeError::NotAnInput(id));
-            }
-            let validated = match (write, &node.state) {
-                (
-                    StateWrite::Numeric { value, .. },
-                    NodeState::Numeric {
-                        quantization,
-                        bucket,
-                    },
-                ) => {
-                    if !value.is_finite() {
-                        return Err(QuantizeError::NonFiniteEstimate.into());
-                    }
-                    ValidatedWrite::Numeric {
-                        quantization: *quantization,
-                        bucket: *bucket,
-                        value,
-                    }
-                }
-                (StateWrite::Atom { value, .. }, NodeState::Atom(current)) => {
-                    ValidatedWrite::Atom {
-                        current: *current,
-                        value,
-                    }
-                }
-                (StateWrite::Numeric { .. }, NodeState::Atom(_)) => {
-                    return Err(RuntimeError::ExpectedNumeric(id));
-                }
-                (StateWrite::Atom { .. }, NodeState::Numeric { .. }) => {
-                    return Err(RuntimeError::ExpectedAtom(id));
-                }
-            };
-            Ok((id, validated))
+            Self::validate_write(node, write).map(|validated| (id, validated))
         })
+    }
+
+    fn validate_write(node: &Node, write: StateWrite) -> Result<ValidatedWrite, RuntimeError> {
+        let id = write.node();
+        if node.evaluator.is_some() {
+            return Err(RuntimeError::NotAnInput(id));
+        }
+        let validated = match (write, &node.state) {
+            (
+                StateWrite::Numeric { value, .. },
+                NodeState::Numeric {
+                    quantization,
+                    bucket,
+                },
+            ) => {
+                if !value.is_finite() {
+                    return Err(QuantizeError::NonFiniteEstimate.into());
+                }
+                ValidatedWrite::Numeric {
+                    quantization: *quantization,
+                    bucket: *bucket,
+                    value,
+                }
+            }
+            (StateWrite::Atom { value, .. }, NodeState::Atom(_)) => ValidatedWrite::Atom { value },
+            (StateWrite::Numeric { .. }, NodeState::Atom(_)) => {
+                return Err(RuntimeError::ExpectedNumeric(id));
+            }
+            (StateWrite::Atom { .. }, NodeState::Numeric { .. }) => {
+                return Err(RuntimeError::ExpectedAtom(id));
+            }
+        };
+        Ok(validated)
     }
 
     fn validate_state_write_batch(&self, writes: &[StateWrite]) -> Result<(), RuntimeError> {
@@ -1012,34 +1018,45 @@ impl Graph {
             NodeState::Atom(_) => return Err(RuntimeError::ExpectedNumeric(id)),
         };
         let next = quantization.resolve(Some(current), output.estimate)?;
+        let validity_at = output
+            .valid_for
+            .map(|duration| self.event_time(duration))
+            .transpose()?;
+        let commit_at = if next != current && output.delay != SimDuration::ZERO {
+            Some(self.event_time(output.delay)?)
+        } else {
+            None
+        };
+        let generation = self.nodes[id.index()]
+            .generation
+            .checked_add(1)
+            .ok_or(RuntimeError::GenerationExhausted(WorkId::Node(id)))?;
         let deps = context.into_dependencies();
         self.update_dependencies(WorkId::Node(id), deps)?;
-        let generation = self.nodes[id.index()].generation.saturating_add(1);
         self.nodes[id.index()].generation = generation;
 
-        if let Some(valid_for) = output.valid_for {
+        if let Some(at) = validity_at {
             self.push_event(
-                self.now.saturating_add(valid_for),
+                at,
                 EventKind::Reevaluate {
                     node: id,
                     generation,
                 },
             );
         }
-        if next == current {
-            return Ok(());
-        }
-        if output.delay == SimDuration::ZERO {
-            self.commit(id, CanonicalValue::Numeric(next))?;
-        } else {
-            self.push_event(
-                self.now.saturating_add(output.delay),
-                EventKind::Commit {
-                    node: id,
-                    generation,
-                    value: CanonicalValue::Numeric(next),
-                },
-            );
+        if next != current {
+            if let Some(at) = commit_at {
+                self.push_event(
+                    at,
+                    EventKind::Commit {
+                        node: id,
+                        generation,
+                        value: CanonicalValue::Numeric(next),
+                    },
+                );
+            } else {
+                self.commit(id, CanonicalValue::Numeric(next))?;
+            }
         }
         Ok(())
     }
@@ -1078,17 +1095,16 @@ impl Graph {
             callbacks,
         } = output;
 
-        // Validate every effect before changing subscriptions or publishing state.
-        for callback in &callbacks {
-            let target = callback.target.resolve(id);
-            self.reactions
-                .get(target.index())
-                .ok_or(RuntimeError::UnknownReaction(target))?;
-        }
+        // Prepare every effect before changing subscriptions or publishing state.
+        let callbacks = self.prepare_callbacks(id, callbacks)?;
         let prepared = transition
             .map(|transition| self.prepare_transition(transition))
             .transpose()?;
 
+        let generation = self.reactions[id.index()]
+            .generation
+            .checked_add(1)
+            .ok_or(RuntimeError::GenerationExhausted(WorkId::Reaction(id)))?;
         if let Some(deps) = dependencies {
             self.update_dependencies(WorkId::Reaction(id), deps)?;
         }
@@ -1097,8 +1113,7 @@ impl Graph {
             .get_mut(id.index())
             .ok_or(RuntimeError::UnknownReaction(id))?;
         reaction.pending_invocation = Invocation::Reactive;
-        reaction.generation = reaction.generation.saturating_add(1);
-        let generation = reaction.generation;
+        reaction.generation = generation;
 
         match prepared {
             Some(PreparedTransition::Immediate {
@@ -1108,13 +1123,13 @@ impl Graph {
                 self.commit_resolved_state_writes(writes)?;
                 self.record_windows(&window_records);
             }
-            Some(PreparedTransition::Delayed(ReactionTransition {
-                after,
+            Some(PreparedTransition::Delayed {
+                at,
                 writes,
                 window_records,
-            })) => {
+            }) => {
                 self.push_event(
-                    self.now.saturating_add(after),
+                    at,
                     EventKind::ReactionTransition {
                         reaction: id,
                         generation,
@@ -1125,10 +1140,39 @@ impl Graph {
             }
             None => {}
         }
-        for callback in callbacks {
-            self.schedule_reaction_once(callback.target.resolve(id), callback);
+        for callback in &callbacks {
+            self.schedule_reaction_once(callback);
         }
         Ok(())
+    }
+
+    fn prepare_callbacks(
+        &self,
+        current: ReactionId,
+        requests: Vec<ScheduledCallback>,
+    ) -> Result<Vec<PreparedCallback>, RuntimeError> {
+        let mut callbacks = Vec::with_capacity(requests.len());
+        let mut seen = BTreeSet::new();
+        let check_duplicates = requests.len() > 1;
+        for request in requests {
+            let reaction = request.target.resolve(current);
+            self.reactions
+                .get(reaction.index())
+                .ok_or(RuntimeError::UnknownReaction(reaction))?;
+            let key = (reaction, request.key);
+            if self.pending_scheduled_reactions.contains(&key)
+                || (check_duplicates && !seen.insert(key))
+            {
+                continue;
+            }
+            callbacks.push(PreparedCallback {
+                reaction,
+                at: self.event_time(request.after)?,
+                key: request.key,
+                priority: request.priority,
+            });
+        }
+        Ok(callbacks)
     }
 
     fn prepare_transition(
@@ -1144,7 +1188,11 @@ impl Graph {
         } else {
             // Delayed writes resolve against canonical state at delivery.
             self.validate_state_write_batch(&transition.writes)?;
-            Ok(PreparedTransition::Delayed(transition))
+            Ok(PreparedTransition::Delayed {
+                at: self.event_time(transition.after)?,
+                writes: transition.writes,
+                window_records: transition.window_records,
+            })
         }
     }
 
@@ -1228,7 +1276,7 @@ impl Graph {
                     .generation;
                 if current_generation == *generation {
                     self.apply_reaction_effects(writes, window_records)?;
-                    self.dirty.mark(WorkId::Reaction(*reaction));
+                    self.wake_reaction(*reaction, Invocation::Forecast)?;
                 }
                 Ok(())
             }
@@ -1275,6 +1323,11 @@ impl Graph {
     }
 
     fn apply_state_writes(&mut self, writes: &[StateWrite]) -> Result<(), RuntimeError> {
+        if let [write] = writes {
+            let id = write.node();
+            let resolved = Self::validate_write(self.node(id)?, *write)?.resolve(id)?;
+            return self.commit(resolved.node, resolved.next);
+        }
         let resolved = self.resolve_state_writes(writes)?;
         self.commit_resolved_state_writes(resolved)
     }
@@ -1295,17 +1348,8 @@ impl Graph {
         &mut self,
         resolved: Vec<ResolvedWrite>,
     ) -> Result<(), RuntimeError> {
-        for ResolvedWrite {
-            node,
-            current,
-            next,
-        } in resolved
-        {
-            if next != current {
-                self.nodes[node.index()].generation =
-                    self.nodes[node.index()].generation.saturating_add(1);
-                self.commit(node, next)?;
-            }
+        for ResolvedWrite { node, next } in resolved {
+            self.commit(node, next)?;
         }
         Ok(())
     }
@@ -1339,21 +1383,26 @@ impl Graph {
         Ok(())
     }
 
-    fn schedule_reaction_once(&mut self, reaction: ReactionId, request: ScheduledCallback) {
-        if !self
-            .pending_scheduled_reactions
-            .insert((reaction, request.key))
-        {
-            return;
-        }
+    fn schedule_reaction_once(&mut self, callback: &PreparedCallback) {
+        self.pending_scheduled_reactions
+            .insert((callback.reaction, callback.key));
         self.push_event_with_priority(
-            self.now.saturating_add(request.after),
-            request.priority,
+            callback.at,
+            callback.priority,
             EventKind::ScheduledReaction {
-                reaction,
-                key: request.key,
+                reaction: callback.reaction,
+                key: callback.key,
             },
         );
+    }
+
+    fn event_time(&self, duration: SimDuration) -> Result<SimTime, RuntimeError> {
+        self.now
+            .checked_add(duration)
+            .ok_or(RuntimeError::TimeOverflow {
+                now: self.now,
+                duration,
+            })
     }
 
     fn push_event(&mut self, at: SimTime, kind: EventKind) {

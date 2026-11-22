@@ -1,5 +1,5 @@
 use super::{InteractionImport, WorkId};
-use quiescence_core::{HistoryId, NodeId, QuantizeError, ReactionId, SimTime};
+use quiescence_core::{HistoryId, NodeId, QuantizeError, ReactionId, SimDuration, SimTime};
 use std::fmt;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EvalError {
@@ -62,6 +62,11 @@ pub enum RuntimeError {
         due_event: Option<SimTime>,
     },
     CorruptEventQueue,
+    GenerationExhausted(WorkId),
+    TimeOverflow {
+        now: SimTime,
+        duration: SimDuration,
+    },
     EventInPast {
         now: SimTime,
         requested: SimTime,
@@ -95,10 +100,7 @@ impl fmt::Display for RuntimeError {
             Self::UnknownReaction(id) => write!(f, "unknown reaction {id:?}"),
             Self::UnknownHistory(id) => write!(f, "unknown temporal history {id:?}"),
             Self::DuplicateStateWrite(id) => {
-                write!(
-                    f,
-                    "reaction transition writes state node {id:?} more than once"
-                )
+                write!(f, "state batch writes node {id:?} more than once")
             }
             Self::InteractionIngress(source) => write!(f, "interaction ingress failed: {source}"),
             Self::InteractionProcessing { source, .. } => {
@@ -113,6 +115,13 @@ impl fmt::Display for RuntimeError {
                 "graph is not quiescent at {at:?}: {dirty_work} dirty work items, due event {due_event:?}"
             ),
             Self::CorruptEventQueue => f.write_str("event queue became inconsistent"),
+            Self::GenerationExhausted(work) => {
+                write!(f, "forecast generation exhausted for {work:?}")
+            }
+            Self::TimeOverflow { now, duration } => write!(
+                f,
+                "simulation time {now:?} plus {duration:?} is unrepresentable"
+            ),
             Self::EventInPast { now, requested } => write!(
                 f,
                 "cannot move backwards: now={now:?}, requested={requested:?}"

@@ -31,6 +31,7 @@ graph_id!(HistoryId, "Graph-local event history identifier.");
 graph_id!(ReactionId, "Graph-local reaction identifier.");
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+/// Signed nanoseconds since the simulation epoch. Larger-unit constructors saturate.
 pub struct SimTime(i64);
 
 impl SimTime {
@@ -51,6 +52,15 @@ impl SimTime {
     pub const fn as_nanos(self) -> i64 {
         self.0
     }
+    /// Add a nonnegative duration, returning None if the result is unrepresentable.
+    #[must_use = "time arithmetic must check for overflow"]
+    pub const fn checked_add(self, duration: SimDuration) -> Option<Self> {
+        match self.0.checked_add(duration.0) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+
     #[must_use = "time arithmetic returns a new time without modifying the original"]
     pub const fn saturating_add(self, d: SimDuration) -> Self {
         Self(self.0.saturating_add(d.0))
@@ -58,6 +68,7 @@ impl SimTime {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+/// Nonnegative nanoseconds. Constructors clamp negative values to zero and saturate overflow.
 pub struct SimDuration(i64);
 
 impl SimDuration {

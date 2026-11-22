@@ -21,23 +21,25 @@ impl EventWindow {
         }
     }
 
-    pub(super) fn count_at(&self, now: SimTime, key: u64) -> usize {
+    fn first_unexpired(&self, now: SimTime) -> usize {
+        let cutoff = i128::from(now.as_nanos()) - i128::from(self.duration.as_nanos());
+        // Records are appended in causal order; expired entries are a prefix.
         self.events
-            .iter()
-            .filter(|event| {
-                let elapsed = i128::from(now.as_nanos()) - i128::from(event.at.as_nanos());
-                event.key == key && (0..=i128::from(self.duration.as_nanos())).contains(&elapsed)
-            })
+            .partition_point(|event| i128::from(event.at.as_nanos()) < cutoff)
+    }
+
+    pub(super) fn count_at(&self, now: SimTime, key: u64) -> usize {
+        let start = self.first_unexpired(now);
+        let end = self.events.partition_point(|event| event.at <= now);
+        self.events
+            .range(start..end)
+            .filter(|event| event.key == key)
             .count()
     }
 
     pub(super) fn record(&mut self, now: SimTime, key: u64) {
-        while self.events.front().is_some_and(|event| {
-            i128::from(now.as_nanos()) - i128::from(event.at.as_nanos())
-                > i128::from(self.duration.as_nanos())
-        }) {
-            self.events.pop_front();
-        }
+        let expired = self.first_unexpired(now);
+        self.events.drain(..expired);
         self.events.push_back(WindowEvent { at: now, key });
     }
 }

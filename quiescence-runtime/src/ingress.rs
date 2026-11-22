@@ -159,7 +159,7 @@ impl InteractionSender {
     }
 
     /// # Errors
-    /// Returns an error if the shared ingress queue lock is poisoned.
+    /// Returns an error if the inbox is disconnected or its queue lock is poisoned.
     pub fn state_now(
         &self,
         priority: i32,
@@ -173,7 +173,7 @@ impl InteractionSender {
     }
 
     /// # Errors
-    /// Returns an error if the shared ingress queue lock is poisoned.
+    /// Returns an error if the inbox is disconnected or its queue lock is poisoned.
     pub fn state_at(
         &self,
         at: SimTime,
@@ -188,7 +188,7 @@ impl InteractionSender {
     }
 
     /// # Errors
-    /// Returns an error if the shared ingress queue lock is poisoned.
+    /// Returns an error if the inbox is disconnected or its queue lock is poisoned.
     pub fn callback_now(
         &self,
         reaction: ReactionId,
@@ -203,7 +203,7 @@ impl InteractionSender {
     }
 
     /// # Errors
-    /// Returns an error if the shared ingress queue lock is poisoned.
+    /// Returns an error if the inbox is disconnected or its queue lock is poisoned.
     pub fn callback_now_with_token(
         &self,
         reaction: ReactionId,
@@ -219,7 +219,7 @@ impl InteractionSender {
     }
 
     /// # Errors
-    /// Returns an error if the shared ingress queue lock is poisoned.
+    /// Returns an error if the inbox is disconnected or its queue lock is poisoned.
     pub fn callback_at(
         &self,
         reaction: ReactionId,
@@ -235,7 +235,7 @@ impl InteractionSender {
     }
 
     /// # Errors
-    /// Returns an error if the shared ingress queue lock is poisoned.
+    /// Returns an error if the inbox is disconnected or its queue lock is poisoned.
     pub fn callback_at_with_token(
         &self,
         reaction: ReactionId,

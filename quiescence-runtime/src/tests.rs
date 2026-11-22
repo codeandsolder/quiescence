@@ -260,7 +260,7 @@ fn budget_exhaustion_preserves_pending_work_for_retry() -> Result<(), Box<dyn st
         Err(RuntimeError::CalculationInstability { .. })
     ));
     assert!(!g.is_quiescent());
-    g.config.same_time_microstep_budget = 2;
+    g.set_microstep_budget(2);
     g.settle()?;
     assert!(g.is_quiescent());
     assert_eq!(g.value_bucket(first)?, Bucket::new(1));
@@ -1395,6 +1395,85 @@ fn history_only_transition_and_invalid_batch_are_atomic() -> Result<(), Box<dyn 
     ));
     assert_eq!(graph.value_bucket(node)?, Bucket::new(0));
     assert_eq!(graph.event_window_count(history, 7)?, 1);
+    assert_eq!(graph.take_transitions(), []);
+    Ok(())
+}
+
+#[test]
+fn overflowing_callback_deadline_rejects_entire_reaction_output()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut graph = Graph::new(RuntimeConfig::default());
+    let node = graph.add_atom_input("state", 0)?;
+    let callback = graph.add_event_callback("overflow", move |_| {
+        Ok(
+            ReactionOutput::immediate(vec![StateWrite::atom(node, 1)]).and_schedule_once_after(
+                SimDuration::from_nanos(1),
+                7,
+                0,
+            ),
+        )
+    })?;
+    let limit = SimTime::from_nanos(i64::MAX);
+    graph.schedule_reaction_event(callback, limit, 0)?;
+    assert!(matches!(
+        graph.advance_to(limit),
+        Err(RuntimeError::TimeOverflow { .. })
+    ));
+    assert_eq!(graph.value_atom(node)?, 0);
+    assert_eq!(graph.take_transitions(), []);
+    assert_eq!(graph.next_event_time(), None);
+    assert!(!graph.is_quiescent());
+    Ok(())
+}
+
+#[test]
+fn overflowing_validity_timer_does_not_commit_derived_value()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut graph = Graph::new(RuntimeConfig::default());
+    let limit = SimTime::from_nanos(i64::MAX);
+    graph.advance_to(limit)?;
+    let node = graph.add_derived("overflow validity", q0()?, 0.0, |_| {
+        Ok(EvalOutput::immediate(1.0).with_valid_for(SimDuration::from_nanos(1)))
+    })?;
+    assert!(matches!(
+        graph.settle(),
+        Err(RuntimeError::TimeOverflow { .. })
+    ));
+    assert_eq!(graph.value_bucket(node)?, Bucket::new(0));
+    assert_eq!(graph.next_event_time(), None);
+    Ok(())
+}
+
+#[test]
+fn duplicate_callback_ignores_later_unrepresentable_deadline()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut graph = Graph::new(RuntimeConfig::default());
+    let limit = SimTime::from_nanos(i64::MAX);
+    let callback = graph.add_event_callback("duplicate", |context| {
+        if matches!(context.invocation(), super::Invocation::External { .. }) {
+            Ok(ReactionOutput::schedule_once_after(SimDuration::ZERO, 7, 0)
+                .and_schedule_once_after(SimDuration::from_nanos(1), 7, 0))
+        } else {
+            Ok(ReactionOutput::idle())
+        }
+    })?;
+    graph.schedule_reaction_event(callback, limit, 0)?;
+    graph.advance_to(limit)?;
+    assert!(graph.is_quiescent());
+    assert_eq!(graph.next_event_time(), None);
+    Ok(())
+}
+
+#[test]
+fn exhausted_generation_cannot_revalidate_a_stale_forecast()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut graph = Graph::new(RuntimeConfig::default());
+    let node = graph.add_derived("generation", q0()?, 0.0, |_| Ok(EvalOutput::immediate(1.0)))?;
+    graph.nodes[node.index()].generation = u64::MAX;
+    assert!(
+        matches!(graph.settle(), Err(RuntimeError::GenerationExhausted(super::WorkId::Node(id))) if id == node)
+    );
+    assert_eq!(graph.value_bucket(node)?, Bucket::new(0));
     assert_eq!(graph.take_transitions(), []);
     Ok(())
 }
