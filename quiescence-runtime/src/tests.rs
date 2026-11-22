@@ -1086,7 +1086,7 @@ fn external_reaction_events_honor_priority_without_dedup() -> Result<(), Box<dyn
         .take_transitions()
         .into_iter()
         .filter(|transition| transition.node == marker)
-        .map(|transition| transition.new())
+        .map(|transition| transition.current())
         .collect();
     assert_eq!(
         marker_values,
@@ -1242,7 +1242,7 @@ fn scheduled_reaction_priority_orders_same_time_callbacks() -> Result<(), Box<dy
         .take_transitions()
         .into_iter()
         .filter(|transition| transition.node == marker)
-        .map(|transition| transition.new())
+        .map(|transition| transition.current())
         .collect();
     assert_eq!(
         marker_values,
@@ -1541,11 +1541,15 @@ fn transition_records_share_stable_name_storage() -> Result<(), Box<dyn std::err
     let node = graph.add_atom_input(Arc::clone(&label), 0)?;
     graph.set_atom_now(node, 1)?;
     graph.set_atom_now(node, 2)?;
+    let labels = graph.node_labels();
     let records = graph.take_transitions();
     drop(graph);
     assert_eq!(records.len(), 2);
     for record in records {
-        assert!(Arc::ptr_eq(&label, &record.node_name));
+        assert!(std::ptr::eq(
+            label.as_ref(),
+            labels.name(record.node).ok_or("missing label")?
+        ));
     }
     Ok(())
 }
@@ -2070,5 +2074,48 @@ fn admitted_midpoint_writes_resolve_hysteresis_against_delivery_state()
     assert_eq!(graph.value_bucket(ingress)?, Bucket::new(-1));
     assert_eq!(graph.value_bucket(forecast)?, Bucket::new(1));
     assert_eq!(graph.value_atom(atom)?, 7);
+    Ok(())
+}
+
+#[test]
+fn published_transition_batches_keep_labels_and_order_during_graph_growth()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut graph = Graph::new(RuntimeConfig::default());
+    let numeric = graph.add_input("numeric", Quantization::INTEGER, -1.0)?;
+    let atom = graph.add_atom_input("atom", u64::MAX)?;
+    graph.set_state_now(&[StateWrite::atom(atom, 0), StateWrite::new(numeric, 2.0)])?;
+    let first = graph.publish_quiescent()?;
+    let added = graph.add_atom_input("later", 0)?;
+    graph.advance_to(SimTime::from_nanos(1))?;
+    graph.set_state_now(&[
+        StateWrite::new(numeric, -3.0),
+        StateWrite::atom(added, u64::MAX),
+    ])?;
+    let later = graph.publish_quiescent()?;
+    drop(graph);
+    assert_eq!(first.snapshot.labels.name(added), None);
+    assert_eq!(later.snapshot.labels.name(added), Some("later"));
+    let first_records = &first.transitions;
+    assert_eq!(first_records.len(), 2);
+    assert_eq!(first_records[0].node, atom);
+    assert_eq!(first_records[0].previous(), CanonicalValue::Atom(u64::MAX));
+    assert_eq!(first_records[0].current(), CanonicalValue::Atom(0));
+    assert_eq!(first_records[1].node, numeric);
+    assert_eq!(
+        first_records[1].previous(),
+        CanonicalValue::Numeric(Bucket::new(-1))
+    );
+    assert_eq!(
+        first_records[1].current(),
+        CanonicalValue::Numeric(Bucket::new(2))
+    );
+    let later_records = &later.transitions;
+    assert_eq!(later_records.len(), 2);
+    assert_eq!(later_records[0].at, SimTime::from_nanos(1));
+    assert_eq!(
+        later_records[0].current(),
+        CanonicalValue::Numeric(Bucket::new(-3))
+    );
+    assert_eq!(later_records[1].current(), CanonicalValue::Atom(u64::MAX));
     Ok(())
 }

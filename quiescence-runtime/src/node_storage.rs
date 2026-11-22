@@ -3,11 +3,9 @@
 //! All nodes have a stable public `NodeId` indexing values and links. Derived
 //! owners have an independent dense index; inputs need no evaluator,
 //! forward subscriptions or forecast generation storage.
-use super::edge_set::ReverseEdges;
 use super::read_set::Dependencies;
 use super::{CanonicalValue, EvalFn};
 use quiescence_core::{Bucket, NodeId, Quantization};
-use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DerivedId(u32);
@@ -70,11 +68,6 @@ impl NodeState {
             Self::Atom(value) => CanonicalValue::Atom(*value),
         }
     }
-}
-
-pub struct NodeLinks {
-    pub(super) name: Arc<str>,
-    pub(super) dependents: ReverseEdges,
 }
 
 pub struct DerivedNode {

@@ -41,6 +41,7 @@ mod ingress;
 mod node_storage;
 mod output;
 mod read_set;
+mod transition;
 mod write_batch;
 
 pub use error::{EvalError, InteractionIngressError, RuntimeError};
@@ -58,8 +59,10 @@ use callbacks::PendingCallbacks;
 use edge_set::ReverseEdges;
 use event_queue::{DeferredEffects, EventKind, EventQueue, ForecastOwner, ScheduledEvent};
 use history::EventWindow;
-use node_storage::{DerivedId, DerivedNode, NodeLinks, NodeState, NumericCell};
+use node_storage::{DerivedId, DerivedNode, NodeState, NumericCell};
 use read_set::{Dependencies, ReadTracker};
+use transition::{LabelStore, TransitionKind};
+pub use transition::{NodeLabels, TransitionRecord};
 use write_batch::{AdmittedWrite, ResolvedWrite};
 
 type EvalFn =
@@ -253,7 +256,8 @@ pub struct Graph {
     config: RuntimeConfig,
     now: SimTime,
     values: Vec<NodeState>,
-    links: Vec<NodeLinks>,
+    links: Vec<ReverseEdges>,
+    labels: LabelStore,
     derived: Vec<DerivedNode>,
     reactions: Vec<Reaction>,
     windows: Vec<EventWindow>,
@@ -275,6 +279,7 @@ impl Graph {
             now: SimTime::ZERO,
             values: Vec::new(),
             links: Vec::new(),
+            labels: LabelStore::new(),
             derived: Vec::new(),
             reactions: Vec::new(),
             windows: Vec::new(),
@@ -325,6 +330,7 @@ impl Graph {
             at: self.now,
             next_event_time: self.events.peek().map(|event| event.at),
             values: self.values.iter().map(NodeState::canonical).collect(),
+            labels: self.labels.snapshot(),
         })
     }
 
@@ -393,7 +399,7 @@ impl Graph {
         let snapshot = self.quiescent_snapshot()?;
         Ok(QuiescentPublication {
             snapshot,
-            transitions: std::mem::take(&mut self.transitions),
+            transitions: self.take_transitions(),
         })
     }
 
@@ -528,10 +534,8 @@ impl Graph {
         let id = NodeId::from_index(raw_id);
         let derived = state.is_derived();
         self.values.push(state);
-        self.links.push(NodeLinks {
-            name: name.into(),
-            dependents: ReverseEdges::new(),
-        });
+        self.links.push(ReverseEdges::new());
+        self.labels.push(name.into());
         self.dirty.nodes.push(false);
         self.reads.register_node();
         if derived {
@@ -945,6 +949,18 @@ impl Graph {
         std::mem::take(&mut self.transitions)
     }
 
+    /// Resolve a registered label without creating a snapshot.
+    #[must_use = "the node label must be considered"]
+    pub fn node_name(&self, node: NodeId) -> Option<&str> {
+        self.labels.name(node)
+    }
+
+    /// Current append-only label catalog, independently usable by other threads.
+    #[must_use = "the immutable node labels must be used"]
+    pub fn node_labels(&self) -> NodeLabels {
+        self.labels.snapshot()
+    }
+
     fn evaluate(&mut self, id: NodeId) -> Result<(), RuntimeError> {
         let NodeState::Derived { cell, owner } = self.values[id.index()] else {
             return Err(RuntimeError::NotDerived(id));
@@ -1190,7 +1206,7 @@ impl Graph {
     }
 
     fn update_dependencies(
-        links: &mut [NodeLinks],
+        links: &mut [ReverseEdges],
         stored: &mut Dependencies,
         dependent: WorkId,
         new: &[NodeId],
@@ -1202,7 +1218,7 @@ impl Graph {
         }
         let old = std::mem::replace(stored, Dependencies::from_sorted(new));
         read_set::changes(old.as_slice(), new, |id, added| {
-            let reverse = &mut links[id.index()].dependents;
+            let reverse = &mut links[id.index()];
             if added {
                 reverse.insert(dependent);
             } else {
@@ -1326,17 +1342,14 @@ impl Graph {
         if before == after {
             return Ok(());
         }
-        let node = &self.links[id.index()];
         self.transitions.push(TransitionRecord {
             at: self.now,
             node: id,
-            node_name: Arc::clone(&node.name),
             kind,
             before,
             after,
         });
-        node.dependents
-            .for_each(|dependent| self.dirty.mark(dependent));
+        self.links[id.index()].for_each(|dependent| self.dirty.mark(dependent));
         Ok(())
     }
 
@@ -1421,46 +1434,6 @@ impl Graph {
             NodeState::Derived { owner, .. } => Ok(*owner),
             _ => Err(RuntimeError::NotDerived(id)),
         }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TransitionKind {
-    Numeric,
-    Atom,
-}
-
-impl TransitionKind {
-    const fn decode(self, raw: u64) -> CanonicalValue {
-        match self {
-            Self::Numeric => CanonicalValue::Numeric(Bucket::new(raw.cast_signed())),
-            Self::Atom => CanonicalValue::Atom(raw),
-        }
-    }
-}
-
-/// One committed change. A node's value kind is immutable, so both
-/// payloads share one discriminant without losing any bits.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TransitionRecord {
-    pub at: SimTime,
-    pub node: NodeId,
-    /// Shared immutable node label, retained after the graph is dropped.
-    pub node_name: Arc<str>,
-    kind: TransitionKind,
-    before: u64,
-    after: u64,
-}
-
-impl TransitionRecord {
-    #[must_use = "the previous canonical value must be considered"]
-    pub const fn old(&self) -> CanonicalValue {
-        self.kind.decode(self.before)
-    }
-
-    #[must_use = "the committed canonical value must be considered"]
-    pub const fn new(&self) -> CanonicalValue {
-        self.kind.decode(self.after)
     }
 }
 

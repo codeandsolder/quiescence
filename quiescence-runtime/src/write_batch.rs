@@ -369,7 +369,7 @@ mod tests {
         let transitions: Vec<_> = graph
             .take_transitions()
             .into_iter()
-            .map(|record| (record.node, record.new()))
+            .map(|record| (record.node, record.current()))
             .collect();
         assert_eq!(transitions, expected);
         graph.set_state_now(&writes)?;

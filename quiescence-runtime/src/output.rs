@@ -1,4 +1,4 @@
-use super::TransitionRecord;
+use super::{NodeLabels, TransitionRecord};
 use quiescence_core::{Bucket, Estimate, HistoryId, NodeId, ReactionId, SimDuration, SimTime};
 use std::fmt;
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -51,6 +51,7 @@ pub struct QuiescentSnapshot {
     pub at: SimTime,
     pub next_event_time: Option<SimTime>,
     pub(super) values: Vec<CanonicalValue>,
+    pub labels: NodeLabels,
 }
 
 impl QuiescentSnapshot {
