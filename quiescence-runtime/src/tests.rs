@@ -1296,8 +1296,8 @@ fn zero_time_oscillation_is_explicit_instability() -> Result<(), Box<dyn std::er
     let mut g = Graph::new(RuntimeConfig {
         same_time_microstep_budget: 32,
     });
-    let a = g.add_input("a", q0()?, 0.0)?;
-    let b = g.add_input("b", q0()?, 0.0)?;
+    let a = g.declare_derived("a", q0()?, 0.0)?;
+    let b = g.declare_derived("b", q0()?, 0.0)?;
     g.set_evaluator(a, move |c| {
         Ok(EvalOutput::immediate(if c.read_bool(b)? {
             0.0
@@ -1722,5 +1722,101 @@ fn buried_obsolete_forecasts_are_bounded_in_grouped_and_sparse_queues()
         assert_eq!(graph.value_atom(marker)?, ordinary.unsigned_abs());
         assert_eq!(graph.nodes[derived.index()].pending_forecasts, 0);
     }
+    Ok(())
+}
+
+#[test]
+fn scheduled_writable_inputs_cannot_become_derived() -> Result<(), Box<dyn std::error::Error>> {
+    let mut graph = Graph::new(RuntimeConfig::default());
+    let numeric = graph.add_input("numeric", Quantization::INTEGER, 0.0)?;
+    let atom = graph.add_atom_input("atom", 0)?;
+    let at = SimTime::from_millis(10);
+    graph.schedule_input(numeric, at, 7.0)?;
+    graph.schedule_atom(atom, at, 9)?;
+    let reaction = graph.add_reaction("forecast", move |context| {
+        if context.now() == SimTime::ZERO {
+            Ok(ReactionOutput::after(
+                SimDuration::from_millis(5),
+                vec![StateWrite::new(numeric, 3.0), StateWrite::atom(atom, 4)],
+            ))
+        } else {
+            Ok(ReactionOutput::idle())
+        }
+    })?;
+    graph.settle()?;
+    assert!(matches!(
+        graph.set_evaluator(numeric, |_| Ok(EvalOutput::immediate(1.0))),
+        Err(RuntimeError::NotDerived(id)) if id == numeric
+    ));
+    assert!(matches!(
+        graph.set_evaluator(atom, |_| Ok(EvalOutput::immediate(1.0))),
+        Err(RuntimeError::NotDerived(id)) if id == atom
+    ));
+    assert_eq!(graph.next_event_time(), Some(SimTime::from_millis(5)));
+    // Admitted forecast and ordinary writes remain valid after rejection.
+    graph.advance_to(SimTime::from_millis(5))?;
+    assert_eq!(graph.value_bucket(numeric)?, Bucket::new(3));
+    assert_eq!(graph.value_atom(atom)?, 4);
+    assert_eq!(graph.reaction_name(reaction)?, "forecast");
+    graph.advance_to(at)?;
+    assert_eq!(graph.value_bucket(numeric)?, Bucket::new(7));
+    assert_eq!(graph.value_atom(atom)?, 9);
+    Ok(())
+}
+
+#[test]
+fn declared_derived_nodes_remain_read_only_and_prevent_premature_settlement()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut graph = Graph::new(RuntimeConfig::default());
+    let derived = graph.declare_derived("undefined", Quantization::INTEGER, 0.0)?;
+    assert!(!graph.is_quiescent());
+    assert!(matches!(
+        graph.quiescent_snapshot(),
+        Err(RuntimeError::NotQuiescent { .. })
+    ));
+    assert!(matches!(
+        graph.set_input_now(derived, 5.0),
+        Err(RuntimeError::NotAnInput(id)) if id == derived
+    ));
+    assert!(matches!(
+        graph.schedule_input(derived, SimTime::from_millis(10), 5.0),
+        Err(RuntimeError::NotAnInput(id)) if id == derived
+    ));
+    assert!(matches!(
+        graph.settle(),
+        Err(RuntimeError::MissingEvaluator(id)) if id == derived
+    ));
+    graph.set_evaluator(derived, |_| Ok(EvalOutput::immediate(2.0)))?;
+    graph.quiesce()?;
+    assert_eq!(graph.value_bucket(derived)?, Bucket::new(2));
+    assert!(graph.is_quiescent());
+    Ok(())
+}
+
+#[test]
+fn replacing_derived_evaluator_preserves_retry_and_removes_old_forecasts_on_success()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut graph = Graph::new(RuntimeConfig::default());
+    let source = graph.add_input("old source", Quantization::INTEGER, 3.0)?;
+    let derived = graph.add_derived("forecast", Quantization::INTEGER, 0.0, move |context| {
+        Ok(
+            EvalOutput::after(context.read_f64(source)?, SimDuration::from_millis(30))
+                .with_valid_for(SimDuration::from_millis(10)),
+        )
+    })?;
+    graph.settle()?;
+    assert_eq!(graph.next_event_time(), Some(SimTime::from_millis(10)));
+    graph.set_evaluator(derived, |_| Err(EvalError::Message(String::from("retry"))))?;
+    assert!(
+        matches!(graph.settle(), Err(RuntimeError::Evaluation { node, .. }) if node == derived)
+    );
+    assert_eq!(graph.next_event_time(), Some(SimTime::from_millis(10)));
+    graph.set_evaluator(derived, |_| Ok(EvalOutput::immediate(11.0)))?;
+    graph.settle()?;
+    assert_eq!(graph.next_event_time(), None);
+    graph.set_input_now(source, 8.0)?;
+    assert_eq!(graph.value_bucket(derived)?, Bucket::new(11));
+    graph.advance_to(SimTime::from_millis(30))?;
+    assert_eq!(graph.value_bucket(derived)?, Bucket::new(11));
     Ok(())
 }

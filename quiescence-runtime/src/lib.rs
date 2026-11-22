@@ -193,10 +193,17 @@ impl EvalContext<'_> {
     }
 }
 
+#[derive(Clone, Copy)]
+struct NumericCell {
+    quantization: Quantization,
+    bucket: Bucket,
+}
+
+/// A node's write/evaluation role is immutable from registration onward.
 enum NodeState {
-    Numeric {
-        quantization: Quantization,
-        bucket: Bucket,
+    Input(NumericCell),
+    Derived {
+        cell: NumericCell,
         evaluator: Option<EvalFn>,
     },
     Atom(u64),
@@ -205,11 +212,9 @@ enum NodeState {
 impl NodeState {
     const fn numeric(&self) -> Option<(Quantization, Bucket)> {
         match self {
-            Self::Numeric {
-                quantization,
-                bucket,
-                ..
-            } => Some((*quantization, *bucket)),
+            Self::Input(cell) | Self::Derived { cell, .. } => {
+                Some((cell.quantization, cell.bucket))
+            }
             Self::Atom(_) => None,
         }
     }
@@ -217,23 +222,17 @@ impl NodeState {
     const fn atom(&self) -> Option<u64> {
         match self {
             Self::Atom(value) => Some(*value),
-            Self::Numeric { .. } => None,
+            Self::Input(_) | Self::Derived { .. } => None,
         }
     }
 
     const fn is_derived(&self) -> bool {
-        matches!(
-            self,
-            Self::Numeric {
-                evaluator: Some(_),
-                ..
-            }
-        )
+        matches!(self, Self::Derived { .. })
     }
 
     const fn canonical(&self) -> CanonicalValue {
         match self {
-            Self::Numeric { bucket, .. } => CanonicalValue::Numeric(*bucket),
+            Self::Input(cell) | Self::Derived { cell, .. } => CanonicalValue::Numeric(cell.bucket),
             Self::Atom(value) => CanonicalValue::Atom(*value),
         }
     }
@@ -500,7 +499,8 @@ impl Graph {
         q: Quantization,
         initial: f64,
     ) -> Result<NodeId, RuntimeError> {
-        self.add_numeric_node(name, q, initial, None)
+        let cell = Self::numeric_cell(q, initial)?;
+        self.add_node(name, NodeState::Input(cell))
     }
 
     /// # Errors
@@ -525,25 +525,46 @@ impl Graph {
     where
         F: for<'a> Fn(&EvalContext<'a>) -> Result<EvalOutput, EvalError> + Send + Sync + 'static,
     {
-        self.add_numeric_node(name, q, initial, Some(Box::new(evaluator)))
+        let cell = Self::numeric_cell(q, initial)?;
+        self.add_node(
+            name,
+            NodeState::Derived {
+                cell,
+                evaluator: Some(Box::new(evaluator)),
+            },
+        )
     }
 
-    fn add_numeric_node(
+    /// Reserve a derived node's identity before its evaluator is defined.
+    ///
+    /// This supports mutually recursive graphs without temporarily exposing
+    /// derived state as externally writable input. The node is dirty from
+    /// registration; settlement fails until its evaluator is installed.
+    ///
+    /// # Errors
+    /// Returns an error if another node cannot be allocated or the initial value cannot be quantized.
+    pub fn declare_derived(
         &mut self,
         name: impl Into<Arc<str>>,
         q: Quantization,
         initial: f64,
-        evaluator: Option<EvalFn>,
     ) -> Result<NodeId, RuntimeError> {
-        let bucket = q.resolve(None, Estimate::point(initial))?;
+        let cell = Self::numeric_cell(q, initial)?;
         self.add_node(
             name,
-            NodeState::Numeric {
-                quantization: q,
-                bucket,
-                evaluator,
+            NodeState::Derived {
+                cell,
+                evaluator: None,
             },
         )
+    }
+
+    fn numeric_cell(q: Quantization, initial: f64) -> Result<NumericCell, RuntimeError> {
+        let bucket = q.resolve(None, Estimate::point(initial))?;
+        Ok(NumericCell {
+            quantization: q,
+            bucket,
+        })
     }
 
     fn add_node(
@@ -570,8 +591,15 @@ impl Graph {
         Ok(id)
     }
 
+    /// Define or replace the evaluator of a derived node.
+    ///
+    /// Input nodes cannot change roles: accepted input writes must remain
+    /// deliverable throughout the lifetime of their target. A replacement
+    /// evaluator is scheduled for settlement and replaces its old forecasts
+    /// only after successful evaluation.
+    ///
     /// # Errors
-    /// Returns an error if the node does not exist or is not numeric.
+    /// Returns an error if the node does not exist or is not derived.
     pub fn set_evaluator<F>(&mut self, id: NodeId, evaluator: F) -> Result<(), RuntimeError>
     where
         F: for<'a> Fn(&EvalContext<'a>) -> Result<EvalOutput, EvalError> + Send + Sync + 'static,
@@ -580,11 +608,11 @@ impl Graph {
             .nodes
             .get_mut(id.index())
             .ok_or(RuntimeError::UnknownNode(id))?;
-        let NodeState::Numeric {
+        let NodeState::Derived {
             evaluator: slot, ..
         } = &mut node.state
         else {
-            return Err(RuntimeError::ExpectedNumeric(id));
+            return Err(RuntimeError::NotDerived(id));
         };
         *slot = Some(Box::new(evaluator));
         self.dirty.mark(WorkId::Node(id));
@@ -983,15 +1011,13 @@ impl Graph {
     }
 
     fn evaluate(&mut self, id: NodeId) -> Result<(), RuntimeError> {
-        let NodeState::Numeric {
+        let NodeState::Derived { cell, evaluator } = &self.nodes[id.index()].state else {
+            return Err(RuntimeError::NotDerived(id));
+        };
+        let NumericCell {
             quantization,
             bucket: current,
-            evaluator,
-        } = &self.nodes[id.index()].state
-        else {
-            return Err(RuntimeError::ExpectedNumeric(id));
-        };
-        let (quantization, current) = (*quantization, *current);
+        } = *cell;
         let evaluator = evaluator
             .as_ref()
             .ok_or(RuntimeError::MissingEvaluator(id))?;
@@ -1319,9 +1345,12 @@ impl Graph {
             return Ok(());
         }
         match (&mut node.state, value) {
-            (NodeState::Numeric { bucket, .. }, CanonicalValue::Numeric(next)) => *bucket = next,
+            (
+                NodeState::Input(cell) | NodeState::Derived { cell, .. },
+                CanonicalValue::Numeric(next),
+            ) => cell.bucket = next,
             (NodeState::Atom(current), CanonicalValue::Atom(next)) => *current = next,
-            (NodeState::Numeric { .. }, CanonicalValue::Atom(_)) => {
+            (NodeState::Input(_) | NodeState::Derived { .. }, CanonicalValue::Atom(_)) => {
                 return Err(RuntimeError::ExpectedNumeric(id));
             }
             (NodeState::Atom(_), CanonicalValue::Numeric(_)) => {

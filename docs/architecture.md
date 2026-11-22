@@ -43,7 +43,7 @@ The canonical-state contract is therefore broader than numeric quantization: a n
 
 ## Layer 2: evaluation and reactions
 
-A derived-node evaluator reads nodes through an evaluation context and produces a candidate result plus temporal information. Reads form the current dependency set.
+A derived-node evaluator reads nodes through an evaluation context and produces a candidate result plus temporal information. Reads form the current dependency set. Input and derived roles are fixed at node registration, so an accepted input write cannot later become undeliverable because its target changed role. For recursive graphs, declare derived identities before defining their evaluators; undeclared evaluators leave the graph dirty and settlement reports an explicit error. Replacing an existing derived evaluator schedules reevaluation, preserving the previous subscriptions and forecasts until successful settlement.
 
 A reaction uses the same read-tracking context, but its output is a forecasted state transition: an optional causal delay plus an atomic batch of numeric and/or exact-atom writes to state/input nodes. Reaction dependencies are dynamic just like derived-node dependencies. If any dependency changes before the forecasted transition, the reaction is reevaluated and a successful reevaluation replaces the old forecast.
 
