@@ -13,13 +13,11 @@ permissions:
   contents: read
 
 jobs:
-  rust-1-99-shared-sccache:
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@ecf97ef6708aaba39d6afad83bb82ebcca84723a # main
+  rust:
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@d7135459ef21e0edd32a725fa9334e0c57c9cd70 # main
     with:
-      rust-toolchain: "1.99.1"
-      rust-components: "clippy rustfmt"
       command: >-
-        cargo +1.99.1 fmt --all -- --check &&
-        CARGO_BUILD_WARNINGS=deny cargo +1.99.1 clippy --locked --workspace --all-targets -- -D warnings &&
-        cargo +1.99.1 test --locked --workspace --all-targets &&
-        RUSTDOCFLAGS="-D warnings" cargo +1.99.1 doc --locked --workspace --no-deps
+        cargo fmt --all -- --check &&
+        CARGO_BUILD_WARNINGS=deny cargo clippy --locked --workspace --all-targets -- -D warnings &&
+        cargo test --locked --workspace --all-targets &&
+        RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps
