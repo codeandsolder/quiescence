@@ -163,3 +163,22 @@ impl From<QuantizeError> for RuntimeError {
         Self::Quantize(value)
     }
 }
+
+// Commit paths have already validated identifiers and values. Keep their
+// remaining invariant errors small and allocation-free inside batch loops.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum CommitError {
+    ExpectedNumeric(NodeId),
+    ExpectedAtom(NodeId),
+    NotAnInput(NodeId),
+}
+
+impl From<CommitError> for RuntimeError {
+    fn from(error: CommitError) -> Self {
+        match error {
+            CommitError::ExpectedNumeric(id) => Self::ExpectedNumeric(id),
+            CommitError::ExpectedAtom(id) => Self::ExpectedAtom(id),
+            CommitError::NotAnInput(id) => Self::NotAnInput(id),
+        }
+    }
+}

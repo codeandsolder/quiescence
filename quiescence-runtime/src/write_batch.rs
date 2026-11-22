@@ -1,6 +1,6 @@
 //! Validation and atomic staging of independent numeric and atom writes.
 use super::read_set::{EpochMarks, ReadTracker};
-use super::{CanonicalValue, Graph, NodeState, RuntimeError, StateWrite};
+use super::{CanonicalValue, CommitError, Graph, NodeState, RuntimeError, StateWrite};
 use quiescence_core::{Bucket, NodeId, PointRequest, PreparedPoint, Quantization};
 
 #[derive(Clone, Copy)]
@@ -25,7 +25,7 @@ impl AdmittedWrite {
         }
     }
 
-    fn deliver(self, graph: &mut Graph) -> Result<(), RuntimeError> {
+    fn deliver(self, graph: &mut Graph) -> Result<(), CommitError> {
         let (node, point) = match self {
             Self::Atom { node, next } => return graph.commit(node, CanonicalValue::Atom(next)),
             Self::Interior { node, bucket } => (node, PreparedPoint::Interior(bucket)),
@@ -33,7 +33,7 @@ impl AdmittedWrite {
         };
         // The target's existence, write role and policy are fixed since admission.
         let NodeState::Input(cell) = graph.values[node.index()] else {
-            return Err(RuntimeError::NotAnInput(node));
+            return Err(CommitError::NotAnInput(node));
         };
         let bucket = point.resolve(cell.bucket, cell.quantization.hysteresis_lsd());
         graph.commit(node, CanonicalValue::Numeric(bucket))
@@ -182,7 +182,10 @@ impl Graph {
     ) -> Result<(), RuntimeError> {
         // Admission proved every target and value valid, with no duplicates.
         // Apply independent writes in original order; evaluators run afterward.
-        writes.iter().try_for_each(|write| write.deliver(self))
+        writes
+            .iter()
+            .try_for_each(|write| write.deliver(self))
+            .map_err(RuntimeError::from)
     }
 
     pub(super) fn apply_state_writes(&mut self, writes: &[StateWrite]) -> Result<(), RuntimeError> {
@@ -325,7 +328,7 @@ impl Graph {
             .try_for_each(|ResolvedWrite { node, next }| self.commit(node, next));
         resolved.clear();
         self.recycle_write_scratch(resolved);
-        result
+        result.map_err(RuntimeError::from)
     }
 
     fn recycle_write_scratch(&mut self, resolved: Vec<ResolvedWrite>) {

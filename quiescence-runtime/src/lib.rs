@@ -56,6 +56,7 @@ pub use output::{
 
 use callbacks::PendingCallbacks;
 use edge_set::ReverseEdges;
+use error::CommitError;
 use event_queue::{DeferredEffects, EventKind, EventQueue, ForecastOwner, ScheduledEvent};
 use history::EventWindow;
 use node_storage::{DerivedId, DerivedNode, NodeLinks, NodeState, NumericCell};
@@ -1300,25 +1301,30 @@ impl Graph {
         }
     }
 
-    fn commit(&mut self, id: NodeId, value: CanonicalValue) -> Result<(), RuntimeError> {
-        let state = &mut self.values[id.index()];
-        let old = state.canonical();
-        if old == value {
-            return Ok(());
-        }
-        match (state, value) {
+    fn commit(&mut self, id: NodeId, value: CanonicalValue) -> Result<(), CommitError> {
+        let old = match (&mut self.values[id.index()], value) {
             (
                 NodeState::Input(cell) | NodeState::Derived { cell, .. },
                 CanonicalValue::Numeric(next),
-            ) => cell.bucket = next,
-            (NodeState::Atom(current), CanonicalValue::Atom(next)) => *current = next,
+            ) => {
+                if cell.bucket == next {
+                    return Ok(());
+                }
+                CanonicalValue::Numeric(std::mem::replace(&mut cell.bucket, next))
+            }
+            (NodeState::Atom(current), CanonicalValue::Atom(next)) => {
+                if *current == next {
+                    return Ok(());
+                }
+                CanonicalValue::Atom(std::mem::replace(current, next))
+            }
             (NodeState::Input(_) | NodeState::Derived { .. }, CanonicalValue::Atom(_)) => {
-                return Err(RuntimeError::ExpectedNumeric(id));
+                return Err(CommitError::ExpectedNumeric(id));
             }
             (NodeState::Atom(_), CanonicalValue::Numeric(_)) => {
-                return Err(RuntimeError::ExpectedAtom(id));
+                return Err(CommitError::ExpectedAtom(id));
             }
-        }
+        };
         let node = &self.links[id.index()];
         self.transitions.push(TransitionRecord {
             at: self.now,
