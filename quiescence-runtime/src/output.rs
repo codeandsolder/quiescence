@@ -109,6 +109,35 @@ pub struct ScheduledCallback {
     pub priority: i32,
 }
 
+/// Callback requests in emission order. A singleton needs no allocation.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum CallbackRequests {
+    #[default]
+    Empty,
+    One(ScheduledCallback),
+    Many(Vec<ScheduledCallback>),
+}
+
+impl CallbackRequests {
+    /// Append to the ordered batch, allocating only when a second request arrives.
+    pub fn push(&mut self, request: ScheduledCallback) {
+        match self {
+            Self::Empty => *self = Self::One(request),
+            Self::One(first) => *self = Self::Many(vec![*first, request]),
+            Self::Many(requests) => requests.push(request),
+        }
+    }
+
+    #[must_use = "the callback requests must be considered"]
+    pub fn as_slice(&self) -> &[ScheduledCallback] {
+        match self {
+            Self::Empty => &[],
+            Self::One(request) => std::slice::from_ref(request),
+            Self::Many(requests) => requests,
+        }
+    }
+}
+
 /// State and history effects applied atomically at a simulation time.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReactionTransition {
@@ -120,7 +149,7 @@ pub struct ReactionTransition {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReactionOutput {
     pub transition: Option<ReactionTransition>,
-    pub callbacks: Vec<ScheduledCallback>,
+    pub callbacks: CallbackRequests,
 }
 
 impl ReactionOutput {
@@ -128,7 +157,7 @@ impl ReactionOutput {
     pub const fn idle() -> Self {
         Self {
             transition: None,
-            callbacks: Vec::new(),
+            callbacks: CallbackRequests::Empty,
         }
     }
 
@@ -140,7 +169,7 @@ impl ReactionOutput {
                 writes,
                 window_records: Vec::new(),
             }),
-            callbacks: Vec::new(),
+            callbacks: CallbackRequests::Empty,
         }
     }
 
