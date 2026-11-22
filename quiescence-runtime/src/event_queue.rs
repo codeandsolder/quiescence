@@ -195,21 +195,24 @@ impl EventQueue {
 mod tests {
     use crate::StateWrite;
     use quiescence_core::SimTime;
+    fn token_event(at: SimTime, priority: i32, token: u64) -> super::ScheduledEvent {
+        super::ScheduledEvent {
+            at,
+            priority,
+            sequence: 0,
+            kind: super::EventKind::ExternalReaction {
+                reaction: quiescence_core::ReactionId::from_index(0),
+                token: Some(token),
+            },
+        }
+    }
+
     #[test]
     fn grouped_event_queue_preserves_priority_fifo_and_failed_event_position()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut queue = super::EventQueue::new();
         let at = SimTime::from_millis(1);
-        let reaction = quiescence_core::ReactionId::from_index(0);
-        let event = |priority, token| super::ScheduledEvent {
-            at,
-            priority,
-            sequence: 0,
-            kind: super::EventKind::ExternalReaction {
-                reaction,
-                token: Some(token),
-            },
-        };
+        let event = |priority, token| token_event(at, priority, token);
         queue.push(event(2, 1));
         queue.push(event(2, 2));
         queue.push(event(3, 3));
@@ -229,17 +232,8 @@ mod tests {
     #[test]
     fn sparse_fallback_keeps_fifo_and_retry_priority() -> Result<(), Box<dyn std::error::Error>> {
         let mut queue = super::EventQueue::new();
-        let reaction = quiescence_core::ReactionId::from_index(0);
         let at = SimTime::from_nanos(8);
-        let event = |priority, token| super::ScheduledEvent {
-            at,
-            priority,
-            sequence: 0,
-            kind: super::EventKind::ExternalReaction {
-                reaction,
-                token: Some(token),
-            },
-        };
+        let event = |priority, token| token_event(at, priority, token);
         for index in 0..=super::MAX_GROUPED_KEYS {
             queue.push(event(i32::try_from(index)?, u64::try_from(index)?));
         }
@@ -264,16 +258,7 @@ mod tests {
     #[test]
     fn sequence_rebase_preserves_fifo_in_both_storage_modes()
     -> Result<(), Box<dyn std::error::Error>> {
-        let reaction = quiescence_core::ReactionId::from_index(0);
-        let event = |priority, token| super::ScheduledEvent {
-            at: SimTime::ZERO,
-            priority,
-            sequence: 0,
-            kind: super::EventKind::ExternalReaction {
-                reaction,
-                token: Some(token),
-            },
-        };
+        let event = |priority, token| token_event(SimTime::ZERO, priority, token);
         let mut grouped = super::EventQueue::new();
         grouped.push(event(0, 1));
         grouped.push(event(0, 2));

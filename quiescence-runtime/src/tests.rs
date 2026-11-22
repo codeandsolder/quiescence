@@ -1,8 +1,8 @@
 use super::{
-    CanonicalValue, EvalError, EvalOutput, Graph, InteractionIngressError, ReactionOutput,
-    RuntimeConfig, RuntimeError, StateWrite, interaction_channel,
+    CanonicalValue, EvalContext, EvalError, EvalOutput, Graph, InteractionIngressError,
+    ReactionOutput, RuntimeConfig, RuntimeError, StateWrite, interaction_channel,
 };
-use quiescence_core::{Bucket, Quantization, SimDuration, SimTime};
+use quiescence_core::{Bucket, Quantization, ReactionId, SimDuration, SimTime};
 use std::{
     sync::{
         Arc, Mutex,
@@ -13,6 +13,22 @@ use std::{
 
 fn q0() -> Result<Quantization, Box<dyn std::error::Error>> {
     Ok(Quantization::new(0, 0)?)
+}
+
+fn recording_callback<T: Send + 'static>(
+    graph: &mut Graph,
+    name: &str,
+    recorded: &Arc<Mutex<Vec<T>>>,
+    observe: impl Fn(&EvalContext<'_>) -> T + Send + Sync + 'static,
+) -> Result<ReactionId, RuntimeError> {
+    let captured = Arc::clone(recorded);
+    graph.add_event_callback(name, move |context| {
+        captured
+            .lock()
+            .map_err(|_| EvalError::Message(String::from("capture lock poisoned")))?
+            .push(observe(context));
+        Ok(ReactionOutput::idle())
+    })
 }
 
 #[test]
@@ -192,13 +208,8 @@ fn newly_scheduled_higher_priority_callback_preempts_existing_event()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut graph = Graph::new(RuntimeConfig::default());
     let seen = Arc::new(Mutex::new(Vec::new()));
-    let captured = Arc::clone(&seen);
-    let target = graph.add_event_callback("target", move |context| {
-        captured
-            .lock()
-            .map_err(|_| EvalError::Message(String::from("capture lock poisoned")))?
-            .push((context.scheduled_key(), context.external_token()));
-        Ok(ReactionOutput::idle())
+    let target = recording_callback(&mut graph, "target", &seen, |context| {
+        (context.scheduled_key(), context.external_token())
     })?;
     let producer = graph.add_event_callback("producer", move |_| {
         Ok(ReactionOutput::schedule_reaction_once_after(
@@ -654,13 +665,8 @@ fn interaction_ingress_crosses_threads_and_returns_quiescent_snapshot()
         Ok(EvalOutput::immediate(0.0))
     })?;
     let callbacks = Arc::new(Mutex::new(Vec::new()));
-    let observed = Arc::clone(&callbacks);
-    let callback = g.add_event_callback("background interaction", move |context| {
-        observed
-            .lock()
-            .map_err(|_| EvalError::Message(String::from("callback capture lock poisoned")))?
-            .push((context.now(), context.external_token()));
-        Ok(ReactionOutput::idle())
+    let callback = recording_callback(&mut g, "background interaction", &callbacks, |context| {
+        (context.now(), context.external_token())
     })?;
     g.quiesce()?;
     g.advance_to(SimTime::from_millis(25))?;
@@ -832,13 +838,8 @@ fn concurrent_producers_all_deliver_before_last_sender_shutdown()
     const PER_PRODUCER: u64 = 64;
     let mut graph = Graph::new(RuntimeConfig::default());
     let seen = Arc::new(Mutex::new(Vec::new()));
-    let captured = Arc::clone(&seen);
-    let callback = graph.add_event_callback("concurrent ingress", move |context| {
-        captured
-            .lock()
-            .map_err(|_| EvalError::Message(String::from("capture lock poisoned")))?
-            .push(context.external_token());
-        Ok(ReactionOutput::idle())
+    let callback = recording_callback(&mut graph, "concurrent ingress", &seen, |context| {
+        context.external_token()
     })?;
     graph.quiesce()?;
     let (sender, inbox) = interaction_channel();
@@ -916,13 +917,8 @@ fn imported_now_interaction_is_not_quiescent_until_processed()
 fn future_interactions_import_without_running_early() -> Result<(), Box<dyn std::error::Error>> {
     let mut g = Graph::new(RuntimeConfig::default());
     let tokens = Arc::new(Mutex::new(Vec::new()));
-    let observed = Arc::clone(&tokens);
-    let callback = g.add_event_callback("future ingress", move |context| {
-        observed
-            .lock()
-            .map_err(|_| EvalError::Message(String::from("future capture lock poisoned")))?
-            .push(context.external_token());
-        Ok(ReactionOutput::idle())
+    let callback = recording_callback(&mut g, "future ingress", &tokens, |context| {
+        context.external_token()
     })?;
     g.quiesce()?;
     let (sender, inbox) = interaction_channel();
@@ -956,13 +952,8 @@ fn invalid_interaction_is_reported_without_blocking_valid_work()
     let mut g = Graph::new(RuntimeConfig::default());
     let atom = g.add_atom_input("atom", 0)?;
     let seen = Arc::new(Mutex::new(Vec::new()));
-    let observed = Arc::clone(&seen);
-    let callback = g.add_event_callback("ordered callback", move |context| {
-        observed
-            .lock()
-            .map_err(|_| EvalError::Message(String::from("capture poisoned")))?
-            .push(context.external_token());
-        Ok(ReactionOutput::idle())
+    let callback = recording_callback(&mut g, "ordered callback", &seen, |context| {
+        context.external_token()
     })?;
     g.quiesce()?;
     let (sender, inbox) = interaction_channel();
@@ -1003,13 +994,8 @@ fn external_reaction_event_tokens_are_delivered_per_duplicate()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut g = Graph::new(RuntimeConfig::default());
     let tokens = Arc::new(Mutex::new(Vec::new()));
-    let observed = Arc::clone(&tokens);
-    let callback = g.add_event_callback("tokenized external callback", move |context| {
-        observed
-            .lock()
-            .map_err(|_| EvalError::Message(String::from("token capture lock poisoned")))?
-            .push(context.external_token());
-        Ok(ReactionOutput::idle())
+    let callback = recording_callback(&mut g, "tokenized external callback", &tokens, |context| {
+        context.external_token()
     })?;
     g.schedule_reaction_event_with_token(callback, SimTime::from_millis(10), 0, 11)?;
     g.schedule_reaction_event_with_token(callback, SimTime::from_millis(10), 0, 12)?;
@@ -1324,13 +1310,8 @@ fn future_inputs_run_in_time_order() -> Result<(), Box<dyn std::error::Error>> {
 fn mixed_callback_destinations_preserve_output_order() -> Result<(), Box<dyn std::error::Error>> {
     let mut graph = Graph::new(RuntimeConfig::default());
     let seen = Arc::new(Mutex::new(Vec::new()));
-    let capture = Arc::clone(&seen);
-    let target = graph.add_event_callback("target", move |context| {
-        capture
-            .lock()
-            .map_err(|_| EvalError::Message(String::from("capture poisoned")))?
-            .push(context.invocation());
-        Ok(ReactionOutput::idle())
+    let target = recording_callback(&mut graph, "target", &seen, |context| {
+        (context.invocation(), context.now())
     })?;
     let capture = Arc::clone(&seen);
     let producer =
@@ -1344,7 +1325,7 @@ fn mixed_callback_destinations_preserve_output_order() -> Result<(), Box<dyn std
                 capture
                     .lock()
                     .map_err(|_| EvalError::Message(String::from("capture poisoned")))?
-                    .push(invocation);
+                    .push((invocation, context.now()));
                 Ok(ReactionOutput::idle())
             }
         })?;
@@ -1353,9 +1334,9 @@ fn mixed_callback_destinations_preserve_output_order() -> Result<(), Box<dyn std
     assert_eq!(
         *seen.lock().map_err(|_| "capture poisoned")?,
         [
-            super::Invocation::Scheduled { key: 1 },
-            super::Invocation::Scheduled { key: 2 },
-            super::Invocation::Scheduled { key: 3 },
+            (super::Invocation::Scheduled { key: 1 }, SimTime::ZERO),
+            (super::Invocation::Scheduled { key: 2 }, SimTime::ZERO),
+            (super::Invocation::Scheduled { key: 3 }, SimTime::ZERO),
         ]
     );
     Ok(())
