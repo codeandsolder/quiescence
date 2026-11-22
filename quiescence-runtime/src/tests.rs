@@ -83,25 +83,25 @@ fn failed_reaction_keeps_previous_subscriptions_until_success()
     })?;
     g.settle()?;
     let before = &g.reactions[reaction.index()].dependencies;
-    assert!(before.contains(&gate));
-    assert!(before.contains(&previous));
-    assert!(!before.contains(&replacement));
+    assert!(before.contains(gate));
+    assert!(before.contains(previous));
+    assert!(!before.contains(replacement));
 
     assert!(matches!(
         g.set_input_now(gate, 1.0),
         Err(RuntimeError::UnknownReaction(_))
     ));
     let still_previous = &g.reactions[reaction.index()].dependencies;
-    assert!(still_previous.contains(&previous));
-    assert!(!still_previous.contains(&replacement));
+    assert!(still_previous.contains(previous));
+    assert!(!still_previous.contains(replacement));
     assert!(!g.is_quiescent());
 
     retry_allowed.store(1, Ordering::Relaxed);
     g.settle()?;
     let after = &g.reactions[reaction.index()].dependencies;
-    assert!(after.contains(&gate));
-    assert!(!after.contains(&previous));
-    assert!(after.contains(&replacement));
+    assert!(after.contains(gate));
+    assert!(!after.contains(previous));
+    assert!(after.contains(replacement));
     Ok(())
 }
 
@@ -1546,5 +1546,58 @@ fn transition_records_share_stable_name_storage() -> Result<(), Box<dyn std::err
     for record in records {
         assert!(Arc::ptr_eq(&label, &record.node_name));
     }
+    Ok(())
+}
+
+#[test]
+fn dynamic_wide_subscriptions_replace_only_after_success() -> Result<(), Box<dyn std::error::Error>>
+{
+    let mut graph = Graph::new(RuntimeConfig::default());
+    let gate = graph.add_atom_input("gate", 0)?;
+    let sources = (0..24)
+        .map(|_| graph.add_atom_input("source", 0))
+        .collect::<Result<Vec<_>, _>>()?;
+    let captured = sources.clone();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let can_run = Arc::new(AtomicUsize::new(1));
+    let observed = Arc::clone(&calls);
+    let allowed = Arc::clone(&can_run);
+    let derived = graph.add_derived("wide", Quantization::INTEGER, 0.0, move |context| {
+        let group = context.read_atom(gate)? % 2;
+        observed.fetch_add(1, Ordering::Relaxed);
+        for (index, &source) in captured.iter().enumerate().rev() {
+            if (index as u64) % 2 == group {
+                context.read_atom(source)?;
+                context.read_atom(source)?;
+            }
+        }
+        if allowed.load(Ordering::Relaxed) == 0 {
+            return Err(EvalError::Message(String::from("retry")));
+        }
+        Ok(EvalOutput::immediate(0.0))
+    })?;
+    graph.settle()?;
+    let dependencies = &graph.nodes[derived.index()].dependencies;
+    assert!(dependencies.contains(sources[0]));
+    assert!(!dependencies.contains(sources[1]));
+    can_run.store(0, Ordering::Relaxed);
+    assert!(matches!(
+        graph.set_atom_now(gate, 1),
+        Err(RuntimeError::Evaluation { .. })
+    ));
+    let dependencies = &graph.nodes[derived.index()].dependencies;
+    assert!(dependencies.contains(sources[0]));
+    assert!(!dependencies.contains(sources[1]));
+    can_run.store(1, Ordering::Relaxed);
+    graph.settle()?;
+    let before = calls.load(Ordering::Relaxed);
+    for source in sources.iter().step_by(2) {
+        graph.set_atom_now(*source, 1)?;
+    }
+    assert_eq!(calls.load(Ordering::Relaxed), before);
+    for source in sources.iter().skip(1).step_by(2) {
+        graph.set_atom_now(*source, 1)?;
+    }
+    assert_eq!(calls.load(Ordering::Relaxed), before + 12);
     Ok(())
 }
