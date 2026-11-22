@@ -1820,3 +1820,55 @@ fn replacing_derived_evaluator_preserves_retry_and_removes_old_forecasts_on_succ
     assert_eq!(graph.value_bucket(derived)?, Bucket::new(11));
     Ok(())
 }
+
+#[test]
+fn reaction_write_validation_does_not_discard_its_read_dependencies()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut graph = Graph::new(RuntimeConfig::default());
+    let input = graph.add_atom_input("input", 1)?;
+    let output_a = graph.add_atom_input("a", 0)?;
+    let output_b = graph.add_atom_input("b", 0)?;
+    let fail = Arc::new(AtomicUsize::new(0));
+    let flag = Arc::clone(&fail);
+    let reaction = graph.add_reaction("copy", move |context| {
+        let value = context.read_atom(input)?;
+        let mut writes = vec![
+            StateWrite::atom(output_a, value),
+            StateWrite::atom(output_b, value),
+        ];
+        if flag.load(Ordering::Relaxed) != 0 {
+            writes.push(StateWrite::atom(output_a, value));
+        }
+        Ok(ReactionOutput::immediate(writes))
+    })?;
+    graph.settle()?;
+    assert!(
+        graph.reactions[reaction.index()]
+            .dependencies
+            .contains(input)
+    );
+    assert_eq!(graph.value_atom(output_a)?, 1);
+    assert_eq!(graph.value_atom(output_b)?, 1);
+    fail.store(1, Ordering::Relaxed);
+    assert!(
+        matches!(graph.set_atom_now(input, 2), Err(RuntimeError::DuplicateStateWrite(id)) if id == output_a)
+    );
+    assert_eq!(graph.value_atom(output_a)?, 1);
+    assert_eq!(graph.value_atom(output_b)?, 1);
+    assert!(
+        graph.reactions[reaction.index()]
+            .dependencies
+            .contains(input)
+    );
+    fail.store(0, Ordering::Relaxed);
+    graph.settle()?;
+    graph.set_atom_now(input, 3)?;
+    assert_eq!(graph.value_atom(output_a)?, 3);
+    assert_eq!(graph.value_atom(output_b)?, 3);
+    assert!(
+        graph.reactions[reaction.index()]
+            .dependencies
+            .contains(input)
+    );
+    Ok(())
+}

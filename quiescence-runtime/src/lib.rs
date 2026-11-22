@@ -313,6 +313,7 @@ pub struct Graph {
     windows: Vec<EventWindow>,
     dirty: DirtyQueue,
     reads: ReadTracker,
+    write_scratch: Vec<ResolvedWrite>,
     events: EventQueue,
     stale_forecasts: usize,
     pending_scheduled_reactions: BTreeSet<(ReactionId, u64)>,
@@ -330,6 +331,7 @@ impl Graph {
             windows: Vec::new(),
             dirty: DirtyQueue::new(),
             reads: ReadTracker::new(),
+            write_scratch: Vec::new(),
             events: EventQueue::new(),
             stale_forecasts: 0,
             pending_scheduled_reactions: BTreeSet::new(),
@@ -752,7 +754,7 @@ impl Graph {
     }
 
     fn validate_external_interaction(
-        &self,
+        &mut self,
         interaction: &ExternalInteraction,
     ) -> Result<(), RuntimeError> {
         let moment = match interaction {
@@ -1203,7 +1205,7 @@ impl Graph {
     }
 
     fn prepare_transition(
-        &self,
+        &mut self,
         transition: ReactionTransition,
     ) -> Result<PreparedTransition, RuntimeError> {
         self.validate_window_records(&transition.window_records)?;
