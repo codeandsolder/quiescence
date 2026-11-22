@@ -1,0 +1,18 @@
+name: Duplicate-code regression
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  merge_group:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  duplicates:
+    uses: codeandsolder/ci-workflows/.github/workflows/clone-regression.yml@d168449633a47de6c0166f0c0cff903e96983820 # main
