@@ -381,3 +381,33 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod packed_tests {
+    use super::*;
+
+    #[test]
+    fn packed_keys_preserve_full_domains_and_inline_order() {
+        let members = [
+            WorkId::Reaction(ReactionId::from_index(u32::MAX)),
+            WorkId::Node(NodeId::from_index(u32::MAX)),
+            WorkId::Reaction(ReactionId::from_index(0)),
+            WorkId::Node(NodeId::from_index(0)),
+        ];
+        for &work in &members {
+            assert_eq!(EdgeKey::from_work(work).work(), work);
+        }
+        let mut inline = InlineEdges::new();
+        for &work in &members[..3] {
+            assert!(inline.insert(EdgeKey::from_work(work)));
+        }
+        assert!(inline.insert(EdgeKey::from_work(members[1])));
+        assert!(!inline.insert(EdgeKey::from_work(members[3])));
+        inline.remove(EdgeKey::from_work(members[2]));
+        assert!(inline.insert(EdgeKey::from_work(members[3])));
+        assert_eq!(
+            inline.iter().map(EdgeKey::work).collect::<Vec<_>>(),
+            [members[3], members[1], members[0]]
+        );
+    }
+}
