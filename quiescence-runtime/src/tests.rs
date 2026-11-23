@@ -19,7 +19,7 @@ fn recording_callback<T: Send + 'static>(
     graph: &mut Graph,
     name: &str,
     recorded: &Arc<Mutex<Vec<T>>>,
-    observe: impl Fn(&EvalContext<'_>) -> T + Send + Sync + 'static,
+    observe: impl Fn(&mut EvalContext<'_>) -> T + Send + Sync + 'static,
 ) -> Result<ReactionId, RuntimeError> {
     let captured = Arc::clone(recorded);
     graph.add_event_callback(name, move |context| {
