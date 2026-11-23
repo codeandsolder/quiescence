@@ -1232,8 +1232,7 @@ impl Graph {
         if stored.as_slice() == new {
             return;
         }
-        let old = std::mem::replace(stored, Dependencies::from_sorted(new));
-        read_set::changes(old.as_slice(), new, |id, added| {
+        read_set::changes(stored.as_slice(), new, |id, added| {
             let reverse = &mut links[id.index()];
             if added {
                 reverse.insert(dependent);
@@ -1241,6 +1240,7 @@ impl Graph {
                 reverse.remove(dependent);
             }
         });
+        stored.replace_sorted(new);
     }
 
     fn apply_event(&mut self, event: &EventKind) -> Result<(), RuntimeError> {
