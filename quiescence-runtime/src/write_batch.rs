@@ -319,6 +319,10 @@ impl Graph {
         &mut self,
         mut resolved: Vec<ResolvedWrite>,
     ) -> Result<(), RuntimeError> {
+        // Every staged write is a distinct, already-validated canonical change.
+        // Reserve the exact number of new transition records before committing;
+        // consumers taking ownership of the log leave an empty Vec each round.
+        self.transitions.reserve(resolved.len());
         let result = resolved
             .iter()
             .copied()
@@ -423,6 +427,72 @@ mod tests {
         assert_eq!(graph.take_transitions(), []);
         Ok(())
     }
+    #[test]
+    fn batch_transitions_reserve_for_exact_changes_and_owned_logs_remain_independent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut graph = Graph::new(crate::RuntimeConfig::default());
+        let mut quiet = Vec::new();
+        let mut changed = Vec::new();
+        let mut expected = Vec::new();
+        for i in 0..49 {
+            if i % 5 == 0 {
+                let id = graph.add_atom_input("atom", 0)?;
+                quiet.push(StateWrite::atom(id, 0));
+                changed.push(StateWrite::atom(id, 1));
+                expected.push(CanonicalValue::Atom(1));
+            } else {
+                let id = graph.add_input("numeric", Quantization::INTEGER, 0.0)?;
+                quiet.push(StateWrite::new(id, 0.0));
+                changed.push(StateWrite::new(id, 3.0));
+                expected.push(CanonicalValue::Numeric(Bucket::new(3)));
+            }
+        }
+        graph.set_state_now(&quiet)?;
+        assert_eq!(graph.transitions, []);
+        assert_eq!(graph.transitions.capacity(), 0);
+
+        graph.set_state_now(&changed)?;
+        assert_eq!(graph.transitions.len(), changed.len());
+        assert!(graph.transitions.capacity() >= changed.len());
+        let owned = graph.take_transitions();
+        assert_eq!(graph.transitions.capacity(), 0);
+        assert!(
+            owned
+                .iter()
+                .map(|record| record.node)
+                .eq(changed.iter().map(|write| write.node()))
+        );
+        assert!(
+            owned
+                .iter()
+                .map(crate::TransitionRecord::current)
+                .eq(expected.iter().copied())
+        );
+
+        graph.set_state_now(&changed)?;
+        assert_eq!(graph.transitions, []);
+        assert_eq!(graph.transitions.capacity(), 0);
+        let mut duplicate = quiet.clone();
+        duplicate.push(quiet[0]);
+        assert!(matches!(
+            graph.set_state_now(&duplicate),
+            Err(RuntimeError::DuplicateStateWrite(_))
+        ));
+        assert_eq!(graph.transitions, []);
+        assert_eq!(graph.transitions.capacity(), 0);
+
+        graph.set_state_now(&quiet)?;
+        assert_eq!(graph.transitions.len(), quiet.len());
+        assert!(graph.transitions.capacity() >= quiet.len());
+        assert!(
+            owned
+                .iter()
+                .map(crate::TransitionRecord::current)
+                .eq(expected.iter().copied())
+        );
+        Ok(())
+    }
+
     #[test]
     fn write_staging_reuses_capacity_and_abandons_partial_failed_batches()
     -> Result<(), Box<dyn std::error::Error>> {
