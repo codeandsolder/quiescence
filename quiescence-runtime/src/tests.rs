@@ -2119,3 +2119,182 @@ fn published_transition_batches_keep_labels_and_order_during_graph_growth()
     assert_eq!(later_records[1].current(), CanonicalValue::Atom(u64::MAX));
     Ok(())
 }
+
+#[test]
+fn retained_publications_keep_all_versions_across_commits_and_growth()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut graph = Graph::new(RuntimeConfig::default());
+    let q = q0()?;
+    let input = graph.add_input("source", q, 0.0)?;
+    let derived = graph.add_derived("double", q, 0.0, move |context| {
+        Ok(EvalOutput::immediate(context.read_f64(input)? * 2.0))
+    })?;
+    let mut atoms = Vec::new();
+    for index in 0..516_u32 {
+        atoms.push(graph.add_atom_input(format!("atom {index}"), 0)?);
+    }
+    graph.settle()?;
+    let initial = graph.quiescent_snapshot()?;
+    let identical = graph.quiescent_snapshot()?;
+    assert_eq!(initial, identical);
+
+    graph.set_atom_now(atoms[253], u64::MAX)?;
+    graph.set_atom_now(atoms[254], 42)?;
+    graph.set_input_now(input, 3.0)?;
+    let changed = graph.quiescent_snapshot()?;
+    assert_eq!(
+        initial.value(input),
+        Some(CanonicalValue::Numeric(Bucket::new(0)))
+    );
+    assert_eq!(
+        initial.value(derived),
+        Some(CanonicalValue::Numeric(Bucket::new(0)))
+    );
+    assert_eq!(
+        changed.value(input),
+        Some(CanonicalValue::Numeric(Bucket::new(3)))
+    );
+    assert_eq!(
+        changed.value(derived),
+        Some(CanonicalValue::Numeric(Bucket::new(6)))
+    );
+    assert_eq!(initial.value(atoms[254]), Some(CanonicalValue::Atom(0)));
+    assert_eq!(changed.value(atoms[254]), Some(CanonicalValue::Atom(42)));
+    assert_eq!(
+        changed.value(atoms[253]),
+        Some(CanonicalValue::Atom(u64::MAX))
+    );
+
+    let added = graph.add_atom_input("after publication", 7)?;
+    let grown = graph.quiescent_snapshot()?;
+    assert_eq!(initial.value(added), None);
+    assert_eq!(changed.value(added), None);
+    assert_eq!(grown.value(added), Some(CanonicalValue::Atom(7)));
+    assert_eq!(grown.node_count(), initial.node_count() + 1);
+    drop(graph);
+    assert_eq!(
+        initial.value(input),
+        Some(CanonicalValue::Numeric(Bucket::new(0)))
+    );
+    assert_eq!(
+        changed.value(derived),
+        Some(CanonicalValue::Numeric(Bucket::new(6)))
+    );
+    assert_eq!(grown.labels.name(added), Some("after publication"));
+    Ok(())
+}
+
+#[test]
+fn published_snapshot_tracks_changes_even_when_transitions_are_drained()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut graph = Graph::new(RuntimeConfig::default());
+    let atom = graph.add_atom_input("atom", 0)?;
+    let first = graph.quiescent_snapshot()?;
+    graph.set_atom_now(atom, 1)?;
+    assert_eq!(graph.take_transitions().len(), 1);
+    graph.set_atom_now(atom, 2)?;
+    let second = graph.quiescent_snapshot()?;
+    assert_eq!(first.value(atom), Some(CanonicalValue::Atom(0)));
+    assert_eq!(second.value(atom), Some(CanonicalValue::Atom(2)));
+    assert_eq!(graph.take_transitions().len(), 1);
+    graph.set_atom_now(atom, 3)?;
+    assert_eq!(graph.take_transitions().len(), 1);
+    graph.set_atom_now(atom, 4)?;
+    assert_eq!(graph.take_transitions().len(), 1);
+    let third = graph.quiescent_snapshot()?;
+    assert_eq!(second.value(atom), Some(CanonicalValue::Atom(2)));
+    assert_eq!(third.value(atom), Some(CanonicalValue::Atom(4)));
+    let identical = graph.quiescent_snapshot()?;
+    assert_eq!(identical, third);
+    Ok(())
+}
+
+#[test]
+fn snapshots_match_reference_across_randomized_registration_writes_drains_and_versions()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut graph = Graph::new(RuntimeConfig::default());
+    let mut nodes = Vec::new();
+    let mut expected = Vec::new();
+    for _ in 0..513 {
+        nodes.push(graph.add_atom_input("random atom", 0)?);
+        expected.push(0_u64);
+    }
+    let mut held = Vec::new();
+    let mut random = 0xb24e_c6d8_3a7f_2091_u64;
+    for step in 0..1024 {
+        random ^= random << 13;
+        random ^= random >> 7;
+        random ^= random << 17;
+        let operation = random % 13;
+        if operation == 0 {
+            let value = u64::try_from(step + 1)?;
+            nodes.push(graph.add_atom_input("new atom", value)?);
+            expected.push(value);
+        } else if operation == 1 {
+            let _ = graph.take_transitions();
+        } else {
+            let index = usize::try_from(random % u64::try_from(nodes.len())?)?;
+            let value = random.rotate_left(17);
+            graph.set_atom_now(nodes[index], value)?;
+            expected[index] = value;
+        }
+        if step % 3 == 0 {
+            let snapshot = graph.quiescent_snapshot()?;
+            assert_eq!(snapshot.node_count(), expected.len());
+            for (&node, &value) in nodes.iter().zip(&expected) {
+                assert_eq!(snapshot.value(node), Some(CanonicalValue::Atom(value)));
+            }
+            held.push((snapshot, expected.clone()));
+        }
+        if step % 7 == 0 {
+            let _ = graph.take_transitions();
+        }
+    }
+    drop(graph);
+    for (snapshot, values) in held {
+        for (index, &value) in values.iter().enumerate() {
+            assert_eq!(
+                snapshot.value(nodes[index]),
+                Some(CanonicalValue::Atom(value))
+            );
+        }
+        assert_eq!(snapshot.node_count(), values.len());
+    }
+    Ok(())
+}
+
+#[test]
+fn dense_transition_publications_preserve_every_canonical_value_across_log_drains()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut graph = Graph::new(RuntimeConfig {
+        same_time_microstep_budget: 4096,
+    });
+    let nodes: Vec<_> = (0..1024)
+        .map(|_| graph.add_atom_input("dense source", 0))
+        .collect::<Result<_, _>>()?;
+    let initial = graph.quiescent_snapshot()?;
+    for round in 1..=2_u64 {
+        let writes = nodes
+            .iter()
+            .enumerate()
+            .map(|(index, &node)| Ok(StateWrite::atom(node, u64::try_from(index)? + round)))
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+        graph.set_state_now(&writes)?;
+        // Test capture-before-drain and drain-before-capture independently.
+        if round == 2 {
+            assert_eq!(graph.take_transitions().len(), nodes.len());
+        }
+        let current = graph.quiescent_snapshot()?;
+        if round == 1 {
+            assert_eq!(graph.take_transitions().len(), nodes.len());
+        }
+        for (index, &node) in nodes.iter().enumerate() {
+            assert_eq!(initial.value(node), Some(CanonicalValue::Atom(0)));
+            assert_eq!(
+                current.value(node),
+                Some(CanonicalValue::Atom(u64::try_from(index)? + round))
+            );
+        }
+    }
+    Ok(())
+}
