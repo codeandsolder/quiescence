@@ -157,8 +157,12 @@ impl EvalContext<'_> {
         self.invocation
     }
 
+    // Evaluators live in downstream crates; keeping these small read APIs
+    // inline exposes state validation, canonical decoding, and epoch tracking
+    // to the caller's optimizer without weakening any of their semantics.
     /// # Errors
     /// Returns an error if the node does not exist or is not numeric.
+    #[inline]
     pub fn read_bucket(&mut self, id: NodeId) -> Result<Bucket, EvalError> {
         self.read_state(id)?
             .bucket()
@@ -166,6 +170,7 @@ impl EvalContext<'_> {
     }
     /// # Errors
     /// Returns an error if the node does not exist or is not numeric.
+    #[inline]
     pub fn read_f64(&mut self, id: NodeId) -> Result<f64, EvalError> {
         self.read_state(id)?
             .decoded()
@@ -173,11 +178,13 @@ impl EvalContext<'_> {
     }
     /// # Errors
     /// Returns an error if the node does not exist or is not numeric.
+    #[inline]
     pub fn read_bool(&mut self, id: NodeId) -> Result<bool, EvalError> {
         Ok(self.read_bucket(id)?.raw() != 0)
     }
     /// # Errors
     /// Returns an error if the node does not exist or is not an atom.
+    #[inline]
     pub fn read_atom(&mut self, id: NodeId) -> Result<u64, EvalError> {
         self.read_state(id)?
             .atom()
@@ -193,6 +200,7 @@ impl EvalContext<'_> {
         Ok(window.count_at(self.now, key))
     }
 
+    #[inline]
     fn read_state(&mut self, id: NodeId) -> Result<&NodeState, EvalError> {
         let node = self
             .values
