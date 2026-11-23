@@ -96,6 +96,7 @@ impl EpochMarks {
         }
     }
 
+    #[inline]
     pub(super) fn insert(&mut self, id: NodeId) -> bool {
         let mark = &mut self.slots[id.index()];
         if *mark == self.epoch {
@@ -143,6 +144,9 @@ impl ReadTracker {
         &mut self.marks
     }
 
+    // Inline with the public evaluation reads: exposing only the outer
+    // call leaves epoch and ordering overhead opaque across crate boundaries.
+    #[inline]
     pub(super) fn record(&mut self, id: NodeId) {
         if self.marks.insert(id) {
             self.ordered &= self.observed.last().is_none_or(|&previous| previous < id);
