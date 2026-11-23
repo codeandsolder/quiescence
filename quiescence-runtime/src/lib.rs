@@ -30,7 +30,7 @@
 use quiescence_core::{
     Bucket, Estimate, HistoryId, NodeId, Quantization, ReactionId, SimDuration, SimTime,
 };
-use std::{cell::RefCell, collections::VecDeque, sync::Arc};
+use std::{collections::VecDeque, sync::Arc};
 
 mod callbacks;
 mod edge_set;
@@ -65,10 +65,14 @@ use transition::{LabelStore, TransitionKind};
 pub use transition::{NodeLabels, TransitionRecord};
 use write_batch::{AdmittedWrite, ResolvedWrite};
 
-type EvalFn =
-    Box<dyn for<'a> Fn(&EvalContext<'a>) -> Result<EvalOutput, EvalError> + Send + Sync + 'static>;
+type EvalFn = Box<
+    dyn for<'a> Fn(&mut EvalContext<'a>) -> Result<EvalOutput, EvalError> + Send + Sync + 'static,
+>;
 type ReactionFn = Box<
-    dyn for<'a> Fn(&EvalContext<'a>) -> Result<ReactionOutput, EvalError> + Send + Sync + 'static,
+    dyn for<'a> Fn(&mut EvalContext<'a>) -> Result<ReactionOutput, EvalError>
+        + Send
+        + Sync
+        + 'static,
 >;
 enum PreparedTransition {
     Immediate {
@@ -110,11 +114,16 @@ pub enum Invocation {
     External { token: Option<u64> },
 }
 
+/// A short-lived view of graph state during one evaluation.
+///
+/// State reads register dependencies, so evaluators borrow the context
+/// exclusively. The graph still owns and evaluates one callback at a time;
+/// time, invocation and temporal-window observations do not mutate graph state.
 pub struct EvalContext<'a> {
     now: SimTime,
     values: &'a [NodeState],
     windows: &'a [EventWindow],
-    reads: Option<RefCell<&'a mut ReadTracker>>,
+    reads: Option<&'a mut ReadTracker>,
     invocation: Invocation,
 }
 impl EvalContext<'_> {
@@ -148,26 +157,26 @@ impl EvalContext<'_> {
 
     /// # Errors
     /// Returns an error if the node does not exist or is not numeric.
-    pub fn read_bucket(&self, id: NodeId) -> Result<Bucket, EvalError> {
+    pub fn read_bucket(&mut self, id: NodeId) -> Result<Bucket, EvalError> {
         self.read_state(id)?
             .bucket()
             .ok_or(EvalError::ExpectedNumeric(id))
     }
     /// # Errors
     /// Returns an error if the node does not exist or is not numeric.
-    pub fn read_f64(&self, id: NodeId) -> Result<f64, EvalError> {
+    pub fn read_f64(&mut self, id: NodeId) -> Result<f64, EvalError> {
         self.read_state(id)?
             .decoded()
             .ok_or(EvalError::ExpectedNumeric(id))
     }
     /// # Errors
     /// Returns an error if the node does not exist or is not numeric.
-    pub fn read_bool(&self, id: NodeId) -> Result<bool, EvalError> {
+    pub fn read_bool(&mut self, id: NodeId) -> Result<bool, EvalError> {
         Ok(self.read_bucket(id)?.raw() != 0)
     }
     /// # Errors
     /// Returns an error if the node does not exist or is not an atom.
-    pub fn read_atom(&self, id: NodeId) -> Result<u64, EvalError> {
+    pub fn read_atom(&mut self, id: NodeId) -> Result<u64, EvalError> {
         self.read_state(id)?
             .atom()
             .ok_or(EvalError::ExpectedAtom(id))
@@ -182,13 +191,13 @@ impl EvalContext<'_> {
         Ok(window.count_at(self.now, key))
     }
 
-    fn read_state(&self, id: NodeId) -> Result<&NodeState, EvalError> {
+    fn read_state(&mut self, id: NodeId) -> Result<&NodeState, EvalError> {
         let node = self
             .values
             .get(id.index())
             .ok_or(EvalError::UnknownNode(id))?;
-        if let Some(reads) = &self.reads {
-            reads.borrow_mut().record(id);
+        if let Some(reads) = &mut self.reads {
+            reads.record(id);
         }
         Ok(node)
     }
@@ -474,7 +483,10 @@ impl Graph {
         evaluator: F,
     ) -> Result<NodeId, RuntimeError>
     where
-        F: for<'a> Fn(&EvalContext<'a>) -> Result<EvalOutput, EvalError> + Send + Sync + 'static,
+        F: for<'a> Fn(&mut EvalContext<'a>) -> Result<EvalOutput, EvalError>
+            + Send
+            + Sync
+            + 'static,
     {
         self.add_derived_node(name, q, initial, Some(Box::new(evaluator)))
     }
@@ -555,7 +567,10 @@ impl Graph {
     /// Returns an error if the node does not exist or is not derived.
     pub fn set_evaluator<F>(&mut self, id: NodeId, evaluator: F) -> Result<(), RuntimeError>
     where
-        F: for<'a> Fn(&EvalContext<'a>) -> Result<EvalOutput, EvalError> + Send + Sync + 'static,
+        F: for<'a> Fn(&mut EvalContext<'a>) -> Result<EvalOutput, EvalError>
+            + Send
+            + Sync
+            + 'static,
     {
         let owner = self.derived_owner(id)?;
         self.derived[owner.index()].evaluator = Some(Box::new(evaluator));
@@ -571,7 +586,7 @@ impl Graph {
         evaluator: F,
     ) -> Result<ReactionId, RuntimeError>
     where
-        F: for<'a> Fn(&EvalContext<'a>) -> Result<ReactionOutput, EvalError>
+        F: for<'a> Fn(&mut EvalContext<'a>) -> Result<ReactionOutput, EvalError>
             + Send
             + Sync
             + 'static,
@@ -593,7 +608,7 @@ impl Graph {
         evaluator: F,
     ) -> Result<ReactionId, RuntimeError>
     where
-        F: for<'a> Fn(&EvalContext<'a>) -> Result<ReactionOutput, EvalError>
+        F: for<'a> Fn(&mut EvalContext<'a>) -> Result<ReactionOutput, EvalError>
             + Send
             + Sync
             + 'static,
@@ -974,15 +989,15 @@ impl Graph {
             .as_ref()
             .ok_or(RuntimeError::MissingEvaluator(id))?;
         self.reads.begin();
-        let context = EvalContext {
+        let mut context = EvalContext {
             now: self.now,
             values: &self.values,
             windows: &self.windows,
-            reads: Some(RefCell::new(&mut self.reads)),
+            reads: Some(&mut self.reads),
             invocation: Invocation::Reactive,
         };
-        let output =
-            evaluator(&context).map_err(|source| RuntimeError::Evaluation { node: id, source })?;
+        let output = evaluator(&mut context)
+            .map_err(|source| RuntimeError::Evaluation { node: id, source })?;
 
         let next = quantization.resolve(Some(current), output.estimate)?;
         let validity_at = output
@@ -1043,19 +1058,20 @@ impl Graph {
         };
         let reads = track_dependencies.then(|| {
             self.reads.begin();
-            RefCell::new(&mut self.reads)
+            &mut self.reads
         });
-        let context = EvalContext {
+        let mut context = EvalContext {
             now: self.now,
             values: &self.values,
             windows: &self.windows,
             reads,
             invocation,
         };
-        let output = evaluator(&context).map_err(|source| RuntimeError::ReactionEvaluation {
-            reaction: id,
-            source,
-        })?;
+        let output =
+            evaluator(&mut context).map_err(|source| RuntimeError::ReactionEvaluation {
+                reaction: id,
+                source,
+            })?;
         let ReactionOutput {
             transition,
             callbacks,

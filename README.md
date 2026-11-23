@@ -16,7 +16,7 @@ The runtime is intentionally domain-neutral. Industrial/factory simulation and b
 - Built-in hysteresis measured in least-significant decimal digits.
 - Exact atom nodes for canonical interned/snapshot identities such as immutable resource-state handles.
 - `f64` numeric working values behind the quantization boundary; canonical observable state is either an integer bucket or an exact atom.
-- Dynamic dependency discovery during evaluation. Read tracking uses reusable dense-ID epoch marks, sorted compact forward subscriptions and adaptive inline, sparse-tree, contiguous bitmap-span and sparse bitmap-tree reverse edges; identical subscriptions avoid graph mutations.
+- Dynamic dependency discovery during evaluation. Evaluator callbacks take a mutable evaluation context so tracked reads update reusable dense-ID epoch marks without runtime interior-borrow checks; sorted compact forward subscriptions and adaptive inline, sparse-tree, contiguous bitmap-span and sparse bitmap-tree reverse edges; identical subscriptions avoid graph mutations.
 - Equality cutoff: unchanged canonical values do not wake dependants.
 - Delayed outputs; delay can itself be read from another node.
 - Future input events and generation-stamped predicted events.
