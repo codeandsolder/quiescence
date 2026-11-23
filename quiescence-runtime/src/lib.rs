@@ -41,6 +41,7 @@ mod ingress;
 mod node_storage;
 mod output;
 mod read_set;
+mod snapshot;
 mod transition;
 mod write_batch;
 
@@ -61,6 +62,7 @@ use event_queue::{DeferredEffects, EventKind, EventQueue, ForecastOwner, Schedul
 use history::EventWindow;
 use node_storage::{DerivedId, DerivedNode, NodeState, NumericCell};
 use read_set::{Dependencies, ReadTracker};
+use snapshot::SnapshotCache;
 use transition::{LabelStore, TransitionKind};
 pub use transition::{NodeLabels, TransitionRecord};
 use write_batch::{AdmittedWrite, ResolvedWrite};
@@ -278,6 +280,7 @@ pub struct Graph {
     pending_scheduled_reactions: PendingCallbacks,
     callback_scratch: Vec<PreparedCallback>,
     transitions: Vec<TransitionRecord>,
+    snapshots: Option<Box<SnapshotCache>>,
 }
 
 impl Graph {
@@ -300,6 +303,7 @@ impl Graph {
             pending_scheduled_reactions: PendingCallbacks::new(),
             callback_scratch: Vec::new(),
             transitions: Vec::new(),
+            snapshots: None,
         }
     }
     #[must_use = "the current simulation time must be used"]
@@ -331,14 +335,17 @@ impl Graph {
     ///
     /// # Errors
     /// Returns an error if the graph is not currently quiescent.
-    pub fn quiescent_snapshot(&self) -> Result<QuiescentSnapshot, RuntimeError> {
+    pub fn quiescent_snapshot(&mut self) -> Result<QuiescentSnapshot, RuntimeError> {
         if !self.is_quiescent() {
             return Err(self.not_quiescent_error());
         }
         Ok(QuiescentSnapshot {
             at: self.now,
             next_event_time: self.events.peek().map(|event| event.at),
-            values: self.values.iter().map(NodeState::canonical).collect(),
+            values: self
+                .snapshots
+                .get_or_insert_with(|| Box::new(SnapshotCache::new()))
+                .capture(&self.values, &self.transitions),
             labels: self.labels.snapshot(),
         })
     }
@@ -961,6 +968,9 @@ impl Graph {
 
     #[must_use = "discarding the returned records permanently drains the transition log"]
     pub fn take_transitions(&mut self) -> Vec<TransitionRecord> {
+        if let Some(cache) = self.snapshots.as_mut() {
+            cache.before_drain(&self.transitions);
+        }
         std::mem::take(&mut self.transitions)
     }
 
