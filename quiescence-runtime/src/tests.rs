@@ -2210,6 +2210,58 @@ fn published_snapshot_tracks_changes_even_when_transitions_are_drained()
 }
 
 #[test]
+fn streaming_transition_drain_retains_buffer_and_snapshot_changes_after_early_drop()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut graph = Graph::new(RuntimeConfig::default());
+    let nodes = (0..513)
+        .map(|_| graph.add_atom_input("atom", 0))
+        .collect::<Result<Vec<_>, _>>()?;
+    let before = graph.quiescent_snapshot()?;
+    let changed = nodes
+        .iter()
+        .enumerate()
+        .map(|(index, &node)| Ok(StateWrite::atom(node, u64::try_from(index)? + 1)))
+        .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+    graph.set_state_now(&changed)?;
+    let capacity = graph.transitions.capacity();
+    assert!(capacity >= nodes.len());
+    {
+        let mut records = graph.drain_transitions();
+        assert_eq!(records.len(), nodes.len());
+        assert_eq!(records.next().ok_or("empty drain")?.node, nodes[0]);
+        assert_eq!(
+            records.next_back().ok_or("missing final record")?.node,
+            nodes[512]
+        );
+        // The rest of the drain is intentionally dropped without iteration.
+    }
+    assert_eq!(graph.transitions.capacity(), capacity);
+    assert_eq!(graph.transitions, []);
+    let after = graph.quiescent_snapshot()?;
+    for (index, &node) in nodes.iter().enumerate() {
+        assert_eq!(before.value(node), Some(CanonicalValue::Atom(0)));
+        assert_eq!(
+            after.value(node),
+            Some(CanonicalValue::Atom(u64::try_from(index)? + 1))
+        );
+    }
+
+    graph.set_atom_now(nodes[512], u64::MAX)?;
+    let records = graph.drain_transitions().collect::<Vec<_>>();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].node, nodes[512]);
+    assert_eq!(records[0].current(), CanonicalValue::Atom(u64::MAX));
+    assert_eq!(graph.transitions.capacity(), capacity);
+    let final_snapshot = graph.quiescent_snapshot()?;
+    assert_eq!(after.value(nodes[512]), Some(CanonicalValue::Atom(513)));
+    assert_eq!(
+        final_snapshot.value(nodes[512]),
+        Some(CanonicalValue::Atom(u64::MAX))
+    );
+    Ok(())
+}
+
+#[test]
 fn snapshots_match_reference_across_randomized_registration_writes_drains_and_versions()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut graph = Graph::new(RuntimeConfig::default());
@@ -2231,7 +2283,9 @@ fn snapshots_match_reference_across_randomized_registration_writes_drains_and_ve
             nodes.push(graph.add_atom_input("new atom", value)?);
             expected.push(value);
         } else if operation == 1 {
-            let _ = graph.take_transitions();
+            // Exercise the streaming buffer-preserving drain alongside the
+            // owned-log drains below, including across retained snapshots.
+            let _ = graph.drain_transitions().count();
         } else {
             let index = usize::try_from(random % u64::try_from(nodes.len())?)?;
             let value = random.rotate_left(17);

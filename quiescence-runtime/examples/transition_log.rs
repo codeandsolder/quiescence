@@ -4,6 +4,19 @@ use quiescence_core::{Quantization, SimTime};
 use quiescence_runtime::{Graph, RuntimeConfig, StateWrite};
 use std::{error::Error, hint::black_box, time::Instant};
 
+// Consume every record in both modes, isolating allocation/ownership from
+// the work of processing the transition log itself.
+fn count_consumed(
+    records: impl IntoIterator<Item = quiescence_runtime::TransitionRecord>,
+) -> usize {
+    let mut count = 0;
+    for record in records {
+        black_box(record);
+        count += 1;
+    }
+    count
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
     let mode = args.next().unwrap_or_else(|| "atom".to_owned());
@@ -16,19 +29,22 @@ fn main() -> Result<(), Box<dyn Error>> {
     let drain = args
         .next()
         .map_or(Ok(1_usize), |arg| arg.parse::<usize>())?;
+    let streaming = mode.ends_with("-stream");
+    let kind = mode.strip_suffix("-stream").unwrap_or(&mode);
     if count == 0
         || drain == 0
-        || !matches!(mode.as_str(), "atom" | "numeric" | "mixed" | "growing")
+        || !matches!(kind, "atom" | "numeric" | "mixed" | "growing")
+        || (streaming && kind == "growing")
     {
         return Err(
-            "expected atom, numeric, mixed or growing; positive node count and drain interval"
+            "expected atom, numeric, mixed, growing or a -stream variant; positive node count and drain interval"
                 .into(),
         );
     }
     let mut graph = Graph::new(RuntimeConfig::default());
     let mut batches = [Vec::with_capacity(count), Vec::with_capacity(count)];
     for index in 0..count {
-        let numeric = mode == "numeric" || (mode == "mixed" && index.is_multiple_of(2));
+        let numeric = kind == "numeric" || (kind == "mixed" && index.is_multiple_of(2));
         let label = format!("node {index}");
         let node = if numeric {
             graph.add_input(label, Quantization::INTEGER, 0.0)?
@@ -49,23 +65,29 @@ fn main() -> Result<(), Box<dyn Error>> {
     for round in 0..rounds {
         graph.set_state_now(&batches[(round + 1) % 2])?;
         if (round + 1).is_multiple_of(drain) {
-            let publication = graph.take_transitions();
-            transitions += publication.len();
-            if mode == "growing" {
-                retained.push(publication);
-                graph.add_atom_input(format!("extra {round}"), 0)?;
+            if streaming {
+                transitions += count_consumed(graph.drain_transitions());
             } else {
-                black_box(publication);
+                let publication = graph.take_transitions();
+                if kind == "growing" {
+                    transitions += publication.len();
+                    retained.push(publication);
+                    graph.add_atom_input(format!("extra {round}"), 0)?;
+                } else {
+                    transitions += count_consumed(publication);
+                }
             }
         }
     }
-    let remaining = graph.take_transitions();
-    transitions += remaining.len();
+    if streaming {
+        transitions += count_consumed(graph.drain_transitions());
+    } else {
+        transitions += count_consumed(graph.take_transitions());
+    }
     println!(
         "{mode}, {count} nodes, {rounds} rounds, {drain} drain interval: {transitions} transitions in {:?}",
         start.elapsed()
     );
-    black_box(remaining);
     black_box(retained);
     black_box(graph.now() == SimTime::ZERO);
     Ok(())

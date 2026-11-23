@@ -974,12 +974,29 @@ impl Graph {
         self.events.peek().map(|event| event.at)
     }
 
-    #[must_use = "discarding the returned records permanently drains the transition log"]
-    pub fn take_transitions(&mut self) -> Vec<TransitionRecord> {
+    fn before_transition_drain(&mut self) {
         if let Some(cache) = self.snapshots.as_mut() {
             cache.before_drain(&self.transitions);
         }
+    }
+
+    #[must_use = "discarding the returned records permanently drains the transition log"]
+    pub fn take_transitions(&mut self) -> Vec<TransitionRecord> {
+        self.before_transition_drain();
         std::mem::take(&mut self.transitions)
+    }
+
+    /// Stream committed records in source order while retaining the log's
+    /// allocation for subsequent batches. The iterator borrows the graph until
+    /// it is dropped. Unconsumed records are discarded
+    /// when the iterator drops, exactly as when the entire log is taken.
+    ///
+    /// Any cached snapshot tracks all changes before draining begins, even
+    /// when the consumer stops early.
+    #[must_use = "consume the records before dropping the drain to avoid discarding them"]
+    pub fn drain_transitions(&mut self) -> std::vec::Drain<'_, TransitionRecord> {
+        self.before_transition_drain();
+        self.transitions.drain(..)
     }
 
     /// Resolve a registered label without creating a snapshot.
