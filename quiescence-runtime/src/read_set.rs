@@ -1,14 +1,15 @@
-//! Reusable unique-read collection and compact immutable dependency lists.
+//! Reusable unique-read collection and compact sorted dependency lists.
 use quiescence_core::NodeId;
 use std::cmp::Ordering;
 
 const INLINE: usize = 6;
 
 /// Once an evaluator succeeds, its subscriptions only need ordered traversal
-/// and equality. Large forward sets therefore need just one dense allocation.
+/// and equality. Larger sets retain reusable capacity across changes;
+/// the small inline representation remains compact.
 pub enum Dependencies {
     Inline { len: u8, ids: [NodeId; INLINE] },
-    Heap(Box<[NodeId]>),
+    Heap(Vec<NodeId>),
 }
 
 impl Default for Dependencies {
@@ -33,7 +34,29 @@ impl Dependencies {
             ids[..values.len()].copy_from_slice(values);
             Self::Inline { len, ids }
         } else {
-            Self::Heap(values.into())
+            Self::Heap(values.to_vec())
+        }
+    }
+
+    /// Commit a new sorted set after its differences were published. Reuse
+    /// heap capacity even if the set's cardinality changes.
+    pub(super) fn replace_sorted(&mut self, values: &[NodeId]) {
+        match self {
+            Self::Inline { len, ids } if values.len() <= INLINE => {
+                if let Ok(new_len) = u8::try_from(values.len()) {
+                    ids[..values.len()].copy_from_slice(values);
+                    *len = new_len;
+                }
+            }
+            Self::Heap(ids) if values.len() > INLINE => {
+                if ids.len() == values.len() {
+                    ids.copy_from_slice(values);
+                } else {
+                    ids.clear();
+                    ids.extend_from_slice(values);
+                }
+            }
+            _ => *self = Self::from_sorted(values),
         }
     }
 
@@ -164,6 +187,31 @@ pub fn changes(mut old: &[NodeId], mut new: &[NodeId], mut changed: impl FnMut(N
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn sorted_forward_subscriptions_reuse_storage_across_cardinality_changes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut stored =
+            Dependencies::from_sorted(&(0..64).map(NodeId::from_index).collect::<Vec<_>>());
+        let initial = stored.as_slice().as_ptr();
+        for count in [8_u32, 9, 32, 17, 64, 7, 64] {
+            let members: Vec<_> = (0..count).map(|id| NodeId::from_index(id * 2)).collect();
+            stored.replace_sorted(&members);
+            assert_eq!(stored.as_slice(), members);
+            assert_eq!(stored.as_slice().as_ptr(), initial);
+        }
+        for count in (0..=u32::try_from(INLINE)?).rev() {
+            let members: Vec<_> = (0..count).map(NodeId::from_index).collect();
+            stored.replace_sorted(&members);
+            assert_eq!(stored.as_slice(), members);
+            assert!(matches!(stored, Dependencies::Inline { .. }));
+        }
+        let members: Vec<_> = (0..100).map(NodeId::from_index).collect();
+        stored.replace_sorted(&members);
+        assert_eq!(stored.as_slice(), members);
+        assert!(matches!(stored, Dependencies::Heap(_)));
+        Ok(())
+    }
 
     #[test]
     fn epoch_deduplication_matches_reference_across_wrap_and_abandoned_evaluations() {
