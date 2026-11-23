@@ -18,7 +18,9 @@ use core::simd::{
 const MAGIC: f64 = 4_503_599_627_370_496.0; // 2^52: spacing = 1
 const LIMIT: f64 = MAGIC / 2.0;
 const MANTISSA: u64 = (1 << 52) - 1;
-const LANES: usize = 8;
+// Four f64 lanes fit one AVX2 vector and outperform the former eight-lane
+// gather/round path on the reference Acer Ryzen; the API stays portable.
+const LANES: usize = 4;
 
 /// Exact, state-independent rounding of a point. The midpoint class
 /// preserves the open hysteresis boundary for any later previous bucket.
@@ -100,7 +102,7 @@ impl PointRequest {
     }
 
     /// Compile independent points without applying their previous buckets.
-    /// On error, earlier blocks may have been written.
+    /// On error, earlier requests may have been written.
     ///
     /// # Errors
     /// Returns the first numeric error, or a length mismatch before writing.
@@ -109,7 +111,15 @@ impl PointRequest {
         requests: &[Self],
         output: &mut [PreparedPoint],
     ) -> Result<(), QuantizeError> {
-        transform_batch(requests, output, prepare_block, Self::prepare)
+        if requests.len() != output.len() {
+            return Err(QuantizeError::BatchLengthMismatch);
+        }
+        // Independent preparation is faster without vector gather/scatter;
+        // exact certification and midpoint fallback remain per request.
+        for (&request, point) in requests.iter().zip(output) {
+            *point = request.prepare()?;
+        }
+        Ok(())
     }
 }
 
@@ -272,22 +282,6 @@ fn resolve_block(
         resolve_point_exact(request.quantization, request.previous, request.value)
     })?;
     *output = buckets;
-    Ok(())
-}
-
-#[inline]
-fn prepare_block(
-    requests: &[PointRequest; LANES],
-    output: &mut [PreparedPoint; LANES],
-) -> Result<(), QuantizeError> {
-    let (rounded, certified) = round_requests(requests);
-    let mut prepared = rounded
-        .to_array()
-        .map(|raw| PreparedPoint::Interior(Bucket::new(raw)));
-    patch_uncertified(requests, certified, &mut prepared, |request| {
-        prepare_point_exact(request.quantization, request.value)
-    })?;
-    *output = prepared;
     Ok(())
 }
 

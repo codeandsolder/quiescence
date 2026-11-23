@@ -1,7 +1,7 @@
 //! Repeatable smoke measurements for independent quantization and graph writes.
 #![forbid(unsafe_code)]
 
-use quiescence_core::{Bucket, PointRequest, Quantization};
+use quiescence_core::{Bucket, PointRequest, PreparedPoint, Quantization};
 use quiescence_runtime::{Graph, RuntimeConfig, StateWrite};
 use std::{error::Error, hint::black_box, time::Instant};
 
@@ -53,6 +53,30 @@ fn quantization(size: usize, scalar: bool) -> Result<(), Box<dyn Error>> {
         Ok(())
     })?;
     black_box(buckets);
+    Ok(())
+}
+
+fn point_preparation(size: usize, scalar: bool) -> Result<(), Box<dyn Error>> {
+    let points = requests(size)?;
+    let mut prepared = vec![PreparedPoint::Interior(Bucket::new(0)); size];
+    let label = if scalar {
+        "scalar preparation"
+    } else {
+        "batch preparation"
+    };
+    measure(label, size, |_| {
+        let points = black_box(&points);
+        let prepared = black_box(&mut prepared);
+        if scalar {
+            for (&request, point) in points.iter().zip(prepared) {
+                *point = request.prepare()?;
+            }
+        } else {
+            PointRequest::prepare_batch(points, prepared)?;
+        }
+        Ok(())
+    })?;
+    black_box(prepared);
     Ok(())
 }
 
@@ -116,8 +140,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     match mode.as_str() {
         "scalar" => quantization(size, true),
         "simd" => quantization(size, false),
+        "prepare" => point_preparation(size, false),
+        "prepare-scalar" => point_preparation(size, true),
         "quiet" | "change" | "mixed" | "mixed-change" | "quiet-unsorted"
         | "mixed-change-unsorted" => graph_writes(size, &mode, stride),
-        _ => Err("mode must be scalar, simd, quiet, change, mixed, mixed-change, quiet-unsorted or mixed-change-unsorted".into()),
+        _ => Err("mode must be scalar, simd, prepare, prepare-scalar, quiet, change, mixed, mixed-change, quiet-unsorted or mixed-change-unsorted".into()),
     }
 }
