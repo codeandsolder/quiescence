@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   rust:
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@b2ec83928e9b119c3b9810c81695b09dc95b8d68 # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@0306b47dabb5bb6c2e62b33f7ab7cec216e07dd7 # main
     with:
       command: >-
         cargo fmt --all -- --check &&
